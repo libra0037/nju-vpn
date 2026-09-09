@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -20,12 +22,150 @@ import (
 var ERR_NEXT_AUTH_SMS = errors.New("SMS Code required")
 var ERR_NEXT_AUTH_TOTP = errors.New("Current user's TOTP bound")
 
+// 短信相关的结果状态。服务端用同一组响应表达"发了新码""旧码还有效""码错了"，
+// 调用方需要区分它们才能给出正确的提示，否则用户会一直等一条不会来的短信。
+var (
+	// ErrSMSSent 表示服务端刚刚发了一条新短信。
+	ErrSMSSent = errors.New("验证码已发送到手机")
+	// ErrSMSStillValid 表示上一条验证码仍在有效期内，服务端没有重发。
+	ErrSMSStillValid = errors.New("上一条验证码仍然有效，未重发")
+	// ErrSMSWrongCode 表示验证码错误。
+	ErrSMSWrongCode = errors.New("验证码错误")
+	// ErrSMSExpired 表示验证码已过期，需要重新获取。
+	ErrSMSExpired = errors.New("验证码已过期")
+	// ErrSMSTooMany 表示请求过于频繁，被服务端限流。
+	ErrSMSTooMany = errors.New("短信发送过于频繁")
+)
+
 // redact 只保留字符串的两端，用于在日志里标识一个凭据而不泄露它。
 func redact(s string) string {
 	if len(s) <= 4 {
 		return "***"
 	}
 	return s[:2] + "***" + s[len(s)-2:]
+}
+
+// RequestSMS 请求服务端发送一条短信验证码。
+// 冷却期内服务端不会重发，此时返回 ErrSMSStillValid。
+func (client *Client) RequestSMS(twfId string) error {
+	c := client.httpClient()
+	buf := make([]byte, 40960)
+
+	addr := "https://" + client.server + "/por/login_sms.csp?apiversion=1"
+	req, err := http.NewRequest("POST", addr, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Cookie", "TWFID="+twfId)
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	n, _ := resp.Body.Read(buf)
+	state, err := classifySMSRequest(buf[:n])
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		return state
+	}
+	return nil
+}
+
+// classifySMSRequest 判断发送验证码请求的结果。
+func classifySMSRequest(body []byte) (error, error) {
+	s := string(body)
+
+	// IS_IN_PERIOD=1 表示服务端认为上一条验证码仍在有效期内，本次没有发新短信。
+	// 响应里同时带有"验证码已发送到您的手机"的模板文案和 <USER_PHONE>，
+	// 所以必须先用这个标志判断，否则会把"冷却中"误报成"已发送"。
+	if inPeriod(s) {
+		return fmt.Errorf("%w（还需等待 %s）", ErrSMSStillValid, smsInterval(s)), nil
+	}
+
+	switch {
+	case strings.Contains(s, "验证码已发送到您的手机"):
+		return ErrSMSSent, nil
+	case strings.Contains(s, "<USER_PHONE>"):
+		return ErrSMSStillValid, nil
+	case strings.Contains(s, "频繁") || strings.Contains(s, "too many") || strings.Contains(s, "TooMany"):
+		return ErrSMSTooMany, nil
+	case strings.Contains(s, "失败") || strings.Contains(s, "fail"):
+		return nil, errors.New("发送验证码失败: " + serverMessage(body))
+	}
+	return nil, errors.New("unexpected sms resp: " + serverMessage(body))
+}
+
+// inPeriod 判断服务端是否处于短信冷却期。
+func inPeriod(body string) bool {
+	m := regexp.MustCompile(`<IS_IN_PERIOD>(\d+)</IS_IN_PERIOD>`).FindStringSubmatch(body)
+	return m != nil && m[1] == "1"
+}
+
+// smsInterval 提取还需要等待的秒数。
+func smsInterval(body string) string {
+	for _, tag := range []string{"SmsSendInterval", "SMS_INTERVAL"} {
+		m := regexp.MustCompile("<" + tag + ">(\\d+)</" + tag + ">").FindStringSubmatch(body)
+		if m != nil {
+			return m[1] + " 秒"
+		}
+	}
+	return "一段时间"
+}
+
+// SMSCooldown 从错误里解析出还需要等待的时间。
+// 解析不出来时返回 0。
+func SMSCooldown(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	re := regexp.MustCompile(`还需等待 (\d+) 秒`)
+	m := re.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0
+	}
+	secs, err := strconv.Atoi(m[1])
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// UserMessage 去掉内部错误的前缀，只保留给用户看的部分。
+// 例如 "SMS Code required: 上一条验证码仍然有效，未重发（还需等待 156 秒）"
+// 会变成 "上一条验证码仍然有效，未重发（还需等待 156 秒）"。
+func UserMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	// errors.Join 用换行连接多个错误，fmt.Errorf 用 ": "，两种都要处理。
+	if i := strings.LastIndex(msg, "\n"); i >= 0 {
+		msg = msg[i+1:]
+	}
+	if i := strings.LastIndex(msg, ": "); i >= 0 {
+		return msg[i+2:]
+	}
+	return msg
+}
+
+// classifySMSAuth 判断提交验证码的结果。
+func classifySMSAuth(body []byte) (error, error) {
+	s := string(body)
+	switch {
+	case strings.Contains(s, "Auth sms suc"):
+		return nil, nil
+	case strings.Contains(s, "过期") || strings.Contains(s, "expire"):
+		return ErrSMSExpired, nil
+	case strings.Contains(s, "错误") || strings.Contains(s, "invalid") || strings.Contains(s, "Invalid"):
+		return ErrSMSWrongCode, nil
+	case strings.Contains(s, "频繁") || strings.Contains(s, "too many"):
+		return ErrSMSTooMany, nil
+	}
+	return nil, errors.New("SMS code verification failed: " + serverMessage(body))
 }
 
 // serverMessage 从服务端返回的 XML 里提取可读的错误信息。
@@ -145,13 +285,15 @@ func (client *Client) WebLogin(username string, password string) (string, error)
 		n, _ := resp.Body.Read(buf)
 		defer resp.Body.Close()
 
-		if !strings.Contains(string(buf[:n]), "验证码已发送到您的手机") && !strings.Contains(string(buf[:n]), "<USER_PHONE>") {
-			return "", errors.New("unexpected sms resp: " + serverMessage(buf[:n]))
+		smsState, err := classifySMSRequest(buf[:n])
+		if err != nil {
+			return "", err
 		}
+		log.Printf("短信状态: %v", smsState)
 
-		log.Printf("SMS Code is sent or still valid.")
-
-		return twfId, ERR_NEXT_AUTH_SMS
+		// 同时包装两个错误，上层既能用 errors.Is 判断需要二次验证，
+		// 也能知道短信到底是新发了、复用旧码还是被限流。
+		return twfId, fmt.Errorf("%w: %w", ERR_NEXT_AUTH_SMS, smsState)
 	}
 
 	// TOTP Authnication Process (Edited by JHong)
@@ -205,8 +347,10 @@ func (client *Client) AuthSms(twfId string, smsCode string) (string, error) {
 	n, _ := resp.Body.Read(buf)
 	defer resp.Body.Close()
 
-	if !strings.Contains(string(buf[:n]), "Auth sms suc") {
-		return "", errors.New("SMS code verification failed: " + serverMessage(buf[:n]))
+	if state, err := classifySMSAuth(buf[:n]); err != nil {
+		return "", err
+	} else if state != nil {
+		return "", state
 	}
 
 	twfId = string(regexp.MustCompile(`<TwfID>(.*)</TwfID>`).FindSubmatch(buf[:n])[1])

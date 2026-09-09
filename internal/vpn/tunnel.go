@@ -3,6 +3,7 @@ package vpn
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -150,7 +151,7 @@ func (client *Client) QueryIp(token *[48]byte, debug bool) ([]byte, *tls.UConn, 
 		DumpHex(message)
 		log.Printf("query ip: 首字节为 0x%02x，完整响应:", reply[0])
 		DumpHex(reply[:n])
-		return nil, nil, fmt.Errorf("unexpected query ip reply: 首字节 0x%02x，共 %d 字节", reply[0], n)
+		return nil, nil, fmt.Errorf("%w: 首字节 0x%02x，共 %d 字节", ErrServerBusy, reply[0], n)
 	}
 
 	return reply[4:8], conn, nil
@@ -233,3 +234,10 @@ func (client *Client) StartProtocol(endpoint *TunnelEndpoint, token *[48]byte, i
 
 	go TX()
 }
+
+// ErrServerBusy 表示服务端拒绝了本次建连。
+//
+// 现象是收到一段固定长度的响应，首字节不是协议规定的 0x00，内容看起来像
+// 服务端进程的内存（含小端栈指针），而且同一个 TwfID 短时间内反复建连时
+// 必然出现。静置一段时间后同一请求就会成功，因此判定为服务端的并发限制。
+var ErrServerBusy = errors.New("服务端暂时拒绝建连（同一会话建连过于频繁）")

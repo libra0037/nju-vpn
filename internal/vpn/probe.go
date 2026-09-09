@@ -1,9 +1,22 @@
 package vpn
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"time"
+)
+
+const (
+	// queryIPAttempts 是 query-ip 阶段的最大尝试次数。
+	queryIPAttempts = 3
+	// queryIPBackoff 是两次尝试之间的等待时间。
+	//
+	// 实测这个重试越密集越失败：服务端对同一账号的建连有限制，频繁重试反而
+	// 会让它一直处于拒绝状态（同一 TwfID 连试 5 次、每次间隔 15 秒，五次全败）。
+	// 因此这里只留少量尝试、间隔拉长，真正的恢复靠用户稍后重来。
+	queryIPBackoff = 30 * time.Second
 )
 
 // Stage 是探测过程中的一个步骤及其耗时。
@@ -22,6 +35,12 @@ type ProbeResult struct {
 	// NeedAuth 非 nil 表示服务端要求二次验证，且本次没有提交验证码。
 	NeedAuth error
 	Stages   []Stage
+
+	// QueryConn 是 query-ip 阶段建立的连接。它必须在隧道存活期间保持打开，
+	// 否则服务端会断开 i/o 流。调用方负责关闭。
+	QueryConn net.Conn
+	// IPRev 是客户端 IP 的字节反序，隧道首包用它标识会话。
+	IPRev *[4]byte
 }
 
 // AuthPrompt 在服务端要求二次验证时被调用，返回用户输入的验证码。
@@ -51,7 +70,7 @@ func (client *Client) Probe(username, password, twfId, code string, debug bool, 
 		if err := step("web-login", func() error {
 			var err error
 			twfId, err = client.WebLogin(username, password)
-			if err != nil && err != ERR_NEXT_AUTH_SMS && err != ERR_NEXT_AUTH_TOTP {
+			if err != nil && !errors.Is(err, ERR_NEXT_AUTH_SMS) && !errors.Is(err, ERR_NEXT_AUTH_TOTP) {
 				return err
 			}
 			loginErr = err
@@ -64,9 +83,9 @@ func (client *Client) Probe(username, password, twfId, code string, debug bool, 
 	}
 	res.TwfID = twfId
 
-	switch loginErr {
-	case nil:
-	case ERR_NEXT_AUTH_TOTP, ERR_NEXT_AUTH_SMS:
+	switch {
+	case loginErr == nil:
+	case errors.Is(loginErr, ERR_NEXT_AUTH_TOTP), errors.Is(loginErr, ERR_NEXT_AUTH_SMS):
 		if code == "" {
 			if prompt == nil {
 				res.NeedAuth = loginErr
@@ -83,12 +102,12 @@ func (client *Client) Probe(username, password, twfId, code string, debug bool, 
 			}
 		}
 		name := "auth-totp"
-		if loginErr == ERR_NEXT_AUTH_SMS {
+		if errors.Is(loginErr, ERR_NEXT_AUTH_SMS) {
 			name = "auth-sms"
 		}
 		if err := step(name, func() error {
 			var err error
-			if loginErr == ERR_NEXT_AUTH_SMS {
+			if errors.Is(loginErr, ERR_NEXT_AUTH_SMS) {
 				twfId, err = client.AuthSms(twfId, code)
 			} else {
 				twfId, err = client.TOTPAuth(twfId, code)
@@ -116,21 +135,44 @@ func (client *Client) Probe(username, password, twfId, code string, debug bool, 
 
 	var clientIP []byte
 	var queryConn net.Conn
+	// 服务端对同一 TwfID 的并发建连有限制：连着建连会返回一段固定的内存数据。
+	// 这里做几次退避重试，避免把服务端的限流当成协议错误。
 	if err := step("query-ip", func() error {
-		var err error
-		clientIP, queryConn, err = client.QueryIp(full, debug)
-		return err
+		var lastErr error
+		for attempt := 1; attempt <= queryIPAttempts; attempt++ {
+			// 用具体类型接收：QueryIp 失败时返回的是 nil 的 *tls.UConn，
+			// 直接赋给 net.Conn 会得到一个非 nil 的接口，Close() 会崩。
+			ip, conn, err := client.QueryIp(full, debug)
+			if err == nil {
+				clientIP, queryConn = ip, conn
+				return nil
+			}
+			lastErr = err
+			if conn != nil {
+				conn.Close()
+			}
+			if !errors.Is(err, ErrServerBusy) {
+				return err
+			}
+			if attempt < queryIPAttempts {
+				log.Printf("query-ip 第 %d 次被服务端拒绝，%s 后重试", attempt, queryIPBackoff)
+				time.Sleep(queryIPBackoff)
+			}
+		}
+		return lastErr
 	}); err != nil {
 		return res, err
 	}
 	// QueryIp 的连接必须保持到隧道握手完成，否则服务端会断开 i/o 流。
-	defer queryConn.Close()
 	res.ClientIP = net.IP(clientIP).String()
+	res.QueryConn = queryConn
 
 	ipRev := &[4]byte{clientIP[3], clientIP[2], clientIP[1], clientIP[0]}
+	res.IPRev = ipRev
 	if err := step("tunnel-handshake", func() error {
 		return client.ProbeTunnel(full, ipRev, debug)
 	}); err != nil {
+		queryConn.Close()
 		return res, err
 	}
 

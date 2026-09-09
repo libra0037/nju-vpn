@@ -18,6 +18,8 @@ import (
 
 	"njuvpn/internal/config"
 	"njuvpn/internal/dial"
+	"njuvpn/internal/ipc"
+	"njuvpn/internal/service"
 	"njuvpn/internal/vpn"
 )
 
@@ -87,11 +89,108 @@ func main() {
 	}
 }
 
-func cmdRun(args []string) error     { return errNotImplemented }
-func cmdStart(args []string) error   { return errNotImplemented }
-func cmdStop(args []string) error    { return errNotImplemented }
-func cmdStatus(args []string) error  { return errNotImplemented }
-func cmdAuth(args []string) error    { return errNotImplemented }
+// cmdRun 是服务进程入口，由 systemd / SCM 拉起。
+func cmdRun(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+
+	log.SetFlags(log.LstdFlags)
+	log.Printf("njuvpn 服务进程启动，目标 %s", cfg.ServerAddr())
+	if cfg.Proxy != "" {
+		log.Printf("出站路径: %s", cfg.Proxy)
+	}
+
+	return service.RunServer(service.New(cfg), cfg.IPC.Endpoint)
+}
+
+func cmdStart(args []string) error {
+	return runCommand("start", args, ipc.Request{Command: ipc.CmdStart})
+}
+
+func cmdStop(args []string) error {
+	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop})
+}
+
+func cmdStatus(args []string) error {
+	return runCommand("status", args, ipc.Request{Command: ipc.CmdStatus})
+}
+
+// cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。
+func cmdAuth(args []string) error {
+	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	// 验证码通常写成 `auth 123456`，后面还可能跟 -config，
+	// 所以先把 flag 挑出来再解析，避免位置参数截断解析。
+	if err := fs.Parse(splitFlags(args)); err != nil {
+		return err
+	}
+
+	code := strings.TrimSpace(strings.Join(joinPositional(args), " "))
+	if code == "" {
+		var err error
+		if code, err = promptCode(); err != nil {
+			return err
+		}
+	}
+
+	cfg, err := clientConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	resp, err := call(endpointOf(cfg), ipc.Request{Command: ipc.CmdAuth, Args: []string{code}})
+	if err != nil {
+		return err
+	}
+	fmt.Println(resp.Message)
+	if resp.Code != ipc.CodeOK {
+		return fmt.Errorf("服务进程返回 %d", resp.Code)
+	}
+	return nil
+}
+
+// splitFlags 把 -flag value / -flag=value 这类参数挑到前面，其余保持原序。
+func splitFlags(args []string) []string {
+	var flags, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			continue
+		}
+		flags = append(flags, a)
+		// -flag value 形式：值不带前缀，且不是下一个 flag
+		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			flags = append(flags, args[i+1])
+			i++
+		}
+	}
+	return append(flags, rest...)
+}
+
+// joinPositional 取出不含 flag 的参数。
+func joinPositional(args []string) []string {
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			continue
+		}
+		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			i++
+		}
+	}
+	return rest
+}
+
 func cmdService(args []string) error { return errNotImplemented }
 
 // cmdProbe 走一遍完整的协议握手，用来验证服务端仍然接受当前的客户端实现。
@@ -160,7 +259,7 @@ func cmdProbe(args []string) error {
 // askCode 在服务端要求二次验证时向终端索取验证码。
 // 短信验证码只在当前登录会话内有效，所以必须在同一次 Probe 里提交。
 func askCode(kind error) (string, error) {
-	if kind == vpn.ERR_NEXT_AUTH_SMS {
+	if errors.Is(kind, vpn.ERR_NEXT_AUTH_SMS) {
 		fmt.Print("服务端已发送短信验证码，请输入: ")
 	} else {
 		fmt.Print("请输入 TOTP 验证码: ")
