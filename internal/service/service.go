@@ -73,6 +73,9 @@ func (s *Service) Start() error {
 		return err
 	}
 	s.client = vpn.NewClient(s.cfg.ServerAddr(), dialFn)
+	if addr := s.cfg.DialAddr(); addr != "" {
+		s.client.WithDialAddr(addr)
+	}
 
 	// TOTP 密钥存在时无人值守完成验证，省掉人工介入。
 	code := ""

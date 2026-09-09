@@ -13,7 +13,10 @@ import (
 
 // Config 是服务进程的全部可配置项。
 type Config struct {
-	Server     string    `yaml:"server"`
+	Server string `yaml:"server"`
+	// ServerIP 可选：服务端域名在本机解析不了时，直接连这个地址，
+	// 协议层仍用 Server 生成 Host 头。
+	ServerIP   string    `yaml:"server_ip"`
 	Port       int       `yaml:"port"`
 	Username   string    `yaml:"username"`
 	Password   string    `yaml:"password"`
@@ -108,4 +111,12 @@ func (c *Config) validate() error {
 // ServerAddr 返回 "host:port" 形式的目标地址。
 func (c *Config) ServerAddr() string {
 	return net.JoinHostPort(c.Server, strconv.Itoa(c.Port))
+}
+
+// DialAddr 返回实际连接地址。配置了 server_ip 时优先用它。
+func (c *Config) DialAddr() string {
+	if c.ServerIP != "" {
+		return net.JoinHostPort(c.ServerIP, strconv.Itoa(c.Port))
+	}
+	return ""
 }

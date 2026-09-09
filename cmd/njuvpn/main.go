@@ -276,6 +276,10 @@ func cmdProbe(args []string) error {
 	}
 
 	client := vpn.NewClient(cfg.ServerAddr(), dialFn)
+	if addr := cfg.DialAddr(); addr != "" {
+		client.WithDialAddr(addr)
+		log.Printf("连接地址覆盖为 %s", addr)
+	}
 
 	if *logout {
 		if *twfId == "" {
