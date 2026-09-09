@@ -39,7 +39,7 @@ internal/config/       配置读取与校验
 
 | 模块 | 版本 | 用途 |
 |---|---|---|
-| `github.com/refraction-networking/utls` | v1.2.0 | 与旧仓库一致，API 已验证可用 |
+| `github.com/refraction-networking/utls` | v1.8.2 | 畸形 ClientHello 构造（与 v1.2.0 线上字节一致，已验证） |
 | `golang.zx2c4.com/wireguard` | v0.0.0-20260522210424-ecfc5a8d5446 | WireGuard 用户态实现 |
 | `github.com/kardianos/service` | v1.3.0 | systemd / SCM 抽象 |
 | `github.com/Microsoft/go-winio` | v0.6.2 | Windows 命名管道 |
