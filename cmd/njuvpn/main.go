@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"njuvpn/internal/config"
@@ -101,6 +102,7 @@ func cmdProbe(args []string) error {
 	configPath := fs.String("config", "", "配置文件路径")
 	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
 	totpCode := fs.String("totp", "", "TOTP 验证码，留空则用配置里的密钥自动生成")
+	twfId := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
 	debug := fs.Bool("debug", false, "打印每一步的报文")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -137,7 +139,7 @@ func cmdProbe(args []string) error {
 		log.Printf("已用配置文件里的密钥生成 TOTP 验证码")
 	}
 
-	res, probeErr := client.Probe(cfg.Username, cfg.Password, code, *debug)
+	res, probeErr := client.Probe(cfg.Username, cfg.Password, *twfId, code, *debug, askCode)
 
 	fmt.Printf("\n%-20s %-10s %s\n", "阶段", "耗时", "结果")
 	for _, s := range res.Stages {
@@ -148,6 +150,24 @@ func cmdProbe(args []string) error {
 		fmt.Printf("%-20s %-10s %s\n", s.Name, s.Duration.Round(time.Millisecond), status)
 	}
 	fmt.Printf("\n%s\n", res.Summary())
+	if res.TwfID != "" {
+		fmt.Printf("TwfID: %s（可用 -twf-id 复用，跳过再次登录）\n", res.TwfID)
+	}
 
 	return probeErr
+}
+
+// askCode 在服务端要求二次验证时向终端索取验证码。
+// 短信验证码只在当前登录会话内有效，所以必须在同一次 Probe 里提交。
+func askCode(kind error) (string, error) {
+	if kind == vpn.ERR_NEXT_AUTH_SMS {
+		fmt.Print("服务端已发送短信验证码，请输入: ")
+	} else {
+		fmt.Print("请输入 TOTP 验证码: ")
+	}
+	var code string
+	if _, err := fmt.Scanln(&code); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(code), nil
 }

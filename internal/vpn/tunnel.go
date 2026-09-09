@@ -3,7 +3,6 @@ package vpn
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -131,6 +130,9 @@ func (client *Client) QueryIp(token *[48]byte, debug bool) ([]byte, *tls.UConn, 
 		return nil, nil, err
 	}
 	log.Printf("query ip: wrote %d bytes", n)
+	if debug {
+		DumpHex(message[:n])
+	}
 
 	reply := make([]byte, 0x80)
 	n, err = conn.Read(reply)
@@ -144,7 +146,11 @@ func (client *Client) QueryIp(token *[48]byte, debug bool) ([]byte, *tls.UConn, 
 	}
 
 	if reply[0] != 0x00 {
-		return nil, nil, errors.New("unexpected query ip reply")
+		log.Printf("query ip: 请求报文:")
+		DumpHex(message)
+		log.Printf("query ip: 首字节为 0x%02x，完整响应:", reply[0])
+		DumpHex(reply[:n])
+		return nil, nil, fmt.Errorf("unexpected query ip reply: 首字节 0x%02x，共 %d 字节", reply[0], n)
 	}
 
 	return reply[4:8], conn, nil

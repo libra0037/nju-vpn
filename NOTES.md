@@ -60,6 +60,10 @@ internal/config/       配置读取与校验
 
 ## 已知约束
 
+- **服务端对同一 TwfID 的并发建连有限制**：连跑 probe 会稳定复现 `unexpected query ip reply`
+  （服务端返回一段固定的内存数据，首字节 0x08）。静置约 60 秒后单次运行即可通过，
+  实测分配地址 172.29.56.18。这与 uTLS 版本无关，v1.2.0 与 v1.8.2 表现一致。
+
 - **单客户端**：`QueryIp` 只返回一个隧道 IP，首包用 `ipRev` 标识，同时只能有一个 peer。
 - **MTU**：隧道 1400，WireGuard 再占 32–60 字节，取 1320。
 - **重启策略**：systemd unit 用 `Restart=on-failure` 而非 `always`，否则短信验证模式下会无限重启等人输码。
