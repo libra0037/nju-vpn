@@ -192,6 +192,44 @@
 验证时尽量复用 TWFID（-twf-id）而不是重新登录，可以省掉短信。
 注意服务端有约 180 秒的发送冷却。
 
+### 7.5 抓包与 MITM 的可行性（实测结论）
+
+隧道连接实际协商的 TLS 参数（实测，在校园网内直连服务端）：
+
+    版本 = 0x0302 (TLS 1.1)
+    套件 = 0x0005 (TLS_RSA_WITH_RC4_128_SHA)
+
+**标准 MITM 工具（mitmproxy / Charles / Fiddler 之类）在本场景不可用**，
+有两个相互独立的原因：
+
+1. 它们依赖 OpenSSL 或 Python 的 ssl 模块，而现代 OpenSSL 3.x 已移除
+   RC4 与 TLS 1.1。实测 `openssl ciphers -v 'RC4'` 与 `openssl ciphers -v 'TLSv1.1'`
+   都报 `no cipher match`。这些工具根本无法与上游协商出服务端要求的套件。
+2. MITM 必须终止客户端的 TLS，再以自己的身份向上游重新发起 TLS。
+   服务端在同一 443 端口上靠 ClientHello 特征区分隧道流量与 Web 流量，
+   上游看到的是代理的 ClientHello，隧道握手必然失败。
+
+注意服务端**接受**标准 TLS 1.2（实测协商出 ECDHE-RSA-AES256-GCM-SHA384），
+但那走的是 Web 认证通道——PortalToken 用的就是这条。所以普通 MITM 不会报错，
+只会把隧道连接悄悄降级成 Web 连接，然后握手失败，很容易误判。
+
+**可用方案**，按可靠性排序：
+
+1. **在容器内用 LD_PRELOAD 挂钩 `SSL_read` / `SSL_write`**（推荐）。
+   直接拿到应用层明文，不依赖证书信任，也不受 TLS 版本限制。
+   官方 Linux 客户端在容器里跑，注入一个 dump 明文的小 .so 即可。
+   需要先确认它链接的是动态 OpenSSL（`ldd` 看一下）。
+2. **自写 uTLS 终止代理**。Go 的 uTLS 仍然实现了 RC4-SHA
+   （cipher_suites.go 里有 TLS_RSA_WITH_RC4_128_SHA），本仓库的 TLSConn 就是证据。
+   用它复现完全相同的 ClientHello 连上游，同时用自签证书面对客户端。
+   注意服务端证书是有效的 DigiCert 通配证书，官方客户端可能校验证书，
+   必要时把自签 CA 装进容器的信任库。
+3. **tcpdump 被动抓包**。只能看到长度与时序，看不到明文，
+   但足以对比 ClientHello 形状与 record 分片。
+
+无论用哪种方式，要对比的关键点是：官方客户端在 TLS 握手之后发出的
+第一个应用层报文、以及它收到的回应，与本仓库 query-ip 的 64 字节是否一致。
+
 ## 8. 代码结构
 
     cmd/njuvpn/main.go        子命令分发与参数解析
