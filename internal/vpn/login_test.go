@@ -5,39 +5,35 @@ import (
 	"testing"
 )
 
-// 真实的冷却期响应：既有"已发送"的模板文案，又有 IS_IN_PERIOD=1。
-const smsInPeriodResp = `<?xml version="1.0" encoding="utf-8"?>
+// 服务端"短信已发出"的真实响应。
+//
+// IS_IN_PERIOD / SmsSendInterval / g_DisableTime 描述的是本次发送之后前端按钮的
+// 禁用倒计时，不是"没有发送"。早先把这个字段解读反了，导致每条实际发出的短信
+// 都被误报成"未重发"。
+const smsSentResp = `<?xml version="1.0" encoding="utf-8"?>
 <Auth>
 	<SmsSendInterval>178</SmsSendInterval>
 	<IS_IN_PERIOD>1</IS_IN_PERIOD>
+	<T_SMSTITLE></T_SMSTITLE>
+	<ISLBENABLED>0</ISLBENABLED>
 	<T_SMSINFOR>验证码已发送到您的手机：198****4391，请查收！</T_SMSINFOR>
 	<Message><![CDATA[auth result.]]></Message>
 	<USER_PHONE>****</USER_PHONE>
 	<SMS_INTERVAL>178</SMS_INTERVAL>
+	<CURRENT_PHONE></CURRENT_PHONE>
 	<ErrorCode>1</ErrorCode>
+	<SMS_SENDTYPE>NEW_HTTPS</SMS_SENDTYPE>
 </Auth>`
 
-// 真正发出新码的响应。
-const smsSentResp = `<?xml version="1.0" encoding="utf-8"?>
+// 会话无效时调用发送接口的响应。
+const smsInvalidSessionResp = `<?xml version="1.0" encoding="utf-8"?>
 <Auth>
-	<IS_IN_PERIOD>0</IS_IN_PERIOD>
-	<T_SMSINFOR>验证码已发送到您的手机：198****4391，请查收！</T_SMSINFOR>
-	<USER_PHONE>****</USER_PHONE>
-	<ErrorCode>1</ErrorCode>
+	<Message><![CDATA[unexpected user service]]></Message>
+	<ErrorCode>20026</ErrorCode>
 </Auth>`
-
-func TestClassifySMSRequestInPeriod(t *testing.T) {
-	// 冷却期优先：即便响应里有"已发送"文案，也必须报告未重发。
-	state, err := classifySMSRequest([]byte(smsInPeriodResp))
-	if err != nil {
-		t.Fatalf("不应返回错误: %v", err)
-	}
-	if !errors.Is(state, ErrSMSStillValid) {
-		t.Errorf("冷却期应判定为 ErrSMSStillValid，实际 %v", state)
-	}
-}
 
 func TestClassifySMSRequestSent(t *testing.T) {
+	// 这是发送成功的响应，必须报"已发送"，不能报"未重发"。
 	state, err := classifySMSRequest([]byte(smsSentResp))
 	if err != nil {
 		t.Fatalf("不应返回错误: %v", err)
@@ -47,8 +43,15 @@ func TestClassifySMSRequestSent(t *testing.T) {
 	}
 }
 
+func TestClassifySMSRequestInvalidSession(t *testing.T) {
+	_, err := classifySMSRequest([]byte(smsInvalidSessionResp))
+	if err == nil {
+		t.Error("会话无效应返回错误")
+	}
+}
+
 func TestSMSCooldownParsing(t *testing.T) {
-	state, err := classifySMSRequest([]byte(smsInPeriodResp))
+	state, err := classifySMSRequest([]byte(smsSentResp))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +102,7 @@ func TestClassifySMSAuth(t *testing.T) {
 }
 
 func TestUserMessageStripsPrefix(t *testing.T) {
-	state, err := classifySMSRequest([]byte(smsInPeriodResp))
+	state, err := classifySMSRequest([]byte(smsSentResp))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -27,8 +27,6 @@ var ERR_NEXT_AUTH_TOTP = errors.New("Current user's TOTP bound")
 var (
 	// ErrSMSSent 表示服务端刚刚发了一条新短信。
 	ErrSMSSent = errors.New("验证码已发送到手机")
-	// ErrSMSStillValid 表示上一条验证码仍在有效期内，服务端没有重发。
-	ErrSMSStillValid = errors.New("上一条验证码仍然有效，未重发")
 	// ErrSMSWrongCode 表示验证码错误。
 	ErrSMSWrongCode = errors.New("验证码错误")
 	// ErrSMSExpired 表示验证码已过期，需要重新获取。
@@ -79,50 +77,58 @@ func (client *Client) RequestSMS(twfId string) error {
 func classifySMSRequest(body []byte) (error, error) {
 	s := string(body)
 
-	// IS_IN_PERIOD=1 表示服务端认为上一条验证码仍在有效期内，本次没有发新短信。
-	// 响应里同时带有"验证码已发送到您的手机"的模板文案和 <USER_PHONE>，
-	// 所以必须先用这个标志判断，否则会把"冷却中"误报成"已发送"。
-	if inPeriod(s) {
-		return fmt.Errorf("%w（还需等待 %s）", ErrSMSStillValid, smsInterval(s)), nil
+	// 成功发送的特征：ErrorCode=1，且带着手机号与冷却倒计时。
+	// 响应里的 IS_IN_PERIOD=1 / SmsSendInterval / g_DisableTime 是**本次发送之后**
+	// 前端按钮的禁用倒计时，不是"没有发送"的标志——早先把它们解读反了，
+	// 导致每次实际发出去的短信都被误报成"未重发"。
+	if smsSent(s) {
+		if d := smsCooldownSeconds(s); d > 0 {
+			return fmt.Errorf("%w（%d 秒内请勿重复请求）", ErrSMSSent, d), nil
+		}
+		return ErrSMSSent, nil
 	}
 
 	switch {
-	case strings.Contains(s, "验证码已发送到您的手机"):
-		return ErrSMSSent, nil
-	case strings.Contains(s, "<USER_PHONE>"):
-		return ErrSMSStillValid, nil
 	case strings.Contains(s, "频繁") || strings.Contains(s, "too many") || strings.Contains(s, "TooMany"):
 		return ErrSMSTooMany, nil
+	case strings.Contains(s, "未登录") || strings.Contains(s, "unexpected user service"):
+		return nil, errors.New("会话无效，无法发送验证码: " + serverMessage(body))
 	case strings.Contains(s, "失败") || strings.Contains(s, "fail"):
 		return nil, errors.New("发送验证码失败: " + serverMessage(body))
 	}
 	return nil, errors.New("unexpected sms resp: " + serverMessage(body))
 }
 
-// inPeriod 判断服务端是否处于短信冷却期。
-func inPeriod(body string) bool {
-	m := regexp.MustCompile(`<IS_IN_PERIOD>(\d+)</IS_IN_PERIOD>`).FindStringSubmatch(body)
-	return m != nil && m[1] == "1"
+// smsSent 判断响应是否表示"短信已发出"。
+// ErrorCode=1 是服务端的成功码，配合手机号字段即可确认。
+func smsSent(body string) bool {
+	if !strings.Contains(body, "<ErrorCode>1</ErrorCode>") {
+		return false
+	}
+	return strings.Contains(body, "<USER_PHONE>") || strings.Contains(body, "验证码已发送")
 }
 
-// smsInterval 提取还需要等待的秒数。
-func smsInterval(body string) string {
+// smsCooldownSeconds 取出前端按钮的禁用倒计时。
+func smsCooldownSeconds(body string) int {
 	for _, tag := range []string{"SmsSendInterval", "SMS_INTERVAL"} {
 		m := regexp.MustCompile("<" + tag + ">(\\d+)</" + tag + ">").FindStringSubmatch(body)
 		if m != nil {
-			return m[1] + " 秒"
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				return n
+			}
 		}
 	}
-	return "一段时间"
+	return 0
 }
 
-// SMSCooldown 从错误里解析出还需要等待的时间。
+// SMSCooldown 从错误里解析出前端按钮的禁用倒计时。
+// 这只影响"能否立刻再点一次发送"，与验证码是否有效无关。
 // 解析不出来时返回 0。
 func SMSCooldown(err error) time.Duration {
 	if err == nil {
 		return 0
 	}
-	re := regexp.MustCompile(`还需等待 (\d+) 秒`)
+	re := regexp.MustCompile(`(\d+) 秒内请勿重复请求`)
 	m := re.FindStringSubmatch(err.Error())
 	if m == nil {
 		return 0

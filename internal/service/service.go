@@ -137,22 +137,34 @@ func (s *Service) Stop() error {
 	if s.state.Get().State == StateIdle {
 		return ErrNotRunning
 	}
-
-	// 先通知服务端注销会话，再关本地资源。
-	// 顺序不能反：登出需要 TWFID，而 release 会把它清掉。
-	if s.client != nil && s.twfID != "" {
-		if err := s.client.Logout(s.twfID); err != nil {
-			// 登出失败不影响本地断开，但要让用户知道服务端可能还留着会话。
-			log.Printf("服务端登出未成功: %v", err)
-		}
-	}
-
+	// release 内部会先登出再释放本地资源。
 	s.release()
 	return s.state.Transition(StateIdle, "已断开")
 }
 
 // release 关闭所有底层资源。调用方需持有 s.mu。
 func (s *Service) release() {
+	s.logoutLocked()
+	s.closeResources()
+}
+
+// logoutLocked 通知服务端注销当前会话。调用方需持有 s.mu。
+//
+// 不登出就丢弃 TWFID，会在服务端留下一个占用名额的会话；
+// 反复失败重试就会把账号的隧道名额耗尽。
+func (s *Service) logoutLocked() {
+	if s.client == nil || s.twfID == "" {
+		return
+	}
+	if err := s.client.Logout(s.twfID); err != nil {
+		log.Printf("服务端登出未成功: %v", err)
+		return
+	}
+	log.Printf("已通知服务端注销会话")
+}
+
+// closeResources 释放本地资源。调用方需持有 s.mu。
+func (s *Service) closeResources() {
 	if s.relay != nil {
 		s.relay.Close()
 		s.relay = nil
@@ -175,9 +187,6 @@ func (s *Service) awaitAuth() error {
 		detail = "需要 TOTP 验证码，请执行 njuvpn auth <code>"
 	case errors.Is(s.authKind, vpn.ErrSMSSent):
 		detail = "验证码已发送到手机，请执行 njuvpn auth <code>"
-	case errors.Is(s.authKind, vpn.ErrSMSStillValid):
-		// 去掉内部错误前缀，只留用户看得懂的部分（含剩余等待时间）。
-		detail = vpn.UserMessage(s.authKind) + "，请执行 njuvpn auth <code>"
 	case errors.Is(s.authKind, vpn.ErrSMSTooMany):
 		detail = "短信发送过于频繁，请稍后再试"
 	case s.authKind != nil:
