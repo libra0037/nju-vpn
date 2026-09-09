@@ -1,0 +1,17 @@
+# 二进制
+/njuvpn
+/njuvpn.exe
+/build_assets/
+
+# 真实配置（含密码和 TOTP 密钥）
+/config.yaml
+*.local.yaml
+
+# WireGuard 自动生成的私钥
+/state/
+
+# 编辑器 / 操作系统
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,29 @@
+# njuvpn 服务进程配置。复制为 config.yaml 后填写，该文件不要提交到 git。
+
+# --- VPN 登录 ---
+server: vpn.nju.edu.cn
+port: 443
+username: yourname
+password: ""
+
+# 可选：TOTP 密钥（Base32）。填了就自动算验证码，服务进程可以无人值守启动；
+# 留空则退化成短信验证，此时必须由 `njuvpn auth <code>` 手工提交。
+# 取值方式：VPN 的 TOTP 绑定页面二维码里 otpauth://totp/...?secret=XXXX 的 secret 部分。
+totp_secret: ""
+
+# --- WireGuard 承载 ---
+wireguard:
+  listen_port: 51820        # 对外暴露的 UDP 端口
+  private_key: ""           # 留空则首次启动自动生成并写回配置文件
+  peer_public_key: ""       # 客户端公钥，只允许这一个 peer 接入
+  peer_address: 10.66.66.2  # 分配给客户端 peer 的固定地址
+
+# --- 服务进程与命令行客户端通信 ---
+ipc:
+  endpoint: /run/njuvpn.sock   # Windows 下忽略，固定用 \\.\pipe\njuvpn
+
+# MTU：底层隧道 1400，再减去 WireGuard 封装开销
+mtu: 1320
+
+log:
+  level: info
