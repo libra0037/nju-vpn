@@ -48,7 +48,9 @@ internal/config/       配置读取与校验
 
 ## 待实现
 
-- [ ] `internal/config`：yaml 读取、默认值、权限检查
+- [x] 经 HTTP 代理出站（`internal/dial`），`njuvpn probe` 可验证协议链路
+- [x] `internal/config`：yaml 读取、默认值、校验
+- [ ] 配置文件的权限检查（拒绝 group/other 可读）
 - [ ] `internal/ipc`：`Listen`/`Dial` 的 build tag 双实现 + 行协议
 - [ ] `internal/wireguard`：`TunRelay` 实现 `tun.Device` 的 7 个方法，`File()` 返回 nil
 - [ ] `internal/service`：状态机 `idle / logging_in / auth_pending / connecting / up / error`

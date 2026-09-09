@@ -3,17 +3,14 @@ package vpn
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"io"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
-	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -23,20 +20,33 @@ import (
 var ERR_NEXT_AUTH_SMS = errors.New("SMS Code required")
 var ERR_NEXT_AUTH_TOTP = errors.New("Current user's TOTP bound")
 
-func WebLogin(server string, username string, password string) (string, error) {
-	server = "https://" + server
+// serverMessage 从服务端返回的 XML 里提取可读的错误信息。
+// 直接把整个响应体塞进错误里，日志会变得没法看。
+func serverMessage(body []byte) string {
+	s := string(body)
+	for _, tag := range []string{"Message", "ErrorMsg", "Note"} {
+		re := regexp.MustCompile("<" + tag + ">(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?</" + tag + ">")
+		if m := re.FindStringSubmatch(s); m != nil && strings.TrimSpace(m[1]) != "" {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	if m := regexp.MustCompile(`<ErrorCode>(.*)</ErrorCode>`).FindStringSubmatch(s); m != nil {
+		return "错误码 " + m[1]
+	}
+	return "服务端返回了未预期的响应"
+}
 
-	c := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
+// WebLogin 完成第一阶段的 Web 登录，返回 TwfID。
+// 若服务端要求二次验证，返回 ERR_NEXT_AUTH_SMS 或 ERR_NEXT_AUTH_TOTP。
+func (client *Client) WebLogin(username string, password string) (string, error) {
+	server := "https://" + client.server
+	c := client.httpClient()
 
 	addr := server + "/por/login_auth.csp?apiversion=1"
 	log.Printf("Login Request: %s", addr)
 
 	resp, err := c.Get(addr)
 	if err != nil {
-		debug.PrintStack()
 		return "", err
 	}
 
@@ -80,7 +90,6 @@ func WebLogin(server string, username string, password string) (string, error) {
 
 	encryptedPassword, err := rsa.EncryptPKCS1v15(rand.Reader, &pubKey, []byte(password))
 	if err != nil {
-		debug.PrintStack()
 		return "", err
 	}
 	encryptedPasswordHex := hex.EncodeToString(encryptedPassword)
@@ -102,7 +111,6 @@ func WebLogin(server string, username string, password string) (string, error) {
 
 	resp, err = c.Do(req)
 	if err != nil {
-		debug.PrintStack()
 		return "", err
 	}
 
@@ -116,13 +124,12 @@ func WebLogin(server string, username string, password string) (string, error) {
 		log.Print("SMS code required.")
 
 		addr = server + "/por/login_sms.csp?apiversion=1"
-		log.Printf("SMS Request: " + addr)
+		log.Printf("SMS Request: %s", addr)
 		req, err = http.NewRequest("POST", addr, nil)
 		req.Header.Set("Cookie", "TWFID="+twfId)
 
 		resp, err = c.Do(req)
 		if err != nil {
-			debug.PrintStack()
 			return "", err
 		}
 
@@ -130,8 +137,7 @@ func WebLogin(server string, username string, password string) (string, error) {
 		defer resp.Body.Close()
 
 		if !strings.Contains(string(buf[:n]), "验证码已发送到您的手机") && !strings.Contains(string(buf[:n]), "<USER_PHONE>") {
-			debug.PrintStack()
-			return "", errors.New("unexpected sms resp: " + string(buf[:n]))
+			return "", errors.New("unexpected sms resp: " + serverMessage(buf[:n]))
 		}
 
 		log.Printf("SMS Code is sent or still valid.")
@@ -148,13 +154,11 @@ func WebLogin(server string, username string, password string) (string, error) {
 	if strings.Contains(string(buf[:n]), "<NextAuth>-1</NextAuth>") || !strings.Contains(string(buf[:n]), "<NextAuth>") {
 		log.Print("No NextAuth found.")
 	} else {
-		debug.PrintStack()
-		return "", errors.New("Not implemented auth: " + string(buf[:n]))
+		return "", errors.New("not implemented auth: " + serverMessage(buf[:n]))
 	}
 
 	if !strings.Contains(string(buf[:n]), "<Result>1</Result>") {
-		debug.PrintStack()
-		return "", errors.New("Login FAILED: " + string(buf[:n]))
+		return "", errors.New("login failed: " + serverMessage(buf[:n]))
 	}
 
 	twfIdMatch := regexp.MustCompile(`<TwfID>(.*)</TwfID>`).FindSubmatch(buf[:n])
@@ -168,16 +172,15 @@ func WebLogin(server string, username string, password string) (string, error) {
 	return twfId, nil
 }
 
-func AuthSms(server string, username string, password string, twfId string, smsCode string) (string, error) {
-	c := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
+// AuthSms 提交短信验证码，返回更新后的 TwfID。
+func (client *Client) AuthSms(twfId string, smsCode string) (string, error) {
+	server := client.server
+	c := client.httpClient()
 
 	buf := make([]byte, 40960)
 
 	addr := "https://" + server + "/por/login_sms1.csp?apiversion=1"
-	log.Printf("SMS Request: " + addr)
+	log.Printf("SMS Request: %s", addr)
 	form := url.Values{
 		"svpn_inputsms": {smsCode},
 	}
@@ -187,7 +190,6 @@ func AuthSms(server string, username string, password string, twfId string, smsC
 
 	resp, err := c.Do(req)
 	if err != nil {
-		debug.PrintStack()
 		return "", err
 	}
 
@@ -195,8 +197,7 @@ func AuthSms(server string, username string, password string, twfId string, smsC
 	defer resp.Body.Close()
 
 	if !strings.Contains(string(buf[:n]), "Auth sms suc") {
-		debug.PrintStack()
-		return "", errors.New("SMS Code verification FAILED: " + string(buf[:n]))
+		return "", errors.New("SMS code verification failed: " + serverMessage(buf[:n]))
 	}
 
 	twfId = string(regexp.MustCompile(`<TwfID>(.*)</TwfID>`).FindSubmatch(buf[:n])[1])
@@ -205,19 +206,17 @@ func AuthSms(server string, username string, password string, twfId string, smsC
 	return twfId, nil
 }
 
-// JHong Implementing.......
-func TOTPAuth(server string, username string, password string, twfId string, TOTPCode string) (string, error) {
-	c := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
+// TOTPAuth 提交 TOTP 验证码，返回更新后的 TwfID。
+func (client *Client) TOTPAuth(twfId string, totpCode string) (string, error) {
+	server := client.server
+	c := client.httpClient()
 
 	buf := make([]byte, 40960)
 
 	addr := "https://" + server + "/por/login_token.csp"
-	log.Printf("TOTP token Request: " + addr)
+	log.Printf("TOTP token Request: %s", addr)
 	form := url.Values{
-		"svpn_inputtoken": {TOTPCode},
+		"svpn_inputtoken": {totpCode},
 	}
 
 	req, err := http.NewRequest("POST", addr, strings.NewReader(form.Encode()))
@@ -225,7 +224,6 @@ func TOTPAuth(server string, username string, password string, twfId string, TOT
 
 	resp, err := c.Do(req)
 	if err != nil {
-		debug.PrintStack()
 		return "", err
 	}
 
@@ -233,8 +231,7 @@ func TOTPAuth(server string, username string, password string, twfId string, TOT
 	defer resp.Body.Close()
 
 	if !strings.Contains(string(buf[:n]), "suc") {
-		debug.PrintStack()
-		return "", errors.New("TOTP token verification FAILED: " + string(buf[:n]))
+		return "", errors.New("TOTP code verification failed: " + serverMessage(buf[:n]))
 	}
 
 	twfId = string(regexp.MustCompile(`<TwfID>(.*)</TwfID>`).FindSubmatch(buf[:n])[1])
@@ -243,8 +240,13 @@ func TOTPAuth(server string, username string, password string, twfId string, TOT
 	return twfId, nil
 }
 
-func PortalToken(server string, twfId string) (string, error) {
-	dialConn, err := net.Dial("tcp", server)
+// PortalToken 取得后续二进制流协议使用的前 31 字节 token。
+func (client *Client) PortalToken(twfId string) (string, error) {
+	server := client.server
+	dialConn, err := client.Dial()
+	if err != nil {
+		return "", err
+	}
 	defer dialConn.Close()
 	conn := utls.UClient(dialConn, &utls.Config{InsecureSkipVerify: true}, utls.HelloGolang)
 	defer conn.Close()
@@ -260,8 +262,7 @@ func PortalToken(server string, twfId string) (string, error) {
 	buf := make([]byte, 40960)
 	n, err := conn.Read(buf)
 	if n == 0 || err != nil {
-		debug.PrintStack()
-		return "", errors.New("portal request failed: error " + err.Error() + "\n" + string(buf[:n]))
+		return "", errors.New("portal request failed: " + err.Error())
 	}
 
 	return hex.EncodeToString(conn.HandshakeState.ServerHello.SessionId)[:31] + "\x00", nil

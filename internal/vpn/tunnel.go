@@ -4,10 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
-	"net"
 	"os"
-	"runtime/debug"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -18,9 +17,10 @@ func DumpHex(buf []byte) {
 	stdoutDumper.Write(buf)
 }
 
-func TLSConn(server string) (*tls.UConn, error) {
+// TLSConn 建立一条隧道用的 TLS 长连接。
+func (client *Client) TLSConn() (*tls.UConn, error) {
 	// dial vpn server
-	dialConn, err := net.Dial("tcp", server)
+	dialConn, err := client.Dial()
 	if err != nil {
 		return nil, err
 	}
@@ -45,10 +45,77 @@ func TLSConn(server string) (*tls.UConn, error) {
 	return conn, nil
 }
 
-func QueryIp(server string, token *[48]byte) ([]byte, *tls.UConn, error) {
-	conn, err := TLSConn(server)
+// ProbeTunnel 走完整的隧道握手，然后立刻关闭，用来验证协议可用性。
+// 它不建立任何数据通路，也不会长期占用服务端资源。
+func (client *Client) ProbeTunnel(token *[48]byte, ipRev *[4]byte, debug bool) error {
+	_, err := client.streamHandshake(token, ipRev, streamRecv, debug)
+	return err
+}
+
+// streamKind 区分隧道里的两个方向。
+type streamKind byte
+
+const (
+	streamRecv streamKind = 0x01 // 下行：校园网 -> 本机
+	streamSend streamKind = 0x02 // 上行：本机 -> 校园网
+)
+
+func (k streamKind) String() string {
+	if k == streamRecv {
+		return "recv"
+	}
+	return "send"
+}
+
+// streamHandshake 打开一条流并完成握手，返回可用的连接。
+func (client *Client) streamHandshake(token *[48]byte, ipRev *[4]byte, kind streamKind, debug bool) (*tls.UConn, error) {
+	conn, err := client.TLSConn()
 	if err != nil {
-		debug.PrintStack()
+		return nil, err
+	}
+
+	// 0x06 请求下行流，0x05 请求上行流。
+	opcode := byte(0x06)
+	if kind == streamSend {
+		opcode = 0x05
+	}
+
+	message := []byte{opcode, 0x00, 0x00, 0x00}
+	message = append(message, token[:]...)
+	message = append(message, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}...)
+	message = append(message, ipRev[:]...)
+
+	n, err := conn.Write(message)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	log.Printf("%s handshake: wrote %d bytes", kind, n)
+	if debug {
+		DumpHex(message[:n])
+	}
+
+	reply := make([]byte, 1500)
+	n, err = conn.Read(reply)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	log.Printf("%s handshake: read %d bytes", kind, n)
+	if debug {
+		DumpHex(reply[:n])
+	}
+
+	if reply[0] != byte(kind) {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected %s handshake reply: 0x%02x", kind, reply[0])
+	}
+	return conn, nil
+}
+
+func (client *Client) QueryIp(token *[48]byte) ([]byte, *tls.UConn, error) {
+	conn, err := client.TLSConn()
+	if err != nil {
 		return nil, nil, err
 	}
 	// defer conn.Close()
@@ -61,7 +128,6 @@ func QueryIp(server string, token *[48]byte) ([]byte, *tls.UConn, error) {
 
 	n, err := conn.Write(message)
 	if err != nil {
-		debug.PrintStack()
 		return nil, nil, err
 	}
 
@@ -71,7 +137,6 @@ func QueryIp(server string, token *[48]byte) ([]byte, *tls.UConn, error) {
 	reply := make([]byte, 0x80)
 	n, err = conn.Read(reply)
 	if err != nil {
-		debug.PrintStack()
 		return nil, nil, err
 	}
 
@@ -79,48 +144,22 @@ func QueryIp(server string, token *[48]byte) ([]byte, *tls.UConn, error) {
 	DumpHex(reply[:n])
 
 	if reply[0] != 0x00 {
-		debug.PrintStack()
 		return nil, nil, errors.New("unexpected query ip reply")
 	}
 
 	return reply[4:8], conn, nil
 }
 
-func BlockRXStream(server string, token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
-	conn, err := TLSConn(server)
+func (client *Client) BlockRXStream(token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
+	conn, err := client.streamHandshake(token, ipRev, streamRecv, debug)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer conn.Close()
 
-	// RECV STREAM START
-	message := []byte{0x06, 0x00, 0x00, 0x00}
-	message = append(message, token[:]...)
-	message = append(message, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}...)
-	message = append(message, ipRev[:]...)
-
-	n, err := conn.Write(message)
-	if err != nil {
-		return err
-	}
-	log.Printf("recv handshake: wrote %d bytes", n)
-	DumpHex(message[:n])
-
 	reply := make([]byte, 1500)
-	n, err = conn.Read(reply)
-	if err != nil {
-		return err
-	}
-	log.Printf("recv handshake: read %d bytes", n)
-	DumpHex(reply[:n])
-
-	if reply[0] != 0x01 {
-		return errors.New("unexpected recv handshake reply")
-	}
-
 	for {
-		n, err = conn.Read(reply)
-
+		n, err := conn.Read(reply)
 		if err != nil {
 			return err
 		}
@@ -134,39 +173,14 @@ func BlockRXStream(server string, token *[48]byte, ipRev *[4]byte, ep *TunnelEnd
 	}
 }
 
-func BlockTXStream(server string, token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
-	conn, err := TLSConn(server)
+func (client *Client) BlockTXStream(token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
+	conn, err := client.streamHandshake(token, ipRev, streamSend, debug)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	// SEND STREAM START
-	message := []byte{0x05, 0x00, 0x00, 0x00}
-	message = append(message, token[:]...)
-	message = append(message, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}...)
-	message = append(message, ipRev[:]...)
-
-	n, err := conn.Write(message)
-	if err != nil {
-		return err
-	}
-	log.Printf("send handshake: wrote %d bytes", n)
-	DumpHex(message[:n])
-
-	reply := make([]byte, 1500)
-	n, err = conn.Read(reply)
-	if err != nil {
-		return err
-	}
-	log.Printf("send handshake: read %d bytes", n)
-	DumpHex(reply[:n])
-
-	if reply[0] != 0x02 {
-		return errors.New("unexpected send handshake reply")
-	}
-
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 
 	ep.OnRecv = func(buf []byte) {
 		var n, err = conn.Write(buf)
@@ -184,11 +198,11 @@ func BlockTXStream(server string, token *[48]byte, ipRev *[4]byte, ep *TunnelEnd
 	return <-errCh
 }
 
-func StartProtocol(endpoint *TunnelEndpoint, server string, token *[48]byte, ipRev *[4]byte, debug bool) {
+func (client *Client) StartProtocol(endpoint *TunnelEndpoint, token *[48]byte, ipRev *[4]byte, debug bool) {
 	RX := func() {
 		counter := 0
 		for counter < 5 {
-			err := BlockRXStream(server, token, ipRev, endpoint, debug)
+			err := client.BlockRXStream(token, ipRev, endpoint, debug)
 			if err != nil {
 				log.Print("Error occurred while recv, retrying: " + err.Error())
 			}
@@ -202,7 +216,7 @@ func StartProtocol(endpoint *TunnelEndpoint, server string, token *[48]byte, ipR
 	TX := func() {
 		counter := 0
 		for counter < 5 {
-			err := BlockTXStream(server, token, ipRev, endpoint, debug)
+			err := client.BlockTXStream(token, ipRev, endpoint, debug)
 			if err != nil {
 				log.Print("Error occurred while send, retrying: " + err.Error())
 			}
