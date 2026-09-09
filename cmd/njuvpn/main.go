@@ -191,7 +191,54 @@ func joinPositional(args []string) []string {
 	return rest
 }
 
-func cmdService(args []string) error { return errNotImplemented }
+// cmdService 管理操作系统服务（systemd / Windows SCM）。
+//
+//	njuvpn service install|uninstall|start|stop|restart|status
+func cmdService(args []string) error {
+	fs := flag.NewFlagSet("service", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	action := ""
+	if rest := fs.Args(); len(rest) > 0 {
+		action = rest[0]
+	}
+	if action == "" {
+		return errors.New("用法: njuvpn service install|uninstall|start|stop|restart|status")
+	}
+
+	switch action {
+	case "install":
+		if err := service.InstallService(*configPath); err != nil {
+			return err
+		}
+		fmt.Println("服务已安装，可用 njuvpn service start 启动")
+		return nil
+	case "uninstall":
+		if err := service.UninstallService(*configPath); err != nil {
+			return err
+		}
+		fmt.Println("服务已卸载")
+		return nil
+	case "status":
+		st, err := service.ServiceStatus(*configPath)
+		if err != nil {
+			return err
+		}
+		fmt.Println(st)
+		return nil
+	case "start", "stop", "restart":
+		if err := service.ControlService(*configPath, action); err != nil {
+			return err
+		}
+		fmt.Printf("服务已 %s\n", action)
+		return nil
+	default:
+		return fmt.Errorf("未知操作 %q", action)
+	}
+}
 
 // cmdProbe 走一遍完整的协议握手，用来验证服务端仍然接受当前的客户端实现。
 //

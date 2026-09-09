@@ -81,3 +81,20 @@ go build -o njuvpn ./cmd/njuvpn
 ```bash
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o njuvpn.exe ./cmd/njuvpn
 ```
+
+## 服务端建隧道受限（2026-09-09 观测）
+
+同一账号在短时间内反复建立隧道后，服务端会持续拒绝 query-ip 与
+tunnel-handshake，返回一段固定的 36 字节内存数据（首字节 0x03 或 0x08，
+含小端栈指针）。此时：
+
+- web-login、auth-sms、portal-token 仍然成功，说明 TwfID 没有过期；
+- 静置 5 分钟以上仍然失败，说明不是短时频率限制；
+- 重试越密集越失败，客户端不应无限重试。
+
+判断是服务端对同一账号的并发隧道会话数有限制，而先前建立的会话没有
+正常登出（logout.csp 返回 logout user failed）。复现路径：一天内建
+十余次隧道后即进入该状态。
+
+对策：隧道只建立一次并长期持有；异常断开后不要立刻重连，至少等待数分钟；
+StartProtocol 的重试必须加退避，不能贴着上限猛冲。
