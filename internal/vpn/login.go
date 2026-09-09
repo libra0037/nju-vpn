@@ -20,6 +20,14 @@ import (
 var ERR_NEXT_AUTH_SMS = errors.New("SMS Code required")
 var ERR_NEXT_AUTH_TOTP = errors.New("Current user's TOTP bound")
 
+// redact 只保留字符串的两端，用于在日志里标识一个凭据而不泄露它。
+func redact(s string) string {
+	if len(s) <= 4 {
+		return "***"
+	}
+	return s[:2] + "***" + s[len(s)-2:]
+}
+
 // serverMessage 从服务端返回的 XML 里提取可读的错误信息。
 // 直接把整个响应体塞进错误里，日志会变得没法看。
 func serverMessage(body []byte) string {
@@ -56,7 +64,7 @@ func (client *Client) WebLogin(username string, password string) (string, error)
 	n, _ := resp.Body.Read(buf)
 
 	twfId := string(regexp.MustCompile(`<TwfID>(.*)</TwfID>`).FindSubmatch(buf[:n])[1])
-	log.Printf("Twf Id: %s", twfId)
+	log.Printf("Twf Id: %s", redact(twfId))
 
 	rsaKey := string(regexp.MustCompile(`<RSA_ENCRYPT_KEY>(.*)</RSA_ENCRYPT_KEY>`).FindSubmatch(buf[:n])[1])
 	log.Printf("RSA Key: %s", rsaKey)
@@ -80,7 +88,8 @@ func (client *Client) WebLogin(username string, password string) (string, error)
 	} else {
 		log.Printf("WARNING: No CSRF Code Match. Maybe you're connecting to an older server? Continue anyway...")
 	}
-	log.Printf("Password to encrypt: %s", password)
+	// 密码和它的密文都不能进日志：明文是凭据本身，密文配合公开的
+	// RSA 公钥和 CSRF 码可以离线爆破。
 
 	pubKey := rsa.PublicKey{}
 	pubKey.E, _ = strconv.Atoi(rsaExp)
@@ -93,7 +102,7 @@ func (client *Client) WebLogin(username string, password string) (string, error)
 		return "", err
 	}
 	encryptedPasswordHex := hex.EncodeToString(encryptedPassword)
-	log.Printf("Encrypted Password: %s", encryptedPasswordHex)
+	log.Printf("已加密密码（%d 字节密文）", len(encryptedPasswordHex)/2)
 
 	addr = server + "/por/login_psw.csp?anti_replay=1&encrypt=1&type=cs"
 	log.Printf("Login Request: %s", addr)
@@ -164,7 +173,7 @@ func (client *Client) WebLogin(username string, password string) (string, error)
 	twfIdMatch := regexp.MustCompile(`<TwfID>(.*)</TwfID>`).FindSubmatch(buf[:n])
 	if twfIdMatch != nil {
 		twfId = string(twfIdMatch[1])
-		log.Printf("Update twfId: %s", twfId)
+		log.Printf("Update twfId: %s", redact(twfId))
 	}
 
 	log.Printf("Web Login process done.")

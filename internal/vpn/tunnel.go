@@ -113,7 +113,7 @@ func (client *Client) streamHandshake(token *[48]byte, ipRev *[4]byte, kind stre
 	return conn, nil
 }
 
-func (client *Client) QueryIp(token *[48]byte) ([]byte, *tls.UConn, error) {
+func (client *Client) QueryIp(token *[48]byte, debug bool) ([]byte, *tls.UConn, error) {
 	conn, err := client.TLSConn()
 	if err != nil {
 		return nil, nil, err
@@ -130,9 +130,7 @@ func (client *Client) QueryIp(token *[48]byte) ([]byte, *tls.UConn, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-
 	log.Printf("query ip: wrote %d bytes", n)
-	DumpHex(message[:n])
 
 	reply := make([]byte, 0x80)
 	n, err = conn.Read(reply)
@@ -141,7 +139,9 @@ func (client *Client) QueryIp(token *[48]byte) ([]byte, *tls.UConn, error) {
 	}
 
 	log.Printf("query ip: read %d bytes", n)
-	DumpHex(reply[:n])
+	if debug {
+		DumpHex(reply[:n])
+	}
 
 	if reply[0] != 0x00 {
 		return nil, nil, errors.New("unexpected query ip reply")

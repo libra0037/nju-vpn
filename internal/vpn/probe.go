@@ -92,7 +92,7 @@ func (client *Client) Probe(username, password, totpCode string, debug bool) (*P
 	var queryConn net.Conn
 	if err := step("query-ip", func() error {
 		var err error
-		clientIP, queryConn, err = client.QueryIp(full)
+		clientIP, queryConn, err = client.QueryIp(full, debug)
 		return err
 	}); err != nil {
 		return res, err
