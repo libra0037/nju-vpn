@@ -137,6 +137,16 @@ func (s *Service) Stop() error {
 	if s.state.Get().State == StateIdle {
 		return ErrNotRunning
 	}
+
+	// 先通知服务端注销会话，再关本地资源。
+	// 顺序不能反：登出需要 TWFID，而 release 会把它清掉。
+	if s.client != nil && s.twfID != "" {
+		if err := s.client.Logout(s.twfID); err != nil {
+			// 登出失败不影响本地断开，但要让用户知道服务端可能还留着会话。
+			log.Printf("服务端登出未成功: %v", err)
+		}
+	}
+
 	s.release()
 	return s.state.Transition(StateIdle, "已断开")
 }

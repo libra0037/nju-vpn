@@ -108,3 +108,23 @@ func TestUserMessageStripsPrefix(t *testing.T) {
 		t.Errorf("UserMessage 未去掉前缀: %q", got)
 	}
 }
+
+func TestClassifyLogout(t *testing.T) {
+	// 服务端登出成功的真实响应。
+	ok := `<Auth><Message><![CDATA[logout user success]]></Message><ErrorCode>1</ErrorCode></Auth>`
+	if err := classifyLogout([]byte(ok)); err != nil {
+		t.Errorf("成功响应不应报错: %v", err)
+	}
+
+	// 会话已失效时的真实响应。
+	gone := `<Auth><Message><![CDATA[logout user failed]]></Message><ErrorCode>20002</ErrorCode></Auth>`
+	if err := classifyLogout([]byte(gone)); !errors.Is(err, ErrLogoutNoSession) {
+		t.Errorf("失效会话应返回 ErrLogoutNoSession，实际 %v", err)
+	}
+
+	// 其他失败信息要报错，但不应被当成"会话不存在"。
+	bad := `<Auth><Message><![CDATA[something bad]]></Message></Auth>`
+	if err := classifyLogout([]byte(bad)); err == nil || errors.Is(err, ErrLogoutNoSession) {
+		t.Errorf("未知响应应返回一般错误，实际 %v", err)
+	}
+}

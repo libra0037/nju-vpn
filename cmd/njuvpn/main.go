@@ -249,6 +249,7 @@ func cmdProbe(args []string) error {
 	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
 	totpCode := fs.String("totp", "", "TOTP 验证码，留空则用配置里的密钥自动生成")
 	twfId := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
+	logout := fs.Bool("logout", false, "只调用服务端登出接口然后退出，不建立隧道")
 	debug := fs.Bool("debug", false, "打印每一步的报文")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -275,6 +276,17 @@ func cmdProbe(args []string) error {
 	}
 
 	client := vpn.NewClient(cfg.ServerAddr(), dialFn)
+
+	if *logout {
+		if *twfId == "" {
+			return errors.New("-logout 需要配合 -twf-id 指定要登出的会话")
+		}
+		if err := client.Logout(*twfId); err != nil {
+			return err
+		}
+		fmt.Println("服务端已注销该会话")
+		return nil
+	}
 
 	code := *totpCode
 	if code == "" && cfg.TOTPSecret != "" {
