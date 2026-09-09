@@ -78,23 +78,29 @@ go build -o njuvpn ./cmd/njuvpn
 
 交叉编译（本机 Linux，产物给 Windows 用）：
 
-```bash
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o njuvpn.exe ./cmd/njuvpn
-```
-
-## 服务端建隧道受限（2026-09-09 观测）
+## 服务端建隧道受限（2026-09-09 观测，2026-09-10 更正）
 
 同一账号在短时间内反复建立隧道后，服务端会持续拒绝 query-ip 与
 tunnel-handshake，返回一段固定的 36 字节内存数据（首字节 0x03 或 0x08，
-含小端栈指针）。此时：
+含小端栈指针）。
 
-- web-login、auth-sms、portal-token 仍然成功，说明 TwfID 没有过期；
-- 静置 5 分钟以上仍然失败，说明不是短时频率限制；
-- 重试越密集越失败，客户端不应无限重试。
+**更正**：先前以为 TwfID 长期有效，这个判断是错的。依据错在
+portal-token 阶段——rclist.csp 不校验 TWFID（不带 Cookie 也返回同样内容），
+conf.csp 用旧 TWFID 与伪造 TWFID 返回同样的 unexpected user service
+(ErrorCode 20026)，所以 PortalToken 从未验证过 TWFID 是否有效。
+实测旧 TwfID 已失效。
 
-判断是服务端对同一账号的并发隧道会话数有限制，而先前建立的会话没有
-正常登出（logout.csp 返回 logout user failed）。复现路径：一天内建
-十余次隧道后即进入该状态。
+观测事实：
 
-对策：隧道只建立一次并长期持有；异常断开后不要立刻重连，至少等待数分钟；
+- 跨午夜（自然日重置）后仍然失败；
+- 静置 5 分钟以上仍然失败；
+- 重试越密集越失败；
+- login_auth.csp 仍返回 login auth success，说明账号尚未被完全禁止登录。
+
+旧仓库 issue #13 / #11 有对应错误码：ErrorCode 20113、"not allow to login now"、"Server forbidden access!"。
+
+待确认：限额是滚动窗口（如 24 小时）还是服务端侧隧道会话泄漏。
+区分办法：等待较长时间后重试；若仍失败，去网页版注销或联系网信中心。
+
+对策：隧道只建立一次并长期持有；异常断开后不要立刻重连；
 StartProtocol 的重试必须加退避，不能贴着上限猛冲。
