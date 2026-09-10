@@ -137,6 +137,44 @@ func TestMapperRejectsWrongDirection(t *testing.T) {
 	}
 }
 
+// 回归：改写地址后 UDP 校验和可能算成 0x0000，而 RFC 768 规定线上要写全 1。
+//
+// 0x0000 的含义是"发送端没算校验和"，接收端会跳过校验——等于给对方一个
+// 可能已损坏的包（实测 100 万个随机样本里约 24 次会踩到）。
+func TestUDPChecksumZeroBecomesAllOnes(t *testing.T) {
+	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 56, 18))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := m.peerIP
+	dst := [4]byte{202, 119, 32, 69}
+
+	// 找一个"改写后恰好是 0"的原始校验和：16 位上的变换是双射，必然存在。
+	chosen := -1
+	for c := 0; c <= 0xffff; c++ {
+		v := updateChecksum(uint16(c),
+			binary.BigEndian.Uint16(src[0:2]), binary.BigEndian.Uint16(m.publicIP[0:2]))
+		v = updateChecksum(v,
+			binary.BigEndian.Uint16(src[2:4]), binary.BigEndian.Uint16(m.publicIP[2:4]))
+		if v == 0 {
+			chosen = c
+			break
+		}
+	}
+	if chosen < 0 {
+		t.Fatal("没找到会变成 0 的校验和，测试前提不成立")
+	}
+
+	pkt := buildUDP(src, dst, []byte("probe"))
+	binary.BigEndian.PutUint16(pkt[20+udpChecksumOff:], uint16(chosen))
+	if _, err := m.Uplink(pkt); err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.BigEndian.Uint16(pkt[20+udpChecksumOff:]); got != 0xffff {
+		t.Errorf("改写后校验和 = 0x%04x，应为 0xffff", got)
+	}
+}
+
 func TestUDPZeroChecksumUntouched(t *testing.T) {
 	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
 	if err != nil {

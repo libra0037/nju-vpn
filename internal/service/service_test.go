@@ -582,6 +582,37 @@ func TestSetPeerRejectsBadKey(t *testing.T) {
 	}
 }
 
+// 回归：隧道已经在跑时再敲一次 start，报的是"状态不允许"（IPC 层映射成 409），
+// 而不是 500 —— 脚本据此区分"用法问题"和"服务端故障"。
+func TestStartOnRunningTunnelReportsBadState(t *testing.T) {
+	h := newHarness(t)
+	h.portal.Set("/por/login_psw.csp", vpntest.Response{
+		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
+	})
+	h.portal.Set("/por/login_sms.csp", vpntest.Response{
+		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
+	})
+	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
+		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
+	})
+	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	}
+	if err := h.svc.Auth("123456"); err != nil {
+		t.Fatalf("提交验证码失败: %v", err)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	err := h.svc.Start()
+	if !errors.Is(err, ErrBadState) {
+		t.Fatalf("隧道已在运行时 start 应返回 ErrBadState，实际 %v", err)
+	}
+	// 已经在跑的隧道不该被这次调用拆掉。
+	if st := h.svc.Status().State; st != StateUp {
+		t.Errorf("状态被改成了 %s", st)
+	}
+}
+
 // 回归：退出期间挤进 actor 的命令必须被拒绝。
 //
 // Close 已经走过登出，此时若还执行 start，就会新建一条没人管的会话，

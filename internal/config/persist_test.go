@@ -37,6 +37,8 @@ func TestPersistPrivateKeyReplacesExistingLine(t *testing.T) {
 	wants := []string{
 		"# njuvpn 配置",
 		"# 对外暴露的 UDP 端口",
+		// 被改写的那一行自己的行尾注释也不能丢。
+		"# 留空则首次启动自动生成",
 		"listen_port: 51820",
 		"peer_address: 10.66.66.2",
 	}

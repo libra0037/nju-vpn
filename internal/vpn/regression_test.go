@@ -151,6 +151,36 @@ func TestStreamTokenLengthValidation(t *testing.T) {
 }
 
 // 回归：会话标识是 16 字符，redact 保留尾部会泄漏其中两个字符。
+// 回归：服务端回了预期之外的字节时必须终止重试。
+//
+// 这类错误不会自愈，而密集重试会把账号打进服务端的"被拒"状态，
+// 每次重试都要等满退避（3 次 × 30 秒）才报错。
+func TestRetryableTreatsProtocolErrorAsTerminal(t *testing.T) {
+	proto := &ProtocolError{Step: "query-ip", Reason: "控制码 0x0f"}
+	if retryable(proto) {
+		t.Error("协议不符不该被当成可重试")
+	}
+	// 控制码仍然按自己的规则走：可重试的照样可重试。
+	if !retryable(&ControlError{Code: ControlServerReset}) {
+		t.Error("ServerReset 应当可重试")
+	}
+}
+
+// 回归：标签内容可能跨行（服务端在 CDATA 里放多行文本），
+// 只匹配单行会取不到值，报成"缺少该标签"。
+func TestTagValueMatchesAcrossLines(t *testing.T) {
+	body := []byte("<Auth>" + "\n" +
+		"<Message><![CDATA[第一行" + "\n" + "第二行]]></Message>" + "\n" +
+		"</Auth>")
+	got, ok := tagValue(body, "Message")
+	if !ok {
+		t.Fatal("跨行的标签内容也要能取到")
+	}
+	if !strings.Contains(got, "第二行") {
+		t.Errorf("内容不完整: %q", got)
+	}
+}
+
 func TestRedactDoesNotLeakTail(t *testing.T) {
 	secret := "0123456789abcdef"
 	got := redact(secret)

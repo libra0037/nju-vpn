@@ -250,5 +250,11 @@ func retryable(err error) bool {
 	if errors.As(err, &ctrl) {
 		return ctrl.Retryable()
 	}
+	// 协议不符不会自愈：服务端回了预期之外的字节，重试只是白烧配额
+	//（密集重试会把账号打进被拒状态）。
+	var proto *ProtocolError
+	if errors.As(err, &proto) {
+		return false
+	}
 	return true
 }

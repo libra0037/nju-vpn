@@ -167,6 +167,9 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			return ipc.Response{Code: ipc.CodeOK, Message: "隧道已建立"}
 		case errors.Is(err, ErrAuthRequired):
 			return ipc.Response{Code: ipc.CodeAuthRequired, Message: s.svc.Status().Detail}
+		case errors.Is(err, ErrBadState):
+			// 已经在跑时又敲一次 start 是常见操作，不该报成服务端故障。
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
 		case errors.Is(err, ErrShuttingDown):
 			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
 		default:
@@ -280,7 +283,9 @@ func RunServer(svc *Service, endpoint string) error {
 		}
 		srv.Shutdown()
 	}()
-	defer signal.Stop(signals)
+	// 故意不 signal.Stop：收尾（登出）由调用方在 Serve 返回之后做，
+	// 这段时间里第二个 Ctrl-C 必须被吞掉而不是立刻终止进程——默认动作
+	// 会把登出请求打断，服务端名额要等它自己超时才释放。
 
 	err = srv.Serve()
 	srv.Shutdown()

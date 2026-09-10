@@ -25,6 +25,9 @@ func DefaultEndpoint() string {
 // dialProbeTimeout 是探测"这个套接字上还有没有活实例"的超时。
 const dialProbeTimeout = 300 * time.Millisecond
 
+// dialTimeout 是连接服务进程的超时，与 Windows 侧保持一致。
+const dialTimeout = 5 * time.Second
+
 // Listen 在 Unix 域套接字上监听。
 //
 // 套接字与目录都收紧到属主专用：这个通道能启动隧道、提交验证码。
@@ -100,7 +103,9 @@ func Dial(endpoint string) (net.Conn, error) {
 	if endpoint == "" {
 		endpoint = DefaultEndpoint()
 	}
-	conn, err := net.Dial("unix", endpoint)
+	// 带超时：服务进程活着但不再 accept 时，没有超时的 connect 会永久挂住，
+	// 客户端连 SetDeadline 都执行不到。
+	conn, err := net.DialTimeout("unix", endpoint, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接服务进程 %s: %w（服务是否在运行？）", endpoint, err)
 	}

@@ -31,7 +31,9 @@ func tagRegexp(tag string) *regexp.Regexp {
 		return v.(*regexp.Regexp)
 	}
 	quoted := regexp.QuoteMeta(tag)
-	re := regexp.MustCompile("<" + quoted + ">(.*)</" + quoted + ">")
+	// (?s) 让点号也匹配换行：服务端会在 CDATA 里放多行文本，
+	// 不跨行匹配会取不到值，报成"缺少该标签"。
+	re := regexp.MustCompile("(?s)<" + quoted + ">(.*?)</" + quoted + ">")
 	actual, _ := tagRegexps.LoadOrStore(tag, re)
 	return actual.(*regexp.Regexp)
 }

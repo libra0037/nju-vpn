@@ -93,6 +93,11 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 		c := binary.BigEndian.Uint16(buf[off:])
 		c = updateChecksum(c, binary.BigEndian.Uint16(old[0:2]), binary.BigEndian.Uint16(new[0:2]))
 		c = updateChecksum(c, binary.BigEndian.Uint16(old[2:4]), binary.BigEndian.Uint16(new[2:4]))
+		// RFC 768：算出来是 0 时线上要写全 1。写成 0x0000 会被接收端
+		// 理解成"发送端没算校验和"，从而跳过校验。
+		if c == 0 {
+			c = 0xffff
+		}
 		binary.BigEndian.PutUint16(buf[off:], c)
 
 	case protocolUDP:
@@ -107,6 +112,11 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 		}
 		c = updateChecksum(c, binary.BigEndian.Uint16(old[0:2]), binary.BigEndian.Uint16(new[0:2]))
 		c = updateChecksum(c, binary.BigEndian.Uint16(old[2:4]), binary.BigEndian.Uint16(new[2:4]))
+		// RFC 768：算出来是 0 时线上要写全 1。写成 0x0000 会被接收端
+		// 理解成"发送端没算校验和"，从而跳过校验。
+		if c == 0 {
+			c = 0xffff
+		}
 		binary.BigEndian.PutUint16(buf[off:], c)
 	}
 }

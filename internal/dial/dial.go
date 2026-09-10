@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -45,14 +46,40 @@ func New(proxy string) (DialFunc, error) {
 
 	switch u.Scheme {
 	case "http", "https":
+		if u.Hostname() == "" {
+			return nil, fmt.Errorf("代理地址 %q 缺少主机名", proxy)
+		}
+		warnCleartextCredentials(u)
 		return httpProxyDialer(u)
 	case "socks5", "socks5h":
+		if u.Hostname() == "" {
+			return nil, fmt.Errorf("代理地址 %q 缺少主机名", proxy)
+		}
+		warnCleartextCredentials(u)
 		return socks5ProxyDialer(u)
 	case "":
 		return nil, fmt.Errorf("代理地址 %q 缺少协议前缀，例如 http://127.0.0.1:7897", proxy)
 	default:
 		return nil, fmt.Errorf("不支持的代理协议 %q", u.Scheme)
 	}
+}
+
+// warnCleartextCredentials 在凭据会明文上网时提醒一句。
+//
+// http 与 socks5 的用户名口令是不加密的（这是协议本身的性质），
+// 只对本机代理安全；真要走远程，应该用 https 代理。
+func warnCleartextCredentials(u *url.URL) {
+	if u.User == nil || u.Scheme == "https" {
+		return
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return
+	}
+	log.Printf("警告: 代理 %s 的凭据是明文发送的，只应对本机代理使用", u.Redacted())
 }
 
 // httpProxyDialer 通过 HTTP 代理的 CONNECT 方法建到目标地址的隧道。
@@ -107,12 +134,14 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 			conn.Close()
 			return nil, fmt.Errorf("读取代理响应: %w", err)
 		}
-		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
 			conn.Close()
 			return nil, fmt.Errorf("代理拒绝 CONNECT %s: %s", address, resp.Status)
 		}
+		// 成功时不再碰 resp：不合规的代理若在 200 里带 Content-Length，
+		// 关闭 body 会把隧道开头的字节一起吃掉，表现为握手时报"响应不符合协议"。
 
 		if err := conn.SetDeadline(time.Time{}); err != nil {
 			conn.Close()
@@ -215,8 +244,28 @@ func socks5Handshake(conn net.Conn, u *url.URL, address string) error {
 		return fmt.Errorf("解析目标端口 %q: %w", portStr, err)
 	}
 
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
-	req = append(req, host...)
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("目标端口越界: %q", portStr)
+	}
+
+	// 地址类型按字面量给：IP 直接发二进制地址，只有域名才交给代理解析
+	//（把 IP 当域名发过去，代理那边会多一次不必要的解析；IPv6 还会失败）。
+	req := []byte{0x05, 0x01, 0x00}
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			req = append(req, 0x01)
+			req = append(req, v4...)
+		} else {
+			req = append(req, 0x04)
+			req = append(req, ip.To16()...)
+		}
+	} else {
+		if len(host) > 255 {
+			return fmt.Errorf("域名过长（%d 字节）", len(host))
+		}
+		req = append(req, 0x03, byte(len(host)))
+		req = append(req, host...)
+	}
 	req = binary.BigEndian.AppendUint16(req, uint16(port))
 
 	if _, err := conn.Write(req); err != nil {

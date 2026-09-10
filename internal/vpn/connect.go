@@ -199,7 +199,6 @@ func (c *Client) Connect(ctx context.Context, opt ConnectOptions) (*Session, err
 
 	ip, queryConn, err := c.acquireIP(ctx, opt, streamTok)
 	if err != nil {
-		opt.Trace.add("query-ip", 0, err)
 		return sess, err
 	}
 	sess.ip = ip
@@ -207,7 +206,6 @@ func (c *Client) Connect(ctx context.Context, opt ConnectOptions) (*Session, err
 	sess.mu.Lock()
 	sess.queryConn = queryConn
 	sess.mu.Unlock()
-	sess.trace.add("query-ip", 0, nil)
 
 	return sess, nil
 }

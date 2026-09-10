@@ -239,6 +239,9 @@ func validateHost(field, host string) error {
 			return fmt.Errorf("%s 含非法字符: %q", field, host)
 		}
 	}
+	if strings.ContainsAny(host, "[]%@") {
+		return fmt.Errorf("%s 含非法字符（方括号、百分号或 @）: %q", field, host)
+	}
 	return nil
 }
 
@@ -295,7 +298,9 @@ func persistWireGuardField(path, field, value string) error {
 		}
 		sectionEnd = i
 		if strings.HasPrefix(trimmed, field+":") {
-			lines[i] = line[:indent] + field + ": " + value
+			// 保留行尾注释：样例文件里 private_key 那行就带着说明，
+			// 写回私钥时丢掉它等于破坏用户手写的配置。
+			lines[i] = line[:indent] + field + ": " + value + commentOf(line)
 			return writePreservingMode(path, fi, lines)
 		}
 	}
@@ -310,6 +315,17 @@ func persistWireGuardField(path, field, value string) error {
 		lines = append(lines, "wireguard:", "  "+field+": "+value)
 	}
 	return writePreservingMode(path, fi, lines)
+}
+
+// commentOf 取出行尾注释（连前面的分隔空格），没有注释就返回空串。
+//
+// 只用于我们自己改写的那一行：值里不可能出现 #（是 base64 或十六进制）。
+func commentOf(line string) string {
+	i := strings.Index(line, "#")
+	if i < 0 {
+		return ""
+	}
+	return " " + strings.TrimSpace(line[i:])
 }
 
 // writePreservingMode 写回文件并保持原有权限。

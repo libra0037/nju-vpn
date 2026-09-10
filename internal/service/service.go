@@ -20,6 +20,10 @@ import (
 // ErrNotRunning 表示服务进程还没有建立隧道。
 var ErrNotRunning = errors.New("隧道未运行")
 
+// ErrBadState 表示当前状态不允许该操作（例如隧道已经建立时又敲 start）。
+// 这是客户端用法问题，不是服务端故障，IPC 层据此回 409 而不是 500。
+var ErrBadState = errors.New("当前状态不允许该操作")
+
 // ErrAuthRequired 表示需要提交验证码才能继续。
 var ErrAuthRequired = errors.New("需要二次验证")
 
@@ -293,7 +297,7 @@ func (s *Service) start(ctx context.Context) error {
 	case StateIdle, StateError:
 		s.teardown("")
 	default:
-		return fmt.Errorf("当前状态是 %s，无法开始新的连接", cur)
+		return fmt.Errorf("%w: 当前状态是 %s", ErrBadState, cur)
 	}
 
 	if err := s.status.set(StateLoggingIn, "正在登录"); err != nil {
@@ -415,18 +419,21 @@ func (s *Service) setPeer(publicKey string) error {
 		return fmt.Errorf("peer 公钥: %w", err)
 	}
 
+	// 先落盘再动设备：反过来的话，写回失败时设备已经用上新公钥、
+	// 内存里的配置还是旧的，隧道重建后又变回旧公钥——客户端表现为
+	// "接不上"，而日志只说写文件失败。
+	if path := s.cfg.SourcePath(); path != "" {
+		if err := config.PersistPeerPublicKey(path, key.String()); err != nil {
+			return fmt.Errorf("写回配置文件失败: %w", err)
+		}
+	}
+
 	applied := false
 	if dev := s.currentDevice(); dev != nil {
 		if err := dev.SetPeer(key, net.ParseIP(s.cfg.WireGuard.PeerAddress)); err != nil {
 			return err
 		}
 		applied = true
-	}
-
-	if path := s.cfg.SourcePath(); path != "" {
-		if err := config.PersistPeerPublicKey(path, key.String()); err != nil {
-			return fmt.Errorf("写回配置文件失败: %w", err)
-		}
 	}
 	s.cfg.WireGuard.PeerPublicKey = key.String()
 
@@ -527,6 +534,15 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 	s.gen++
 	gen := s.gen
 	go func() {
+		defer func() {
+			// 隧道协程没有命令层的 recover 保护：真崩了要收敛成一次
+			// "隧道断开"，而不是带走整个进程（进程一死就没人登出了）。
+			if r := recover(); r != nil {
+				panicErr := fmt.Errorf("隧道协程内部错误: %v", r)
+				log.Printf("%v\n%s", panicErr, debug.Stack())
+				s.reportTunnelDown(gen, panicErr)
+			}
+		}()
 		err := sess.RunWithRetry(runCtx, vpn.DefaultRetryPolicy())
 		s.reportTunnelDown(gen, err)
 	}()

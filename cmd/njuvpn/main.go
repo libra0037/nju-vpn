@@ -248,7 +248,9 @@ func cmdAuth(args []string) error {
 		}
 	}
 
-	return runCommand("auth", args, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 2*time.Minute)
+	// 超时给足：服务端最坏路径是 submitCode + portalToken + acquireIP
+	//（3 次尝试 × 30 秒退避），加起来可能超过 3 分钟。
+	return runCommand("auth", args, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 5*time.Minute)
 }
 
 // splitFlags 把 -flag value / -flag=value 这类参数挑到前面，其余保持原序。
