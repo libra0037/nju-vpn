@@ -10,6 +10,7 @@ import (
 	"njuvpn/internal/config"
 	"njuvpn/internal/vpn"
 	"njuvpn/internal/vpntest"
+	"njuvpn/internal/wireguard"
 )
 
 // harness 装一套假的 portal 与假隧道，用来在没有校园网的情况下
@@ -34,12 +35,17 @@ func newHarness(t *testing.T) *harness {
 	})
 
 	cfg := &config.Config{
-		Server:    "vpn.example.edu",
-		Port:      443,
-		Username:  "u",
-		Password:  "p",
-		MTU:       1320,
-		WireGuard: config.WireGuard{PeerAddress: "10.66.66.2"},
+		Server:   "vpn.example.edu",
+		Port:     443,
+		Username: "u",
+		Password: "p",
+		MTU:      1320,
+		WireGuard: config.WireGuard{
+			PeerAddress: "10.66.66.2",
+			// 承载层需要一个能用的私钥；这里现生成，端口取 0 让系统分配。
+			PrivateKey: testPrivateKey(t),
+			ListenPort: 0,
+		},
 	}
 
 	svc := New(cfg)
@@ -55,6 +61,16 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(svc.Close)
 
 	return &harness{svc: svc, portal: portal, tunnel: tunnel}
+}
+
+// testPrivateKey 生成一个测试用的 WireGuard 私钥。
+func testPrivateKey(t *testing.T) string {
+	t.Helper()
+	key, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key.String()
 }
 
 // waitState 等待服务进入某个状态。

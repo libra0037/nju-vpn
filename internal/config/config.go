@@ -8,12 +8,16 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Config 是服务进程的全部可配置项。
 type Config struct {
+	// sourcePath 是这份配置的来源文件，用于把生成的内容写回原文件。
+	sourcePath string
+
 	Server string `yaml:"server"`
 	// ServerIP 可选：服务端域名在本机解析不了时，直接连这个地址，
 	// 协议层仍用 Server 生成 Host 头。
@@ -50,6 +54,9 @@ const (
 	MinMTU = 576
 	MaxMTU = 1400
 )
+
+// SourcePath 返回这份配置的来源文件路径。
+func (c *Config) SourcePath() string { return c.sourcePath }
 
 // DefaultPath 返回当前平台的默认配置文件路径。
 func DefaultPath() string {
@@ -104,6 +111,7 @@ func load(path string) (*Config, error) {
 	}
 
 	var cfg Config
+	cfg.sourcePath = path
 	// KnownFields 让键名写错时直接报错，而不是静默回落默认值。
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -207,6 +215,82 @@ func validateHost(field, host string) error {
 		if r <= ' ' || r == '/' || r == '\\' {
 			return fmt.Errorf("%s 含非法字符: %q", field, host)
 		}
+	}
+	return nil
+}
+
+// PersistPrivateKey 把自动生成的 WireGuard 私钥写回配置文件。
+//
+// 就地替换 wireguard 段里的 private_key 行，保留原有的注释——用 YAML
+// 序列化整份配置会把注释全部丢掉，而那份文件是给人看的。
+// 找不到对应行时按情况插入或追加一段。
+func PersistPrivateKey(path, key string) error {
+	if path == "" {
+		return fmt.Errorf("没有配置文件路径")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	sectionAt := -1  // wireguard: 所在行
+	sectionEnd := -1 // wireguard 段的最后一行
+	inSection := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		if indent == 0 {
+			if inSection {
+				sectionEnd = i - 1
+				inSection = false
+			}
+			if strings.HasPrefix(trimmed, "wireguard:") {
+				sectionAt = i
+				sectionEnd = i
+				inSection = true
+			}
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		sectionEnd = i
+		if strings.HasPrefix(trimmed, "private_key:") {
+			lines[i] = line[:indent] + "private_key: " + key
+			return writePreservingMode(path, fi, lines)
+		}
+	}
+
+	switch {
+	case sectionAt >= 0:
+		// 有 wireguard 段但没有 private_key 行，插到段尾。
+		insertAt := sectionEnd + 1
+		lines = append(lines[:insertAt], append([]string{"  private_key: " + key}, lines[insertAt:]...)...)
+	default:
+		// 完全没有 wireguard 段，追加一段。
+		lines = append(lines, "wireguard:", "  private_key: "+key)
+	}
+	return writePreservingMode(path, fi, lines)
+}
+
+// writePreservingMode 写回文件并保持原有权限。
+func writePreservingMode(path string, fi os.FileInfo, lines []string) error {
+	content := strings.Join(lines, "\n")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), fi.Mode().Perm()); err != nil {
+		return fmt.Errorf("写入 %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("替换 %s: %w", path, err)
 	}
 	return nil
 }

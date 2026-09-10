@@ -24,6 +24,7 @@ import (
 	"njuvpn/internal/ipc"
 	"njuvpn/internal/service"
 	"njuvpn/internal/vpn"
+	"njuvpn/internal/wireguard"
 )
 
 const prog = "njuvpn"
@@ -116,12 +117,54 @@ func cmdRun(args []string) error {
 		log.Printf("出站路径: %s", cfg.Proxy)
 	}
 
+	// WireGuard 私钥缺失时生成一个并写回配置：服务端公钥要填到客户端配置里，
+	// 每次重启换一个会让客户端配置失效。
+	if cfg.WireGuard.PrivateKey == "" {
+		if err := generateWireGuardKey(cfg); err != nil {
+			log.Printf("警告: %v", err)
+		}
+	}
+	logWireGuardPublicKey(cfg)
+
 	svc := service.New(cfg)
 	// 退出路径上无条件登出：服务端同一账号只允许一个客户端，
 	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
 	return service.RunPlatform(svc, cfg.IPC.Endpoint)
+}
+
+// generateWireGuardKey 生成私钥并写回配置文件。
+func generateWireGuardKey(cfg *config.Config) error {
+	key, err := wireguard.GenerateKey()
+	if err != nil {
+		return fmt.Errorf("生成 WireGuard 私钥失败: %w", err)
+	}
+	cfg.WireGuard.PrivateKey = key.String()
+	if err := config.PersistPrivateKey(cfg.SourcePath(), key.String()); err != nil {
+		return fmt.Errorf("私钥已生成但无法写回 %s（%v）；重启后公钥会变，客户端需要重新配置",
+			cfg.SourcePath(), err)
+	}
+	log.Printf("已生成 WireGuard 私钥并写回 %s", cfg.SourcePath())
+	return nil
+}
+
+// logWireGuardPublicKey 打印服务端公钥，用户需要把它填进客户端配置。
+func logWireGuardPublicKey(cfg *config.Config) {
+	if cfg.WireGuard.PrivateKey == "" {
+		return
+	}
+	key, err := wireguard.ParseKey(cfg.WireGuard.PrivateKey)
+	if err != nil {
+		log.Printf("警告: wireguard.private_key 无法解析: %v", err)
+		return
+	}
+	pub, err := key.PublicKey()
+	if err != nil {
+		log.Printf("警告: 推导 WireGuard 公钥失败: %v", err)
+		return
+	}
+	log.Printf("WireGuard 服务端公钥: %s", pub.String())
 }
 
 func cmdStart(args []string) error {

@@ -67,7 +67,7 @@ type Service struct {
 	clientFactory func(cfg *config.Config) (*vpn.Client, error)
 	client        *vpn.Client
 	session       *vpn.Session
-	relay         *wireguard.Relay
+	device        *wireguard.Device
 	runCancel     context.CancelFunc
 	gen           uint64
 	pendingAuth   *vpn.AuthRequiredError
@@ -401,11 +401,34 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 		return s.fail(fmt.Errorf("地址映射: %w", err))
 	}
 
-	s.relay = wireguard.NewRelay(wireguard.RelayOptions{
-		MTU:      s.cfg.MTU,
-		Endpoint: sess.Endpoint(),
-		Mapper:   mapper,
+	privateKey, err := wireguard.ParseKey(s.cfg.WireGuard.PrivateKey)
+	if err != nil {
+		return s.fail(fmt.Errorf("wireguard.private_key: %w", err))
+	}
+	var peerKey wireguard.Key
+	if s.cfg.WireGuard.PeerPublicKey != "" {
+		peerKey, err = wireguard.ParseKey(s.cfg.WireGuard.PeerPublicKey)
+		if err != nil {
+			return s.fail(fmt.Errorf("wireguard.peer_public_key: %w", err))
+		}
+	}
+
+	dev, err := wireguard.NewDevice(wireguard.DeviceOptions{
+		MTU:           s.cfg.MTU,
+		Endpoint:      sess.Endpoint(),
+		Mapper:        mapper,
+		PrivateKey:    privateKey,
+		ListenPort:    s.cfg.WireGuard.ListenPort,
+		PeerPublicKey: peerKey,
+		PeerAddress:   net.ParseIP(s.cfg.WireGuard.PeerAddress),
+		Verbose:       s.cfg.Log.Level == "debug",
 	})
+	if err != nil {
+		return s.fail(fmt.Errorf("启动 WireGuard 承载: %w", err))
+	}
+	s.device = dev
+
+	log.Printf("WireGuard 承载已启动: %s", s.bearerSummary(dev, peerKey))
 
 	s.status.setAddresses(sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
 	// 先进入 up 再启动隧道协程：如果协程立刻就失败，
@@ -460,6 +483,24 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 	}
 	_ = s.status.set(StateError, detail)
 	return nil
+}
+
+// bearerSummary 描述承载层的监听状态。
+//
+// 配置里端口写 0 时由系统分配，日志要给出真实端口而不是一个 0。
+func (s *Service) bearerSummary(dev *wireguard.Device, peerKey wireguard.Key) string {
+	port := s.cfg.WireGuard.ListenPort
+	if actual, err := dev.ListenPort(); err == nil && actual > 0 {
+		port = actual
+	}
+	listen := fmt.Sprintf("UDP %d", port)
+	if port == 0 {
+		listen = "UDP 端口由系统分配"
+	}
+	if peerKey.IsZero() {
+		return listen + " 在监听，但没有配置 peer_public_key，任何客户端都无法接入"
+	}
+	return fmt.Sprintf("%s，peer %s，端口对外开放后客户端即可接入", listen, s.cfg.WireGuard.PeerAddress)
 }
 
 // logTrace 把各阶段耗时与结果写进日志，供失败后定位。
@@ -520,9 +561,9 @@ func (s *Service) teardown(detail string) {
 		s.runCancel()
 		s.runCancel = nil
 	}
-	if s.relay != nil {
-		s.relay.Close()
-		s.relay = nil
+	if s.device != nil {
+		s.device.Close()
+		s.device = nil
 	}
 	if s.session != nil {
 		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，

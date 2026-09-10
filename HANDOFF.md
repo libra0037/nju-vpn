@@ -198,9 +198,8 @@ RSA 公钥 2048 位、指数 65537，CSRF 码 9 字节。
 
 同一天早些时候还成功分配过 172.29.56.18，说明地址在 172.29.56.x 里轮转。
 
-**注意 `up` 的准确含义**：它只表示校园网隧道通了（登录、token、
-query-ip、两条流都在）。WireGuard 承载层还没接线——没有创建 device、
-没有 UDP bind、没有加载密钥与 peer，所以此时还不能从本机走隧道上网。
+**注意 `up` 的准确含义**：它表示校园网隧道通了（真机已验收到 172.29.56.18），（登录、token、
+query-ip、两条流都在）。WireGuard 承载层已经在监听（见 6.7 节），此时已可从客户端接入。
 
 ### 短信接口的语义（踩坑记录）
 
@@ -227,6 +226,35 @@ TwfID 时沿用原值）。如果按"释放上一个会话"处理，登出会把
 Shutdown(8) 拒绝。现在 `attach` 与 `auth` 都会识别"同一个服务端会话"，
 只释放本地资源、不登出。
 
+## 6.7 WireGuard 承载层（已接线）
+
+承载层用的是用户态 wireguard-go，**不创建 TUN 网卡、不需要 root**：
+
+    Clash Verge / sing-box（客户端，自带用户态网络栈）
+      ↕ WireGuard UDP（默认 51820）
+    wireguard-go Device（本进程）
+      ↕ internal/wireguard.Relay：内存里的 tun.Device，按 IPv4 总长度分帧
+      ↕ internal/wireguard.Mapper：peer 地址 ↔ 校园网分配的地址，含校验和增量修正
+      ↕ 校园网隧道（TLS 上的私有协议）
+
+关键点：
+
+- 私钥留空时首次启动自动生成、按 RFC 7748 夹紧，并**就地写回配置文件**
+  （只替换 private_key 那一行，注释与其它字段原样保留）。启动日志会打印
+  服务端公钥，客户端配置要用它。
+- UAPI 里的密钥是**十六进制**，配置文件里是 **base64**，两者不能混。
+- 客户端 Outbound 需要这三项：服务端公钥、peer 地址（默认 10.66.66.2）、
+  以及 `allowed_ips` 用 0.0.0.0/0。这样默认路由才走隧道，流量才会被承载层
+  改写后送进校园网。
+- 从校园网里到不了这台机器时（笔记本与台式机不在同一网段），UDP 有两个办法：
+  一是让它走已有的 SOCKS/HTTP 隧道转发 UDP；二是在本机用 `socat`/
+  `udp2raw` 之类的工具把 UDP 映射到一条已打通的 TCP 通道上。
+  目前实现里 `wireguard.listen_port` 只在本机监听，没有走代理。
+
+验证方式：`internal/wireguard/loopback_test.go` 用一台真实的 wireguard-go 设备
+（客户端）+ 内存 TUN 做回环，覆盖握手、加密、双向包转发、地址改写、
+未授权客户端被拒、Close 后停止转发。不需要网卡也不需要 root。
+
 ## 7. 参考实现（协议对照）
 
 1. **sunnysab/smelly-connect**（Rust）— 含 `smelly-tls`，从零实现的 TLS 1.1 客户端。
@@ -238,7 +266,7 @@ Shutdown(8) 拒绝。现在 `attach` 与 `auth` 都会识别"同一个服务端�
 ## 8. 待办
 
 - [ ] 端到端联调：服务进程 `start` → `auth` → 状态 `up` → WireGuard 客户端接入
-- [ ] WireGuard 私钥首次启动自动生成并写回配置
+- [x] WireGuard 私钥首次启动自动生成并写回配置
 - [ ] 真机验证 `service install` 与 systemd 单元
 - [x] 配置文件权限检查（拒绝 group/other 可读）
 - [x] 协议层与服务层的健壮性重构（见第 9 节）
