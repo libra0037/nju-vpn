@@ -159,6 +159,28 @@ IPv4 `个人服务器`**，不存在轮换。
 - **旧仓库 `NJUConnect` 只读**。
 - **凭据不入库**。`config.yaml` 已在 `.gitignore`，权限 600。
 
+## 6.5 线上格式已被 golden 测试与实测钉住
+
+重构后新增 `internal/vpn/wire_format_test.go`：把隧道 ClientHello 的三个参数、
+流握手帧（64 字节）、query-ip 帧（64 字节）、token 布局、地址反序全部写成常量断言。
+这些值都是从旧实现逐字节核对过的，改动后会立刻失败。
+
+2026-09-10 于宿舍网段实测（不消耗账号配额，见 `internal/vpn/live_hello_test.go`）：
+
+| 构造 | 服务端反应 | 结论 |
+|---|---|---|
+| 隧道 ClientHello（TLS1.1 + RC4-SHA + SessionId 以 L3IP 开头） | 握手成功，约 5ms | 可用 |
+| 同样构造但 SessionId 换成 NOPE | `remote error: tls: handshake failure` | **L3IP 是判别位** |
+| 同样构造但版本改成 TLS 1.2 | `server selected unsupported protocol version 302` | 服务端强制 TLS 1.1（0x0302） |
+| 同样构造但 SessionId 为空 | `remote error: tls: handshake failure` | 那个 SessionId 不能省 |
+| 普通 ClientHello（HelloGolang） | 握手成功 | 443 端口同时服务 Web 登录，因此普通 TLS 成功是正常的 |
+
+注意最后一行：**"普通 TLS 也能握手成功"是预期行为**，不能据此认为服务端不区分隧道；
+真正的判别依据是上面第二行的反例。
+
+登录页实测：2431 字节、12ms，返回的 TwfID 恰好 16 字节（与 token 布局假设一致），
+RSA 公钥 2048 位、指数 65537，CSRF 码 9 字节。
+
 ## 7. 参考实现（协议对照）
 
 1. **sunnysab/smelly-connect**（Rust）— 含 `smelly-tls`，从零实现的 TLS 1.1 客户端。

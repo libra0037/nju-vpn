@@ -256,6 +256,10 @@ type Tunnel struct {
 	uplink      [][]byte
 	downlink    int
 
+	// 最近一次收到的握手报文原文，用于逐字节核对线上格式。
+	queryFrame  []byte
+	streamFrame map[byte][]byte
+
 	recvConn net.Conn
 	recvCh   chan struct{}
 	onUplink func([]byte)
@@ -268,6 +272,7 @@ func NewTunnel() *Tunnel {
 		ip:           [4]byte{172, 29, 56, 18},
 		rejectStream: make(map[byte]byte),
 		recvCh:       make(chan struct{}, 8),
+		streamFrame:  make(map[byte][]byte),
 	}
 }
 
@@ -372,6 +377,20 @@ func (t *Tunnel) CloseRecvStream() {
 	}
 }
 
+// QueryFrame 返回最近一次收到的 query-ip 报文原文。
+func (t *Tunnel) QueryFrame() []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.queryFrame...)
+}
+
+// StreamFrame 返回某方向最近一次收到的流握手报文原文。
+func (t *Tunnel) StreamFrame(kind byte) []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.streamFrame[kind]...)
+}
+
 // Dial 是注入给 vpn.Options 的 TLSDialFunc。
 func (t *Tunnel) Dial(ctx context.Context) (net.Conn, error) {
 	client, server := net.Pipe()
@@ -414,9 +433,9 @@ func (t *Tunnel) serve(server net.Conn) {
 	case bytes.Equal(head, []byte("GET ")):
 		t.servePortalToken(r, server)
 	case head[0] == 0x00:
-		t.serveQueryIP(r, server)
+		t.serveQueryIP(r, server, head)
 	case head[0] == 0x05 || head[0] == 0x06:
-		t.serveStream(r, server, head[0])
+		t.serveStream(r, server, head[0], head)
 	}
 }
 
@@ -432,14 +451,18 @@ func (t *Tunnel) servePortalToken(r *bufio.Reader, server net.Conn) {
 }
 
 // serveQueryIP 应答 query-ip，然后保持连接打开。
-func (t *Tunnel) serveQueryIP(r *bufio.Reader, server net.Conn) {
-	if _, err := io.CopyN(io.Discard, r, streamTokenLen+8); err != nil {
+func (t *Tunnel) serveQueryIP(r *bufio.Reader, server net.Conn, head []byte) {
+	frame := append([]byte(nil), head...)
+	rest := make([]byte, queryFrameLen-4)
+	if _, err := io.ReadFull(r, rest); err != nil {
 		return
 	}
+	frame = append(frame, rest...)
 
 	t.mu.Lock()
 	reject := t.rejectQueryIP
 	ip := t.ip
+	t.queryFrame = frame
 	t.queryIP++
 	t.mu.Unlock()
 
@@ -457,13 +480,17 @@ func (t *Tunnel) serveQueryIP(r *bufio.Reader, server net.Conn) {
 }
 
 // serveStream 应答流握手，然后把收到的数据交给回调。
-func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte) {
-	if _, err := io.CopyN(io.Discard, r, streamTokenLen+8); err != nil {
+func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head []byte) {
+	frame := append([]byte(nil), head...)
+	rest := make([]byte, streamFrameLen-4)
+	if _, err := io.ReadFull(r, rest); err != nil {
 		return
 	}
+	frame = append(frame, rest...)
 
 	t.mu.Lock()
 	reject := t.rejectStream[kind]
+	t.streamFrame[kind] = frame
 	t.streams = append(t.streams, kind)
 	if kind == 0x06 {
 		t.recvConn = server
@@ -510,8 +537,12 @@ func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte) {
 	}
 }
 
-// streamTokenLen 与协议层保持一致：4 字节操作码 + 48 字节 token + 8 字节 + 4 字节反序地址。
-const streamTokenLen = 48
+// 帧长与协议层保持一致：4 字节操作码 + 48 字节 token + 8 字节 + 4 字节尾。
+const (
+	streamTokenLen = 48
+	streamFrameLen = 4 + streamTokenLen + 8 + 4
+	queryFrameLen  = streamFrameLen
+)
 
 // readHTTPRequests 读若干个完整的 HTTP 请求头。
 func readHTTPRequests(r *bufio.Reader, n int) error {

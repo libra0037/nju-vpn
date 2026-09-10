@@ -190,19 +190,38 @@ func (c *Client) dialTunnelTLS(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	conn.SetClientRandom(random)
-	conn.SetTLSVers(utls.VersionTLS11, utls.VersionTLS11, []utls.TLSExtension{})
-	conn.HandshakeState.Hello.Vers = utls.VersionTLS11
-	conn.HandshakeState.Hello.CipherSuites = []uint16{
+	conn.SetTLSVers(tunnelHelloVersion, tunnelHelloVersion, []utls.TLSExtension{})
+	conn.HandshakeState.Hello.Vers = tunnelHelloVersion
+	conn.HandshakeState.Hello.CipherSuites = tunnelHelloCipherSuites()
+	conn.HandshakeState.Hello.CompressionMethods = tunnelHelloCompression()
+	conn.HandshakeState.Hello.SessionId = tunnelHelloSessionID()
+	return &utlsTunnelConn{UConn: conn}, nil
+}
+
+// 隧道 ClientHello 的畸形参数。这些值是与服务端的契约，改动前先看
+// wire_format_test.go：任何一项变了，握手都会被拒。
+const tunnelHelloVersion = utls.VersionTLS11
+
+// tunnelHelloSessionID 返回隧道专用的 SessionId。服务端靠它是否以
+// "L3IP" 开头来区分隧道流量与同端口的 Web 登录流量。
+func tunnelHelloSessionID() []byte {
+	const sessionIDLen = 32
+	id := make([]byte, sessionIDLen)
+	copy(id, "L3IP")
+	return id
+}
+
+// tunnelHelloCipherSuites 返回隧道 ClientHello 的套件列表。
+// RC4-SHA 是服务端唯一接受的套件。
+func tunnelHelloCipherSuites() []uint16 {
+	return []uint16{
 		utls.TLS_RSA_WITH_RC4_128_SHA,
 		utls.FAKE_TLS_EMPTY_RENEGOTIATION_INFO_SCSV,
 	}
-	conn.HandshakeState.Hello.CompressionMethods = []uint8{0}
-	conn.HandshakeState.Hello.SessionId = []byte{
-		'L', '3', 'I', 'P',
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	}
-	return &utlsTunnelConn{UConn: conn}, nil
 }
+
+// tunnelHelloCompression 返回隧道 ClientHello 的压缩方法。
+func tunnelHelloCompression() []uint8 { return []uint8{0} }
 
 // newHTTPClient 返回走同一出站路径的 HTTP 客户端。
 //
