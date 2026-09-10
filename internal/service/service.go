@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -238,16 +237,8 @@ func (s *Service) finishConnect(res *vpn.ProbeResult) error {
 	client := s.client
 	endpoint := s.endpoint
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				// 协程里的 panic 不会触发 cmdRun 的 defer，必须在这里登出，
-				// 否则服务端会留下占用名额的会话。
-				log.Printf("隧道收发协程异常终止: %v", r)
-				s.Close()
-				os.Exit(1)
-			}
-		}()
-		client.StartProtocol(endpoint, token, ipRev, false)
+		err := client.StartProtocol(endpoint, token, ipRev, false)
+		s.tunnelDown(err)
 	}()
 
 	s.state.SetAddresses(res.ClientIP, s.cfg.WireGuard.PeerAddress)
@@ -258,6 +249,26 @@ func (s *Service) finishConnect(res *vpn.ProbeResult) error {
 
 	log.Printf("隧道已建立：校园网地址 %s，peer 地址 %s", res.ClientIP, s.cfg.WireGuard.PeerAddress)
 	return nil
+}
+
+// tunnelDown 处理隧道运行期断开：切到 error 并释放资源。
+//
+// 与 fail 的区别是它从后台协程调用，需要自己加锁，
+// 而且只在状态确实是 up 时才处理——期间可能已经被 Stop 清理过。
+func (s *Service) tunnelDown(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur := s.state.Get().State
+	if cur != StateUp {
+		// 已经不在运行中（被 Stop 或 Close 清理过），无需重复处理。
+		log.Printf("隧道协程已退出（当前状态 %s）: %v", cur, err)
+		return
+	}
+
+	log.Printf("隧道断开: %v", err)
+	s.release()
+	_ = s.state.Transition(StateError, "隧道已断开: "+err.Error())
 }
 
 // fail 记录失败状态。调用方需持有 s.mu。

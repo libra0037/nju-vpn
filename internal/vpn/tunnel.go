@@ -3,9 +3,11 @@ package vpn
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -107,7 +109,8 @@ func (client *Client) streamHandshake(token *[48]byte, ipRev *[4]byte, kind stre
 
 	if reply[0] != byte(kind) {
 		conn.Close()
-		return nil, fmt.Errorf("unexpected %s handshake reply: 0x%02x", kind, reply[0])
+		// 服务端用控制码说明拒绝原因，走同一套可重试判断。
+		return nil, &ControlError{Code: reply[0], Context: fmt.Sprintf("%s 流握手被拒绝", kind)}
 	}
 	return conn, nil
 }
@@ -191,7 +194,11 @@ func (client *Client) BlockTXStream(token *[48]byte, ipRev *[4]byte, ep *TunnelE
 	ep.OnRecv = func(buf []byte) {
 		var n, err = conn.Write(buf)
 		if err != nil {
-			errCh <- err
+			// 非阻塞发送，避免同时有多个写失败时阻塞在通道上。
+			select {
+			case errCh <- err:
+			default:
+			}
 			return
 		}
 
@@ -200,36 +207,93 @@ func (client *Client) BlockTXStream(token *[48]byte, ipRev *[4]byte, ep *TunnelE
 			DumpHex([]byte(buf[:n]))
 		}
 	}
+	defer func() { ep.OnRecv = nil }()
 
 	return <-errCh
 }
 
-func (client *Client) StartProtocol(endpoint *TunnelEndpoint, token *[48]byte, ipRev *[4]byte, debug bool) {
-	RX := func() {
-		counter := 0
-		for counter < 5 {
-			err := client.BlockRXStream(token, ipRev, endpoint, debug)
-			if err != nil {
-				log.Print("Error occurred while recv, retrying: " + err.Error())
-			}
-			counter += 1
+// 重试参数。服务端的控制码区分了能否重试：
+//
+//	3 ServerReset / 5 IpBusy —— 暂时性，值得退避重试；
+//	8 Shutdown / 9 IpConflict / 14 IpKick —— 终止性，重试只会继续被拒，
+//	而且密集重试会让账号进入长时间被拒的状态。
+const (
+	streamRetryLimit = 4
+	streamRetryBase  = 2 * time.Second
+	streamRetryMax   = 30 * time.Second
+)
+
+// StreamError 表示某条数据流（收或发）终止。
+type StreamError struct {
+	// Direction 是 "recv" 或 "send"。
+	Direction string
+	Err       error
+}
+
+func (e *StreamError) Error() string {
+	return fmt.Sprintf("%s 流失败: %v", e.Direction, e.Err)
+}
+
+func (e *StreamError) Unwrap() error { return e.Err }
+
+// StartProtocol 建立收、发两条数据流并阻塞转发，直到任一条终止。
+//
+// 调用方应在单独的 goroutine 中运行它，并根据返回的错误更新服务状态。
+// 与旧实现不同，这里不再在重试耗尽后 panic——服务进程需要能感知失败，
+// 而不是整体崩溃。
+func (client *Client) StartProtocol(endpoint *TunnelEndpoint, token *[48]byte, ipRev *[4]byte, debug bool) error {
+	errCh := make(chan *StreamError, 2)
+
+	go func() {
+		errCh <- &StreamError{Direction: "recv", Err: client.runStream(streamRecv, token, ipRev, endpoint, debug)}
+	}()
+	// 发方向的真实错误由 OnRecv 回填，见 BlockTXStream。
+	go func() {
+		errCh <- &StreamError{Direction: "send", Err: client.runStream(streamSend, token, ipRev, endpoint, debug)}
+	}()
+
+	first := <-errCh
+	// 一条断了，另一条也就没有意义了。清掉回调，避免继续往已关闭的连接写。
+	endpoint.OnRecv = nil
+	return first
+}
+
+// runStream 带退避地反复建立一条流，正常返回时按 error 处理。
+func (client *Client) runStream(kind streamKind, token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
+	var lastErr error
+	for attempt := 0; attempt <= streamRetryLimit; attempt++ {
+		if attempt > 0 {
+			delay := retryDelay(attempt)
+			log.Printf("%s 流第 %d 次重试，%s 后重连（上次错误: %v）", kind, attempt, delay, lastErr)
+			time.Sleep(delay)
 		}
-		panic("recv retry limit exceeded.")
-	}
 
-	go RX()
-
-	TX := func() {
-		counter := 0
-		for counter < 5 {
-			err := client.BlockTXStream(token, ipRev, endpoint, debug)
-			if err != nil {
-				log.Print("Error occurred while send, retrying: " + err.Error())
-			}
-			counter += 1
+		var err error
+		if kind == streamRecv {
+			err = client.BlockRXStream(token, ipRev, ep, debug)
+		} else {
+			err = client.BlockTXStream(token, ipRev, ep, debug)
 		}
-		panic("send retry limit exceeded.")
-	}
+		lastErr = err
+		if err == nil {
+			return nil
+		}
 
-	go TX()
+		// 终止性错误直接放弃，避免把账号打进被拒状态。
+		var ctrl *ControlError
+		if errors.As(err, &ctrl) && !ctrl.Retryable() {
+			return err
+		}
+	}
+	return fmt.Errorf("重试 %d 次后仍未恢复: %w", streamRetryLimit, lastErr)
+}
+
+// retryDelay 返回第 attempt 次重试前的等待时长（attempt 从 1 开始），
+// 按 2 秒起步指数增长，上限 30 秒。
+func retryDelay(attempt int) time.Duration {
+	d := streamRetryBase << (attempt - 1)
+	if d <= 0 || d > streamRetryMax {
+		return streamRetryMax
+	}
+	return d
 }
