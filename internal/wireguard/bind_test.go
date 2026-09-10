@@ -11,7 +11,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 
-	"njuvpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // 这两个用例用"能不能在同一个端口的另一个地址上再绑一次"来判定监听范围，

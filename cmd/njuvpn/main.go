@@ -19,12 +19,12 @@ import (
 	"syscall"
 	"time"
 
-	"njuvpn/internal/config"
-	"njuvpn/internal/dial"
-	"njuvpn/internal/ipc"
-	"njuvpn/internal/service"
-	"njuvpn/internal/vpn"
-	"njuvpn/internal/wireguard"
+	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/service"
+	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/wireguard"
 )
 
 const prog = "njuvpn"

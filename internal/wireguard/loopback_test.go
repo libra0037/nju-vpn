@@ -14,7 +14,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
-	"njuvpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // 这个文件做一次真正的端到端回环：本进程的承载设备（Relay + 映射 + 假校园网隧道）

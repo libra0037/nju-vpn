@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"njuvpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // ipv4Pkt 造一个长度合法的 IPv4 包（最小头部 + 指定大小的载荷）。

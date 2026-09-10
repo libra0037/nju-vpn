@@ -20,7 +20,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
-	"njuvpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // ErrClosed 表示 relay 已经关闭。

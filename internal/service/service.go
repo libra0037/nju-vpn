@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"njuvpn/internal/config"
-	"njuvpn/internal/dial"
-	"njuvpn/internal/vpn"
-	"njuvpn/internal/wireguard"
+	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/wireguard"
 )
 
 // ErrNotRunning 表示服务进程还没有建立隧道。

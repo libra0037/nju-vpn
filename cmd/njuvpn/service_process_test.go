@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"njuvpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 )
 
 // fakeService 起一个只会 pong、并且记录 shutdown 的假服务端。

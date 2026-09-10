@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"njuvpn/internal/config"
-	"njuvpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/dial"
 )
 
 // 真实服务端的实验阶梯。

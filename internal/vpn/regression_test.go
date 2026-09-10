@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"njuvpn/internal/vpntest"
+	"github.com/libra0037/nju-vpn/internal/vpntest"
 )
 
 // 一次完整登录的脚本：登录页、口令页、portal、query-ip、两条流。

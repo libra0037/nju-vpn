@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"njuvpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 )
 
 const (

@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"njuvpn/internal/config"
-	"njuvpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 )
 
 const (

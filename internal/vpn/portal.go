@@ -162,7 +162,7 @@ func (c *Client) webLogin(ctx context.Context, username, password string) (strin
 //
 // 注意这只挡住"明显不对"的公钥：整条链路仍然没有证书校验，
 // 主动中间人可以换成自己的 2048 位公钥。口令的保密性等价于
-// "没有主动中间人"，见 REVIEW.md 的 D1。
+// "没有主动中间人"。
 const minRSAModulusBits = 1024
 
 // 返回的 state 非 nil 表示请求被受理（ErrSMSSent / ErrSMSTooMany 等），

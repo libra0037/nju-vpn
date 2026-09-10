@@ -1,4 +1,4 @@
-module njuvpn
+module github.com/libra0037/nju-vpn
 
 go 1.26.6
 

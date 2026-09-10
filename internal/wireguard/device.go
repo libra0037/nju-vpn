@@ -12,7 +12,7 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 
-	"njuvpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // DeviceOptions 是创建 WireGuard 承载设备的参数。

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"njuvpn/internal/config"
-	"njuvpn/internal/vpn"
-	"njuvpn/internal/vpntest"
-	"njuvpn/internal/wireguard"
+	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/vpntest"
+	"github.com/libra0037/nju-vpn/internal/wireguard"
 )
 
 // harness 装一套假的 portal 与假隧道，用来在没有校园网的情况下

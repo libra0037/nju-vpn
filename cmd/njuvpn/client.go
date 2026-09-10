@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"njuvpn/internal/config"
-	"njuvpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 )
 
 // clientConfig 是命令行客户端需要的配置：只有 IPC 端点。

@@ -11,7 +11,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
-	"njuvpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/dial"
 )
 
 // DialFunc 与 net.Dialer.Dial 的签名一致，由 internal/dial 提供。

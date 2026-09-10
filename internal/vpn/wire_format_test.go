@@ -9,7 +9,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
-	"njuvpn/internal/vpntest"
+	"github.com/libra0037/nju-vpn/internal/vpntest"
 )
 
 // 这个文件把与真实服务端的线上格式钉死。
