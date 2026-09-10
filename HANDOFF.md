@@ -368,10 +368,10 @@ WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能�
 
 ## 8. 待办
 
-进行中（方向见第 10 节）：
+进行中：
 
-- [ ] 按 REVIEW.md 逐条处理审查清单（A 组优先）
-- [ ] 实现第 10 节的进程模型：CLI 按需拉起 + `shutdown` / `restart`（替代 `service install`）
+- [ ] REVIEW.md 剩余项：C14（重连期间的状态显示）、E4（vpntest 里的死代码与轮询等待）、
+      F 组 16 条简化
 - [ ] 在 Ubuntu 真机跑通（服务进程 + 客户端接入）
 - [ ] 开机自启：Windows 任务计划程序 / Linux systemd user unit
 
@@ -381,6 +381,8 @@ WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能�
 - [x] WireGuard 私钥首次启动自动生成并写回配置
 - [x] 协议层与服务层的健壮性重构（见第 9 节）
 - [x] 配置文件权限检查（改代码时按 G1 删除）
+- [x] REVIEW.md 的 A / B / C / D / E 组（B5 的进程模型、单用户假设下的加固取舍）
+- [x] 新形态在 Windows 上端到端跑通（见第 11 节）
 
 ## 9. 重构后的结构
 
@@ -409,33 +411,68 @@ WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能�
 
 `go test ./... -race` 不连任何真实服务端：假 portal 是注入的 `RoundTripper`，假隧道是注入的 `net.Pipe`，都在 `internal/vpntest` 里。覆盖的回归点：畸形响应不 panic、SessionId 过短不越界、复用会话时验证码确实提交、部分失败仍能登出、并发 Close 只登出一次、退避能响应 ctx 取消、流断开后另一条也收敛、Close 不被长 I/O 阻塞、panic 不带走进程、IPC 超长行与配置权限。
 
-## 10. 已决定的方向（2026-09-10，尚未实现）
+## 10. 进程模型与路径（2026-09-10 已实现）
 
-来源：REVIEW.md 的逐条审查与确认。**下面这些都没有落地，当前代码仍是旧形态。**
+来源：REVIEW.md 的逐条审查与确认。这一节记录**改完之后**的形态。
 
 ### 平台
 
 Windows 与 Linux 都要能用 —— Linux 侧不是「只用来跑测试」，用 Ubuntu 做主力机的人应该能直接部署。
 
-### 进程模型：CLI 按需拉起，不再装系统服务
+### 进程模型：CLI 按需拉起，没有系统服务
 
-- 删掉 `njuvpn service ...`、`internal/service/install.go`、`windowsProgram`、kardianos 依赖
-- `njuvpn start`：先探端点，连不上就 detached spawn `njuvpn run`，再轮询 `ping` 到就绪
-- 新增 IPC `shutdown`（收尾含登出后退出）与 CLI `njuvpn restart`（改配置、重置进程都靠它）
+- `njuvpn start` 先探活，连不上就以脱离终端的方式拉起 `njuvpn run`（记日志到配置同目录），
+  再轮询到就绪。**只影响 start / restart**：stop / status / auth / wg-* 不会拉起服务。
+- `njuvpn restart` = 请服务进程收尾退出（含登出）→ 等端点不再响应 → 重新拉起。
+  改完配置用它，不要手工杀进程（手工杀会跳过登出，服务端名额要等超时才释放）。
+- 服务进程的退出有两条路径：系统信号（Ctrl-C / systemd / 任务计划程序）与 IPC 的 `shutdown`。
+  两条都走到同一个 `RunServer` 返回处，由 `cmdRun` 的 `defer svc.Close()` 完成登出。
 - 开机自启按需另配：Windows 用任务计划程序「登录时启动」；Linux 手写 systemd user unit
-  （`~/.config/systemd/user/njuvpn.service`，要免登录也运行再加 `loginctl enable-linger`）
-- 理由：服务进程不需要任何特权（6.9 节实测，普通会话即可）。以 SCM 跑会落到 LocalSystem，
-  命名管道的 DACL 里不含交互用户，五个子命令在 connect 阶段全被拒（见 REVIEW.md 的 B3）
+  （`~/.config/systemd/user/njuvpn.service`，要免登录也运行再加 `loginctl enable-linger`）。
+- 已删掉：`njuvpn service ...`、`internal/service/install.go`、`windowsProgram`、kardianos 依赖。
+  理由：服务进程不需要任何特权（6.9 节实测，普通会话即可）。以 SCM 跑会落到 LocalSystem，
+  命名管道的 DACL 里不含交互用户，五个子命令在 connect 阶段全被拒（见 REVIEW.md 的 B3）。
 
 ### 路径
 
 - 配置文件：Windows 用 `%LOCALAPPDATA%` 下的 njuvpn 目录，Linux 用 `~/.config/njuvpn/config.yaml`
-  —— 原来的 `/etc/njuvpn/config.yaml` 与 ProgramData 都以特权运行为前提，随之作废
-- IPC 端点：Linux 用 `$XDG_RUNTIME_DIR/njuvpn.sock`（取不到时回落 `/tmp/njuvpn-<uid>.sock`），
-  Windows 命名管道不变
+  —— 原来的 `/etc/njuvpn/config.yaml` 与 ProgramData 都以特权运行为前提，随之作废。
+- IPC 端点：Linux 用 `$XDG_RUNTIME_DIR/njuvpn.sock`（取不到时回落到该用户的私有临时目录），
+  Windows 命名管道不变。
+- 服务日志：配置文件同目录的 `njuvpn.log`（被拉起的服务进程没有控制台）。
 
 ### 安全取舍
 
 个人使用、单用户机器：只对「同机其他用户 / 同机敌意进程」成立的加固不做 ——
 配置文件权限校验（G1）、IPC 对端校验（G2）、argv 可见性（G3）、连接数上限（G4）。
 命名管道 DACL（G5）保留，只把注释改成「只让当前用户与管理员访问」。
+
+## 11. 新形态的端到端实测（2026-09-10 晚，笔记本 Windows）
+
+部署方式：本机 `GOOS=windows go build` → scp 到笔记本 → 换掉旧二进制。
+配置从 `C:\Users\<用户名>\njuvpn\` 移到 `%LOCALAPPDATA%\njuvpn\`（默认路径已改，见第 10 节）。
+
+先做了一次**不耗短信**的冒烟测试，确认新的生命周期在 Windows 上成立：
+
+```
+njuvpn.exe restart
+  服务进程未在运行（...），直接拉起
+  已拉起服务进程（日志: %LOCALAPPDATA%\njuvpn\njuvpn.log）
+  服务进程已重启          142ms（含探活 + 拉起 + 轮询就绪）
+njuvpn.exe status   →   idle
+```
+
+然后走完整链路（用户操作，22:19–22:20）：
+
+```
+22:19:08  start            登录页 → 口令登录 → 服务端要求短信
+22:19:09  短信接口         倒计时 178 秒（判据：重置到窗口顶部 ⇒ 真的发了）
+22:19:21  auth            短信验证码校验通过
+22:19:21  portal-token    Server Session ID: 32 字节
+22:19:21  承载层          WireGuard 承载已启动: UDP 51820（仅本机），peer 10.66.66.2
+22:19:21  状态 up         校园网地址 172.29.56.18
+22:20:04  stop            logout user success（服务端会话已释放）
+```
+
+结论：**CLI 按需拉起 + 热更新的承载层在 Windows 上工作正常**，Clash 侧配置无需改动
+（服务端公钥与私钥都从原配置继承）。

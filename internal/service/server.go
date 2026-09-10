@@ -262,6 +262,11 @@ func statusLine(st Status) string {
 // RunServer 是服务进程的入口：监听本地端点并处理请求。
 // 返回时说明服务已经停止。
 func RunServer(svc *Service, endpoint string) error {
+	// 端点留空表示用平台默认值；解析出来再记日志，
+	// 否则日志里"监听 "后面是空的，排查时看不出到底听在哪。
+	if endpoint == "" {
+		endpoint = ipc.DefaultEndpoint()
+	}
 	ln, err := ipc.Listen(endpoint)
 	if err != nil {
 		return err
