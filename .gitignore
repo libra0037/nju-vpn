@@ -1,6 +1,8 @@
 # 二进制
 /njuvpn
 /njuvpn.exe
+# 发行产物（由 scripts/build-release.sh 生成）
+/dist/
 /build_assets/
 
 # 真实配置（含密码和 TOTP 密钥）

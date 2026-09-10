@@ -29,6 +29,10 @@ import (
 
 const prog = "njuvpn"
 
+// version 是发行版本号，由构建脚本用 -ldflags 注入；
+// 源码直接构建时是 dev，便于区分「自己编的」与「下载的」。
+var version = "dev"
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `%s - NJU VPN 服务端与命令行客户端
 
@@ -42,6 +46,7 @@ func usage() {
   %s probe                        探测协议可用性（直接连服务端，不经过服务进程）
   %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
   %s wg-stats                      查看 WireGuard 收发统计
+  %s version                      查看版本号
 
 全局参数:
   -config <path>                  配置文件路径（默认见下）
@@ -50,7 +55,7 @@ func usage() {
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
   Windows  %%LOCALAPPDATA%%\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -81,6 +86,9 @@ func main() {
 		err = runCommand("wg-stats", args, ipc.Request{Command: ipc.CmdWGStats}, time.Minute)
 	case "probe":
 		err = cmdProbe(args)
+	case "version", "-v", "--version":
+		fmt.Printf("%s %s\n", prog, version)
+		return
 	case "help", "-h", "--help":
 		usage()
 		return
