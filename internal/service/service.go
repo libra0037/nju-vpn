@@ -89,11 +89,16 @@ func (s *Service) Start() error {
 	}
 
 	res, err := s.client.Probe(s.cfg.Username, s.cfg.Password, "", code, false, nil)
+	// Probe 失败时也要先记下 TWFID：登录可能已经成功，只是后续建隧道失败。
+	// 不记的话 fail → release → logoutLocked 会因为 twfID 为空而跳过登出，
+	// 服务端就会留下一个占用名额的会话。
+	if res != nil && res.TwfID != "" {
+		s.twfID = res.TwfID
+	}
 	if err != nil {
 		s.fail(err)
 		return err
 	}
-	s.twfID = res.TwfID
 	s.authKind = res.NeedAuth
 
 	if res.NeedAuth != nil {
@@ -218,6 +223,7 @@ func (s *Service) awaitAuth() error {
 // finishConnect 用一次成功的探测结果建立 WireGuard 承载。
 func (s *Service) finishConnect(res *vpn.ProbeResult) error {
 	if err := s.state.Transition(StateConnecting, "正在建立 WireGuard 承载"); err != nil {
+		s.fail(err)
 		return err
 	}
 
@@ -246,6 +252,7 @@ func (s *Service) finishConnect(res *vpn.ProbeResult) error {
 
 	s.state.SetAddresses(res.ClientIP, s.cfg.WireGuard.PeerAddress)
 	if err := s.state.Transition(StateUp, "隧道已建立"); err != nil {
+		s.fail(err)
 		return err
 	}
 

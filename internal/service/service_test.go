@@ -51,6 +51,34 @@ func TestCloseAttemptsLogout(t *testing.T) {
 	}
 }
 
+// Probe 失败但已拿到 TWFID 时，也必须能登出。
+//
+// 这是真实踩过的坑：Start 里原先在 err != nil 之前不记录 res.TwfID，
+// 于是 query-ip 失败（登录已成功）时 release 会跳过登出，
+// 服务端累积未释放的会话，最终导致后续建隧道全被拒。
+func TestFailAfterPartialProbeStillLogsOut(t *testing.T) {
+	svc := newTestService(t)
+	svc.state = newMachine()
+	if err := svc.state.Transition(StateLoggingIn, "正在登录"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟 Probe 的返回值：登录成功拿到 TWFID，但后续阶段失败。
+	res := &vpn.ProbeResult{TwfID: "0123456789abcdef"}
+	if res.TwfID != "" {
+		svc.twfID = res.TwfID
+	}
+
+	got := captureLog(t, func() { svc.fail(errors.New("模拟建隧道失败")) })
+
+	if !strings.Contains(got, "登出") {
+		t.Errorf("部分失败路径未尝试登出，日志: %q", got)
+	}
+	if svc.state.Get().State != StateError {
+		t.Errorf("状态应为 error，实际 %s", svc.state.Get().State)
+	}
+}
+
 // Close 可重复调用，不应 panic。
 func TestCloseIdempotent(t *testing.T) {
 	svc := newTestService(t)
