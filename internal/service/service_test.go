@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -393,4 +394,94 @@ type panicTransport struct{}
 
 func (panicTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	panic("测试用的内部错误")
+}
+
+// 回归（真机实测发现）：二次验证续用的就是 start 留下的那个会话，
+// 但如果 auth 建好新会话对象后去"释放上一个会话"，就会用同一个 TwfID
+// 把正在续用的会话登出。
+//
+// 真机表现：auth 返回成功、状态一度是 up，紧接着上行流握手被服务端以
+// Shutdown(8) 拒绝——因为会话刚被自己杀掉。这里断言续用期间**一次登出
+// 都不能发生**。
+func TestAuthContinuationDoesNotLogoutSharedSession(t *testing.T) {
+	h := newHarness(t)
+	// 服务端不返回新 TwfID，即续用登录时的那个。
+	h.portal.Set("/por/login_psw.csp", vpntest.Response{
+		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
+	})
+	h.portal.Set("/por/login_sms.csp", vpntest.Response{
+		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE></Auth>`,
+	})
+	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
+		Body: `<Auth>Auth sms suc</Auth>`,
+	})
+
+	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	}
+	if n := h.portal.Count("/por/logout.csp"); n != 0 {
+		t.Fatalf("还在等验证码就登出了 %d 次", n)
+	}
+
+	if err := h.svc.Auth("123456"); err != nil {
+		t.Fatalf("提交验证码失败: %v", err)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	if n := h.portal.Count("/por/logout.csp"); n != 0 {
+		t.Errorf("续用会话期间发生了 %d 次登出——会把正在使用的会话杀掉", n)
+	}
+	// 隧道必须还能用：下行流握手不该被拒。
+	if err := h.svc.session.CheckTunnel(context.Background()); err != nil {
+		t.Errorf("续用后隧道不可用: %v", err)
+	}
+}
+
+// 回归：attach 遇到共用同一 TwfID 的会话时只能释放本地资源。
+func TestAttachSameSessionDoesNotLogout(t *testing.T) {
+	h := newHarness(t)
+	if err := h.svc.Start(); err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	prev := h.svc.session
+	// 造一个新会话对象，但携带同一个 TwfID。
+	same, err := h.svc.client.Connect(context.Background(), vpn.ConnectOptions{
+		Username: "u",
+		Password: "p",
+		TwfID:    prev.TwfID(),
+		Trace:    &vpn.Trace{},
+	})
+	if err != nil {
+		t.Fatalf("续用失败: %v", err)
+	}
+	defer same.Close(context.Background())
+
+	h.svc.attach(same)
+
+	if n := h.portal.Count("/por/logout.csp"); n != 0 {
+		t.Errorf("共用 TwfID 的会话被登出了 %d 次", n)
+	}
+}
+
+// 服务端说"没有这个会话"时，释放资源不该报成错误。
+func TestTeardownToleratesMissingServerSession(t *testing.T) {
+	h := newHarness(t)
+	if err := h.svc.Start(); err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	// 之后再有人登出同一个会话，服务端会回 logout user failed。
+	h.portal.Set("/por/logout.csp", vpntest.Response{
+		Body: `<Auth><Message><![CDATA[logout user failed]]></Message></Auth>`,
+	})
+
+	if err := h.svc.Stop(); err != nil {
+		t.Errorf("会话已不存在时 Stop 不该报错: %v", err)
+	}
+	if st := h.svc.Status().State; st != StateIdle {
+		t.Errorf("状态应为 idle，实际 %s", st)
+	}
 }

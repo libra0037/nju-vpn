@@ -311,6 +311,13 @@ func (s *Service) auth(ctx context.Context, code string) error {
 		return errors.New("验证码为空")
 	}
 
+	// 续用同一个服务端会话：先把待验证的会话从 s.session 上摘下来，
+	// 否则 attach 会把"上一个会话"当成需要释放的对象，用同一个 TwfID
+	// 去登出——那会把正在续用的会话一起杀掉（真机实测：登出成功后
+	// 上行流立刻被服务端以 Shutdown 拒绝）。
+	pending := s.session
+	s.session = nil
+
 	trace := &vpn.Trace{}
 	sess, err := s.client.Connect(ctx, vpn.ConnectOptions{
 		Username: s.cfg.Username,
@@ -320,6 +327,10 @@ func (s *Service) auth(ctx context.Context, code string) error {
 		AuthKind: s.pendingAuth.Kind,
 		Trace:    trace,
 	})
+	// 待验证会话本身没有本地连接，只需要释放资源，不能登出。
+	if pending != nil {
+		pending.CloseLocal()
+	}
 	defer func() {
 		if err != nil || sess == nil {
 			logTrace(trace, err)
@@ -361,12 +372,22 @@ func (s *Service) attach(sess *vpn.Session) {
 	if sess == nil {
 		return
 	}
-	if s.session != nil && s.session != sess {
-		if err := s.session.Close(context.Background()); err != nil {
-			log.Printf("释放上一个会话: %v", err)
-		}
-	}
+	prev := s.session
 	s.session = sess
+	if prev == nil || prev == sess {
+		return
+	}
+
+	// 两道保险：TwfID 相同说明是同一个服务端会话（例如二次验证续用），
+	// 对它登出等于把当前会话一起关掉，只能释放本地资源。
+	if prev.TwfID() != "" && prev.TwfID() == sess.TwfID() {
+		log.Printf("新会话与上一个共用同一 TwfID，只释放本地资源，不登出")
+		prev.CloseLocal()
+		return
+	}
+	if err := prev.Close(context.Background()); err != nil && !errors.Is(err, vpn.ErrLogoutNoSession) {
+		log.Printf("释放上一个会话: %v", err)
+	}
 }
 
 // finishConnect 用一次成功的连接建立 WireGuard 承载。
@@ -502,7 +523,8 @@ func (s *Service) teardown(detail string) {
 	if s.session != nil {
 		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，
 		// 而登出本身必须发出去。
-		if err := s.session.Close(context.Background()); err != nil {
+		// 服务端已经没有这个会话不算错误——目标已经达成。
+		if err := s.session.Close(context.Background()); err != nil && !errors.Is(err, vpn.ErrLogoutNoSession) {
 			log.Printf("释放会话时出错: %v", err)
 		}
 		s.session = nil
