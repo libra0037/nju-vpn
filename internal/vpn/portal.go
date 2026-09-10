@@ -172,6 +172,10 @@ func (c *Client) requestSMS(ctx context.Context, twfID string) (error, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 原始响应记进日志：这个接口用同一组字段表达"发了新码"和"还在冷却，
+	// 没发"，只靠文案判断必然误判，出问题时必须有原文可查。
+	// 内容只有脱敏手机号与倒计时，没有凭据。
+	log.Printf("短信接口响应: %s", strings.Join(strings.Fields(string(body)), " "))
 	return classifySMSRequest(body)
 }
 

@@ -490,6 +490,10 @@ func (s *Service) awaitAuth() error {
 		detail = "需要 TOTP 验证码，请执行 njuvpn auth <code>"
 	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSSent):
 		detail = "验证码已发送到手机，请执行 njuvpn auth <code>"
+	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSStillValid):
+		// 冷却期内服务端不会重发，上一条验证码仍然有效——不能提示"已发送"，
+		// 否则用户会一直等一条不会来的短信。
+		detail = vpn.UserMessage(s.pendingAuth) + "，请用上一条验证码执行 njuvpn auth <code>"
 	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSTooMany):
 		detail = "短信发送过于频繁，请稍后再试"
 	case s.pendingAuth != nil:

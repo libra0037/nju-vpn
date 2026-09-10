@@ -21,6 +21,11 @@ var (
 	ErrSMSExpired = errors.New("验证码已过期")
 	// ErrSMSTooMany 表示请求过于频繁，被服务端限流。
 	ErrSMSTooMany = errors.New("短信发送过于频繁")
+	// ErrSMSStillValid 表示还在冷却期，服务端没有重发，上一条验证码仍然有效。
+	//
+	// 这个区分很重要：服务端在冷却期会把上次的响应原样返回，只改倒计时，
+	// 不做区分就会提示用户"验证码已发送"，而实际什么都不会来。
+	ErrSMSStillValid = errors.New("上一条验证码仍然有效，未重发")
 )
 
 // ErrLogoutNoSession 表示服务端没有找到可登出的会话。

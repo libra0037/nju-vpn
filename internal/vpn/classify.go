@@ -24,23 +24,43 @@ func redact(s string) string {
 	return fmt.Sprintf("%s…(%d 字节)", s[:4], len(s))
 }
 
+// smsFreshThreshold 是"这次真的发出去了"的倒计时下限。
+//
+// 服务端在冷却期内会**把上次发送时的响应原样返回**，连
+// "验证码已发送到您的手机" 这句文案都不改，唯一变化的是倒计时：
+//
+//	真发送   SmsSendInterval = 179 / 178   （窗口顶部，约等于整个窗口）
+//	冷却期内 SmsSendInterval = 102 / 48    （上一个窗口的剩余时间）
+//
+// 所以只能靠倒计时是否接近窗口长度来区分。窗口实测约 180 秒，
+// 这里取 150 秒留出余量。
+const smsFreshThreshold = 150
+
 // classifySMSRequest 判断"发送验证码"请求的结果。
 //
 // 返回值约定：
-//   - state 非 nil：服务端受理了这次请求（可能带限流/冷却信息）；
+//   - state 非 nil：服务端受理了这次请求；
 //   - err 非 nil：这次请求失败，需要报给调用方。
 //
-// 响应里的 IS_IN_PERIOD / SmsSendInterval / g_DisableTime 是**本次发送之后**
-// 前端按钮的禁用倒计时，不是"没有发送"的标志——早先把它们解读反了，
-// 导致每次实际发出去的短信都被误报成"未重发"。
+// 关键区分：ErrSMSSent 表示**这次真的发出了一条新短信**；
+// ErrSMSStillValid 表示还在冷却期、没有重发（上一条验证码仍然有效）。
+// 早先按"ErrorCode=1 + 手机号字段"判断已发送，结果在冷却期里骗用户
+// 去等一条不会来的短信——真机实测踩到过。
 func classifySMSRequest(body []byte) (state error, err error) {
 	s := string(body)
 
-	if smsSent(s) {
-		if d := smsCooldownSeconds(s); d > 0 {
-			return fmt.Errorf("%w（%d 秒内请勿重复请求）", ErrSMSSent, d), nil
+	if strings.Contains(s, "<ErrorCode>1</ErrorCode>") {
+		cooldown := smsCooldownSeconds(s)
+		switch {
+		case cooldown >= smsFreshThreshold:
+			return fmt.Errorf("%w（%d 秒内请勿重复请求）", ErrSMSSent, cooldown), nil
+		case cooldown > 0:
+			return fmt.Errorf("%w（还需等待 %d 秒）", ErrSMSStillValid, cooldown), nil
+		default:
+			// 拿不到倒计时就无法区分，按"已发送"提示，并让用户知道
+			// 若没收到可以重试。
+			return ErrSMSSent, nil
 		}
-		return ErrSMSSent, nil
 	}
 
 	switch {
@@ -52,15 +72,6 @@ func classifySMSRequest(body []byte) (state error, err error) {
 		return nil, errors.New("发送验证码失败: " + serverMessage(body))
 	}
 	return nil, errors.New("发送验证码的响应无法识别: " + serverMessage(body))
-}
-
-// smsSent 判断响应是否表示"短信已发出"。
-// ErrorCode=1 是服务端的成功码，配合手机号字段即可确认。
-func smsSent(body string) bool {
-	if !strings.Contains(body, "<ErrorCode>1</ErrorCode>") {
-		return false
-	}
-	return strings.Contains(body, "<USER_PHONE>") || strings.Contains(body, "验证码已发送")
 }
 
 // smsCooldownSeconds 取出前端按钮的禁用倒计时。
