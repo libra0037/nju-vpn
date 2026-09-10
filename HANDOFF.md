@@ -145,9 +145,9 @@ IPv4 `个人服务器`**，不存在轮换。
 - **登出**：`GET /por/logout.csp` 需携带有效 TWFID。`Stop` 与 `fail` 都会先登出再释放资源。
   服务进程还会在**退出时无条件登出**（相当于 atexit）：`cmdRun` 里 `defer svc.Close()`，
   `RunServer` 捕获 SIGINT/SIGTERM 后停止接受连接让 `Serve` 返回。
-  隧道收发协程若 panic（`StartProtocol` 失败 5 次的旧行为），
-  也会先登出再 `os.Exit(1)`——协程 panic 不会触发主协程的 defer。
-  登出请求带 10 秒超时，避免网络不通时卡住进程退出。
+  隧道与命令处理都在 actor 协程里运行，panic 由该协程的 recover 兜住
+  并收敛成一次失败（不会再带走进程）。登出请求带 10 秒超时，
+  避免网络不通时卡住进程退出。
 - **服务端并发限制**：同一 TWFID 短时间反复建连会被拒，重试越密越失败。probe 只保留 3 次 × 30 秒退避。
 - **日志**：不得打印密码、密文、TWFID 明文（已有 `redact`，勿回退）。
 
@@ -170,7 +170,34 @@ IPv4 `个人服务器`**，不存在轮换。
 ## 8. 待办
 
 - [ ] 端到端联调：服务进程 `start` → `auth` → 状态 `up` → WireGuard 客户端接入
-- [ ] `StartProtocol` 失败 5 次后仍会 `panic`，服务进程里应改为返回错误
-- [ ] 配置文件的权限检查（拒绝 group/other 可读）
 - [ ] WireGuard 私钥首次启动自动生成并写回配置
 - [ ] 真机验证 `service install` 与 systemd 单元
+- [x] 配置文件权限检查（拒绝 group/other 可读）
+- [x] 协议层与服务层的健壮性重构（见第 9 节）
+
+## 9. 重构后的结构
+
+一次针对「错误路径」的重构，目标是把三类事故堵死：对端给了意外数据就 panic、
+错误路径泄漏连接、状态被并发操作搅乱。
+
+### 分层
+
+| 包 | 职责 |
+|---|---|
+| `internal/vpn` | 协议层。`Connect` 完成登录并返回 `*Session`；`Session` 持有 TwfID、query-ip 连接与两条数据流，`Run`/`RunWithRetry` 负责转发，`Close` 幂等收尾并登出 |
+| `internal/service` | actor 模型：所有改状态的操作经 `cmds` 通道串行执行，状态快照单独加锁、只读查询永不阻塞 |
+| `internal/ipc` | 行协议（有长度上限与读写超时）、端点权限校验、连接数上限 |
+| `internal/wireguard` | `tun.Device` 实现：按 IPv4 总长度分帧，按需改写地址 |
+| `internal/vpntest` | 测试替身：脚本化 portal 与内存隧道服务端 |
+
+### 几条硬规则（改动时不要破坏）
+
+1. **协议层不许 panic**：所有从服务端响应取值的地方走 `requireTag` / `tagValue`，长度不足返回 `*ProtocolError`。曾经有四处 `FindSubmatch(...)[1]`、一处 `HandshakeState.ServerHello.SessionId`、一处 `(*[48]byte)([]byte(token+twfID))`，每一个都能一次带走整个进程。
+2. **失败路径也要交出会话**：`Connect` 在部分失败时返回非 nil 的 `*Session`，调用方必须 `Close`，否则服务端名额不会释放。
+3. **一切 I/O 可取消**：`Connect`、隧道重连、登出、IPC 调用都有 ctx 或超时。
+4. **连接所有权唯一**：连接由 `Session` 持有并统一关闭；`openStream` / `queryIP` 的每条错误路径都先关连接——曾经 query-ip 失败返回 `(nil, nil, err)`，调用方的清理代码永远是死代码。
+5. **状态只能由 actor 改**：隧道协程的退出报告带代次（gen），过期代次一律忽略，否则旧协程会把刚建立的新会话拆掉。
+
+### 回归测试
+
+`go test ./... -race` 不连任何真实服务端：假 portal 是注入的 `RoundTripper`，假隧道是注入的 `net.Pipe`，都在 `internal/vpntest` 里。覆盖的回归点：畸形响应不 panic、SessionId 过短不越界、复用会话时验证码确实提交、部分失败仍能登出、并发 Close 只登出一次、退避能响应 ctx 取消、流断开后另一条也收敛、Close 不被长 I/O 阻塞、panic 不带走进程、IPC 超长行与配置权限。

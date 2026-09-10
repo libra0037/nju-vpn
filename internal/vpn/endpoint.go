@@ -1,26 +1,73 @@
 package vpn
 
+import (
+	"errors"
+	"sync"
+)
+
+// ErrNoUplink 表示隧道上行通道还没有建立。
+var ErrNoUplink = errors.New("隧道上行通道尚未建立")
+
 // TunnelEndpoint 是 L3 隧道和上层承载之间的桥。
 //
-// 旧仓库里它实现 gvisor 的 stack.LinkEndpoint 接口，包要经过一个完整的
-// 用户态 TCP/IP 栈；现在服务端只做 L3 中继，网络栈挪到了客户端，所以这里
-// 退化成两个回调，不再依赖 gvisor。
-//
-// 两个方向的语义沿用旧仓库，以免改动 tunnel.go：
-//
-//	OnRecv  由承载侧设置。隧道上行时调用，把裸 IP 包写进 TLS 长连接。
-//	WriteTo 由 tunnel.go 调用。隧道下行收到包时触发 OnDeliver。
+// 两个方向都是回调，但回调字段会被隧道协程和承载协程并发读写，
+// 所以必须走内部锁——旧实现把字段直接暴露出去，读取方和写入方之间
+// 没有任何同步，真机跑起来就是数据竞争。
 type TunnelEndpoint struct {
-	// OnRecv 接收来自承载侧（WireGuard）的裸 IP 包，交由隧道发往校园网。
-	OnRecv func(buf []byte)
-
-	// OnDeliver 接收来自隧道的裸 IP 包，交由承载侧（WireGuard）发回客户端。
-	OnDeliver func(buf []byte)
+	mu       sync.RWMutex
+	uplink   func([]byte) error
+	downlink func([]byte)
 }
 
-// WriteTo 把隧道下行收到的包交给承载侧。
-func (ep *TunnelEndpoint) WriteTo(buf []byte) {
-	if ep.OnDeliver != nil {
-		ep.OnDeliver(buf)
+// NewEndpoint 构造一个隧道端点。
+func NewEndpoint() *TunnelEndpoint { return &TunnelEndpoint{} }
+
+// SetUplink 注册上行回调：把来自承载侧的裸 IP 包写进隧道。
+func (ep *TunnelEndpoint) SetUplink(f func([]byte) error) {
+	ep.mu.Lock()
+	ep.uplink = f
+	ep.mu.Unlock()
+}
+
+// ClearUplink 注销上行回调。
+func (ep *TunnelEndpoint) ClearUplink() {
+	ep.mu.Lock()
+	ep.uplink = nil
+	ep.mu.Unlock()
+}
+
+// HasUplink 报告上行通道是否就绪。
+func (ep *TunnelEndpoint) HasUplink() bool {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+	return ep.uplink != nil
+}
+
+// Send 把上行的裸 IP 包交给隧道。
+//
+// 持读锁调用回调：回调内部是往长连接写数据，可能阻塞，
+// 这样能保证 ClearUplink 返回后不会再有写入发生。
+func (ep *TunnelEndpoint) Send(buf []byte) error {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+	if ep.uplink == nil {
+		return ErrNoUplink
+	}
+	return ep.uplink(buf)
+}
+
+// SetDownlink 注册下行回调：把隧道收到的裸 IP 包交给承载侧。
+func (ep *TunnelEndpoint) SetDownlink(f func([]byte)) {
+	ep.mu.Lock()
+	ep.downlink = f
+	ep.mu.Unlock()
+}
+
+// Deliver 把隧道下行的裸 IP 包交给承载侧。
+func (ep *TunnelEndpoint) Deliver(buf []byte) {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+	if ep.downlink != nil {
+		ep.downlink(buf)
 	}
 }

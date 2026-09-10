@@ -113,6 +113,7 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 
 type ipv4Header struct {
 	headerLen int
+	totalLen  int
 	protocol  byte
 	fragField uint16
 }
@@ -146,9 +147,25 @@ func parseIPv4(buf []byte) (ipv4Header, error) {
 	}
 	return ipv4Header{
 		headerLen: headLen,
+		totalLen:  int(binary.BigEndian.Uint16(buf[2:])),
 		protocol:  buf[9],
 		fragField: binary.BigEndian.Uint16(buf[fragmentFieldAt:]),
 	}, nil
+}
+
+// ipv4TotalLength 返回 IPv4 报文声明的总长度，并做基本合法性检查。
+//
+// 隧道下行是字节流：服务端可能把两个包写进一次 TLS 记录（粘包），
+// 也可能把包分两次写（半包）。按总长度切包是唯一可靠的边界判断。
+func ipv4TotalLength(buf []byte) (int, error) {
+	hdr, err := parseIPv4(buf)
+	if err != nil {
+		return 0, err
+	}
+	if hdr.totalLen < hdr.headerLen {
+		return 0, fmt.Errorf("IPv4 总长度 %d 小于头部长度 %d", hdr.totalLen, hdr.headerLen)
+	}
+	return hdr.totalLen, nil
 }
 
 func equal4(b []byte, want [4]byte) bool {

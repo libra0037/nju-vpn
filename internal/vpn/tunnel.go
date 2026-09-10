@@ -1,56 +1,24 @@
 package vpn
 
 import (
-	"crypto/rand"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"sync"
 	"time"
-
-	tls "github.com/refraction-networking/utls"
 )
 
+// DumpHex 打印报文的十六进制内容。
+//
+// 只在显式打开 debug 时调用：握手报文里含 token 与 TWFID，等价于凭据。
 func DumpHex(buf []byte) {
-	stdoutDumper := hex.Dumper(os.Stdout)
-	defer stdoutDumper.Close()
-	stdoutDumper.Write(buf)
-}
-
-// TLSConn 建立一条隧道用的 TLS 长连接。
-func (client *Client) TLSConn() (*tls.UConn, error) {
-	// dial vpn server
-	dialConn, err := client.Dial()
-	if err != nil {
-		return nil, err
-	}
-	log.Println("socket: connected to: ", dialConn.RemoteAddr())
-
-	// 用 uTLS 构造一个刻意畸形的 Client Hello：服务端要求 TLS 1.1、
-	// RC4-SHA 套件，并靠一个特殊 SessionId 把隧道流量和同端口的 Web 登录
-	// 流量区分开。缺任何一项，握手都会被拒。
-	conn := tls.UClient(dialConn, &tls.Config{InsecureSkipVerify: true}, tls.HelloCustom)
-
-	random := make([]byte, 32)
-	rand.Read(random) // Ignore the err
-	conn.SetClientRandom(random)
-	conn.SetTLSVers(tls.VersionTLS11, tls.VersionTLS11, []tls.TLSExtension{})
-	conn.HandshakeState.Hello.Vers = tls.VersionTLS11
-	conn.HandshakeState.Hello.CipherSuites = []uint16{tls.TLS_RSA_WITH_RC4_128_SHA, tls.FAKE_TLS_EMPTY_RENEGOTIATION_INFO_SCSV}
-	conn.HandshakeState.Hello.CompressionMethods = []uint8{0}
-	conn.HandshakeState.Hello.SessionId = []byte{'L', '3', 'I', 'P', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-
-	log.Println("tls: connected to: ", conn.RemoteAddr())
-
-	return conn, nil
-}
-
-// ProbeTunnel 走完整的隧道握手，然后立刻关闭，用来验证协议可用性。
-// 它不建立任何数据通路，也不会长期占用服务端资源。
-func (client *Client) ProbeTunnel(token *[48]byte, ipRev *[4]byte, debug bool) error {
-	_, err := client.streamHandshake(token, ipRev, streamRecv, debug)
-	return err
+	dumper := hex.Dumper(os.Stdout)
+	defer dumper.Close()
+	_, _ = dumper.Write(buf)
 }
 
 // streamKind 区分隧道里的两个方向。
@@ -63,15 +31,22 @@ const (
 
 func (k streamKind) String() string {
 	if k == streamRecv {
-		return "recv"
+		return "下行流"
 	}
-	return "send"
+	return "上行流"
 }
 
-// streamHandshake 打开一条流并完成握手，返回可用的连接。
-func (client *Client) streamHandshake(token *[48]byte, ipRev *[4]byte, kind streamKind, debug bool) (*tls.UConn, error) {
-	conn, err := client.TLSConn()
+// openStream 建立一条数据流并完成握手。
+//
+// 返回的连接由调用方持有；每条失败路径都先关闭连接。
+func (c *Client) openStream(ctx context.Context, token [streamTokenLen]byte, ipRev [4]byte, kind streamKind, debug bool) (net.Conn, error) {
+	conn, err := c.tunnelTLS(ctx)
 	if err != nil {
+		return nil, fmt.Errorf("%s: %w", kind, err)
+	}
+	// 握手阶段必须有超时，否则对端不回包就会永久挂住。
+	if err := conn.SetDeadline(deadlineFrom(ctx, c.timeouts.Handshake)); err != nil {
+		conn.Close()
 		return nil, err
 	}
 
@@ -81,219 +56,199 @@ func (client *Client) streamHandshake(token *[48]byte, ipRev *[4]byte, kind stre
 		opcode = 0x05
 	}
 
-	message := []byte{opcode, 0x00, 0x00, 0x00}
+	message := make([]byte, 0, 4+streamTokenLen+8+4)
+	message = append(message, opcode, 0x00, 0x00, 0x00)
 	message = append(message, token[:]...)
-	message = append(message, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}...)
+	message = append(message, make([]byte, 8)...)
 	message = append(message, ipRev[:]...)
 
 	n, err := conn.Write(message)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("%s: 发送握手: %w", kind, err)
 	}
 	log.Printf("%s handshake: wrote %d bytes", kind, n)
 	if debug {
-		DumpHex(message[:n])
+		DumpHex(message)
 	}
 
-	reply := make([]byte, 1500)
+	reply := make([]byte, 64)
 	n, err = conn.Read(reply)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("%s: 读取握手回执: %w", kind, err)
 	}
-	log.Printf("%s handshake: read %d bytes", kind, n)
+	if n == 0 {
+		conn.Close()
+		return nil, &ProtocolError{Step: kind.String(), Reason: "握手回执为空"}
+	}
 	if debug {
+		log.Printf("%s handshake: read %d bytes", kind, n)
 		DumpHex(reply[:n])
 	}
 
 	if reply[0] != byte(kind) {
 		conn.Close()
 		// 服务端用控制码说明拒绝原因，走同一套可重试判断。
-		return nil, &ControlError{Code: reply[0], Context: fmt.Sprintf("%s 流握手被拒绝", kind)}
+		return nil, &ControlError{Code: reply[0], Context: fmt.Sprintf("%s握手被拒绝", kind)}
+	}
+
+	// 数据阶段不再设 deadline：长连接会长时间空闲，退出靠 ctx 取消或显式关闭。
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, err
 	}
 	return conn, nil
 }
 
-func (client *Client) QueryIp(token *[48]byte, debug bool) ([]byte, *tls.UConn, error) {
-	conn, err := client.TLSConn()
+// queryIP 请求服务端分配一个校园网地址。
+//
+// 返回的连接必须保持打开到隧道握手完成，否则服务端会断开 i/o 流，
+// 所以它是返回值的一部分，由调用方持有。失败路径一律关闭连接：
+// 旧实现在失败时返回 (nil, nil, err)，调用方的清理代码永远是死代码。
+func (c *Client) queryIP(ctx context.Context, token [streamTokenLen]byte, debug bool) (net.IP, net.Conn, error) {
+	const step = "query-ip"
+
+	conn, err := c.tunnelTLS(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	// defer conn.Close()
-	// Query IP conn CAN NOT be closed, otherwise tx/rx handshake will fail
+	owned := true
+	defer func() {
+		if owned {
+			conn.Close()
+		}
+	}()
 
-	// QUERY IP PACKET
+	if err := conn.SetDeadline(deadlineFrom(ctx, c.timeouts.Handshake)); err != nil {
+		return nil, nil, err
+	}
+
 	message := []byte{0x00, 0x00, 0x00, 0x00}
 	message = append(message, token[:]...)
-	message = append(message, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff}...)
+	message = append(message, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff}...)
 
-	n, err := conn.Write(message)
-	if err != nil {
-		return nil, nil, err
+	if _, err := conn.Write(message); err != nil {
+		return nil, nil, fmt.Errorf("%s: 发送请求: %w", step, err)
 	}
-	log.Printf("query ip: wrote %d bytes", n)
 	if debug {
-		DumpHex(message[:n])
+		DumpHex(message)
 	}
 
 	reply := make([]byte, 0x80)
-	n, err = conn.Read(reply)
+	n, err := conn.Read(reply)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%s: 读取响应: %w", step, err)
 	}
-
-	log.Printf("query ip: read %d bytes", n)
 	if debug {
+		log.Printf("query ip: 收到 %d 字节", n)
 		DumpHex(reply[:n])
 	}
-
-	if reply[0] != 0x00 {
-		log.Printf("query ip: 请求报文:")
-		DumpHex(message)
-		log.Printf("query ip: 首字节为 0x%02x，完整响应:", reply[0])
-		DumpHex(reply[:n])
+	if n == 0 {
+		return nil, nil, &ProtocolError{Step: step, Reason: "响应为空"}
+	}
+	if reply[0] != ControlSendIP {
 		return nil, nil, &ControlError{Code: reply[0], Context: "query-ip 被拒绝"}
 	}
+	if n < 8 {
+		return nil, nil, &ProtocolError{Step: step, Reason: fmt.Sprintf("响应只有 %d 字节，读不到分配的地址", n)}
+	}
 
-	return reply[4:8], conn, nil
+	ip := net.IPv4(reply[4], reply[5], reply[6], reply[7])
+	// 数据阶段保持长连接，不设 deadline。
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, nil, err
+	}
+	owned = false
+	return ip, conn, nil
 }
 
-func (client *Client) BlockRXStream(token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
-	conn, err := client.streamHandshake(token, ipRev, streamRecv, debug)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	reply := make([]byte, 1500)
-	for {
-		n, err := conn.Read(reply)
-		if err != nil {
-			return err
-		}
-
-		ep.WriteTo(reply[:n])
-
-		if debug {
-			log.Printf("recv: read %d bytes", n)
-			DumpHex(reply[:n])
-		}
-	}
-}
-
-func (client *Client) BlockTXStream(token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
-	conn, err := client.streamHandshake(token, ipRev, streamSend, debug)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	errCh := make(chan error, 1)
-
-	ep.OnRecv = func(buf []byte) {
-		var n, err = conn.Write(buf)
-		if err != nil {
-			// 非阻塞发送，避免同时有多个写失败时阻塞在通道上。
-			select {
-			case errCh <- err:
-			default:
-			}
-			return
-		}
-
-		if debug {
-			log.Printf("send: wrote %d bytes", n)
-			DumpHex([]byte(buf[:n]))
-		}
-	}
-	defer func() { ep.OnRecv = nil }()
-
-	return <-errCh
-}
-
-// 重试参数。服务端的控制码区分了能否重试：
+// uplinkSink 把上行的 IP 包写进隧道，并记住第一次写失败。
 //
-//	3 ServerReset / 5 IpBusy —— 暂时性，值得退避重试；
-//	8 Shutdown / 9 IpConflict / 14 IpKick —— 终止性，重试只会继续被拒，
-//	而且密集重试会让账号进入长时间被拒的状态。
-const (
-	streamRetryLimit = 4
-	streamRetryBase  = 2 * time.Second
-	streamRetryMax   = 30 * time.Second
-)
+// 上行方向平时没有读者，只有真的有包要发时才知道连接已经死了，
+// 所以失败要靠写路径主动上报。
+type uplinkSink struct {
+	conn net.Conn
 
-// StreamError 表示某条数据流（收或发）终止。
+	mu   sync.Mutex
+	err  error
+	done chan struct{}
+}
+
+func newUplinkSink(conn net.Conn) *uplinkSink {
+	return &uplinkSink{conn: conn, done: make(chan struct{})}
+}
+
+// Write 实现 TunnelEndpoint 需要的写入回调。
+func (s *uplinkSink) Write(buf []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	if _, err := s.conn.Write(buf); err != nil {
+		s.err = err
+		close(s.done)
+		return err
+	}
+	return nil
+}
+
+// Err 返回第一次写失败的原因。
+func (s *uplinkSink) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// Done 在第一次写失败时关闭。
+func (s *uplinkSink) Done() <-chan struct{} { return s.done }
+
+// StreamError 表示某条数据流终止。
 type StreamError struct {
-	// Direction 是 "recv" 或 "send"。
 	Direction string
 	Err       error
 }
 
-func (e *StreamError) Error() string {
-	return fmt.Sprintf("%s 流失败: %v", e.Direction, e.Err)
-}
-
+func (e *StreamError) Error() string { return e.Direction + "失败: " + e.Err.Error() }
 func (e *StreamError) Unwrap() error { return e.Err }
 
-// StartProtocol 建立收、发两条数据流并阻塞转发，直到任一条终止。
+// RetryPolicy 描述数据流断开后的重连策略。
 //
-// 调用方应在单独的 goroutine 中运行它，并根据返回的错误更新服务状态。
-// 与旧实现不同，这里不再在重试耗尽后 panic——服务进程需要能感知失败，
-// 而不是整体崩溃。
-func (client *Client) StartProtocol(endpoint *TunnelEndpoint, token *[48]byte, ipRev *[4]byte, debug bool) error {
-	errCh := make(chan *StreamError, 2)
-
-	go func() {
-		errCh <- &StreamError{Direction: "recv", Err: client.runStream(streamRecv, token, ipRev, endpoint, debug)}
-	}()
-	// 发方向的真实错误由 OnRecv 回填，见 BlockTXStream。
-	go func() {
-		errCh <- &StreamError{Direction: "send", Err: client.runStream(streamSend, token, ipRev, endpoint, debug)}
-	}()
-
-	first := <-errCh
-	// 一条断了，另一条也就没有意义了。清掉回调，避免继续往已关闭的连接写。
-	endpoint.OnRecv = nil
-	return first
+// 服务端的控制码区分了能否重试：3(ServerReset) / 5(IpBusy) 值得退避重试；
+// 8(Shutdown) / 9(IpConflict) / 14(IpKick) 是终止性的，重试只会继续被拒，
+// 密集重试还会让账号进入长时间被拒绝的状态。
+type RetryPolicy struct {
+	Attempts int
+	Base     time.Duration
+	Max      time.Duration
 }
 
-// runStream 带退避地反复建立一条流，正常返回时按 error 处理。
-func (client *Client) runStream(kind streamKind, token *[48]byte, ipRev *[4]byte, ep *TunnelEndpoint, debug bool) error {
-	var lastErr error
-	for attempt := 0; attempt <= streamRetryLimit; attempt++ {
-		if attempt > 0 {
-			delay := retryDelay(attempt)
-			log.Printf("%s 流第 %d 次重试，%s 后重连（上次错误: %v）", kind, attempt, delay, lastErr)
-			time.Sleep(delay)
-		}
+// DefaultRetryPolicy 是默认的重连策略。
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{Attempts: 4, Base: 2 * time.Second, Max: 30 * time.Second}
+}
 
-		var err error
-		if kind == streamRecv {
-			err = client.BlockRXStream(token, ipRev, ep, debug)
-		} else {
-			err = client.BlockTXStream(token, ipRev, ep, debug)
-		}
-		lastErr = err
-		if err == nil {
-			return nil
-		}
-
-		// 终止性错误直接放弃，避免把账号打进被拒状态。
-		var ctrl *ControlError
-		if errors.As(err, &ctrl) && !ctrl.Retryable() {
-			return err
-		}
+// delay 返回第 attempt 次重试前的等待时长（attempt 从 1 开始）。
+func (p RetryPolicy) delay(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
 	}
-	return fmt.Errorf("重试 %d 次后仍未恢复: %w", streamRetryLimit, lastErr)
-}
-
-// retryDelay 返回第 attempt 次重试前的等待时长（attempt 从 1 开始），
-// 按 2 秒起步指数增长，上限 30 秒。
-func retryDelay(attempt int) time.Duration {
-	d := streamRetryBase << (attempt - 1)
-	if d <= 0 || d > streamRetryMax {
-		return streamRetryMax
+	if attempt > 30 { // 防御移位溢出
+		return p.Max
+	}
+	d := p.Base << (attempt - 1)
+	if d <= 0 || d > p.Max {
+		return p.Max
 	}
 	return d
+}
+
+// retryable 判断错误是否值得重试。
+func retryable(err error) bool {
+	var ctrl *ControlError
+	if errors.As(err, &ctrl) {
+		return ctrl.Retryable()
+	}
+	return true
 }

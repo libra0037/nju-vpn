@@ -8,11 +8,23 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"njuvpn/internal/ipc"
+)
+
+const (
+	// idleTimeout 是客户端连接的空闲上限。超过它没有任何请求就断开，
+	// 免得一个挂死的客户端长期占着文件描述符。
+	idleTimeout = 60 * time.Second
+	// writeTimeout 限制一次写响应的时间。
+	writeTimeout = 15 * time.Second
+	// maxConns 限制并发连接数。
+	maxConns = 32
 )
 
 // Server 在本地端点上提供服务，把 IPC 请求转成对 Service 的调用。
@@ -22,15 +34,21 @@ type Server struct {
 
 	closing chan struct{}
 	once    sync.Once
+	sem     chan struct{}
+	wg      sync.WaitGroup
 }
 
 // NewServer 构造服务端。
 func NewServer(svc *Service, listener net.Listener) *Server {
-	return &Server{svc: svc, listener: listener, closing: make(chan struct{})}
+	return &Server{
+		svc:      svc,
+		listener: listener,
+		closing:  make(chan struct{}),
+		sem:      make(chan struct{}, maxConns),
+	}
 }
 
-// Shutdown 停止接受新连接。处理中的连接会自然结束，不在退出路径上等待，
-// 以免被 probe 的长时间重试拖住进程退出。
+// Shutdown 停止接受新连接。处理中的连接会自然结束，不在退出路径上等待。
 func (s *Server) Shutdown() {
 	s.once.Do(func() {
 		close(s.closing)
@@ -58,17 +76,48 @@ func (s *Server) Serve() error {
 			}
 			return err
 		}
-		go s.handle(conn)
+
+		select {
+		case s.sem <- struct{}{}:
+		default:
+			log.Printf("IPC 连接数已达上限 %d，拒绝新连接", maxConns)
+			conn.Close()
+			continue
+		}
+
+		s.wg.Add(1)
+		go func() {
+			defer func() {
+				<-s.sem
+				s.wg.Done()
+			}()
+			s.handle(conn)
+		}()
 	}
 }
 
+// Wait 等待所有在处理的连接结束，仅用于测试与优雅退出。
+func (s *Server) Wait() { s.wg.Wait() }
+
+// handle 处理一条客户端连接。
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
+
+	// panic 边界：一个畸形请求不该带走整个服务进程——服务端的会话
+	// 还开着，进程直接死掉就没人登出了。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("处理 IPC 请求时发生内部错误: %v\n%s", r, debug.Stack())
+		}
+	}()
 
 	reader := bufio.NewReader(conn)
 	for {
 		// 退出过程中不再接受新请求，避免刚登出又被叫起来建隧道。
 		if s.isClosing() {
+			return
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
 			return
 		}
 		req, err := ipc.ReadRequest(reader)
@@ -77,6 +126,9 @@ func (s *Server) handle(conn net.Conn) {
 		}
 
 		resp := s.dispatch(req)
+		if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return
+		}
 		if err := ipc.WriteResponse(conn, resp); err != nil {
 			return
 		}
@@ -90,18 +142,7 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		return ipc.Response{Code: ipc.CodeOK, Message: "pong"}
 
 	case ipc.CmdStatus:
-		st := s.svc.Status()
-		msg := string(st.State)
-		if st.Detail != "" {
-			msg += " | " + st.Detail
-		}
-		if st.ClientIP != "" {
-			msg += fmt.Sprintf(" | 校园网地址 %s", st.ClientIP)
-		}
-		if st.PeerIP != "" {
-			msg += fmt.Sprintf(" | peer %s", st.PeerIP)
-		}
-		return ipc.Response{Code: ipc.CodeOK, Message: msg}
+		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(s.svc.Status())}
 
 	case ipc.CmdStart:
 		err := s.svc.Start()
@@ -109,8 +150,9 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		case err == nil:
 			return ipc.Response{Code: ipc.CodeOK, Message: "隧道已建立"}
 		case errors.Is(err, ErrAuthRequired):
-			// 409 让客户端知道要接着调用 auth，而不是当成失败。
-			return ipc.Response{Code: ipc.CodeRejected, Message: s.svc.Status().Detail}
+			return ipc.Response{Code: ipc.CodeAuthRequired, Message: s.svc.Status().Detail}
+		case errors.Is(err, ErrShuttingDown):
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
 		default:
 			return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
 		}
@@ -119,27 +161,53 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		if len(req.Args) == 0 {
 			return ipc.Response{Code: ipc.CodeBadRequest, Message: "用法: auth <验证码>"}
 		}
-		code := strings.TrimSpace(req.Args[0])
-		if err := s.svc.Auth(code); err != nil {
-			if errors.Is(err, ErrAuthRequired) {
-				return ipc.Response{Code: ipc.CodeRejected, Message: s.svc.Status().Detail}
-			}
-			return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
+		// 验证码可能被拆成多个参数（用户敲了空格），拼回去再用。
+		code := strings.TrimSpace(strings.Join(req.Args, ""))
+		err := s.svc.Auth(code)
+		switch {
+		case err == nil:
+			return ipc.Response{Code: ipc.CodeOK, Message: "验证成功，隧道已建立"}
+		case errors.Is(err, ErrAuthRequired):
+			return ipc.Response{Code: ipc.CodeAuthRequired, Message: s.svc.Status().Detail}
+		case errors.Is(err, ErrShuttingDown):
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
+		default:
+			// 验证码错误属于客户端输入问题，不该报成服务端故障。
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
 		}
-		return ipc.Response{Code: ipc.CodeOK, Message: "验证成功，隧道已建立"}
 
 	case ipc.CmdStop:
-		if err := s.svc.Stop(); err != nil {
-			if errors.Is(err, ErrNotRunning) {
-				return ipc.Response{Code: ipc.CodeRejected, Message: "隧道本来就没有运行"}
-			}
+		err := s.svc.Stop()
+		switch {
+		case err == nil:
+			return ipc.Response{Code: ipc.CodeOK, Message: "隧道已断开"}
+		case errors.Is(err, ErrNotRunning):
+			return ipc.Response{Code: ipc.CodeRejected, Message: "隧道本来就没有运行"}
+		default:
 			return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
 		}
-		return ipc.Response{Code: ipc.CodeOK, Message: "隧道已断开"}
 
 	default:
 		return ipc.Response{Code: ipc.CodeBadRequest, Message: "未知命令: " + req.Command}
 	}
+}
+
+// statusLine 把状态拼成一行文本。
+func statusLine(st Status) string {
+	msg := string(st.State)
+	if st.Detail != "" {
+		msg += " | " + st.Detail
+	}
+	if st.ClientIP != "" {
+		msg += " | 校园网地址 " + st.ClientIP
+	}
+	if st.PeerIP != "" {
+		msg += " | peer " + st.PeerIP
+	}
+	if !st.Since.IsZero() {
+		msg += fmt.Sprintf(" | %s 起", st.Since.Format("15:04:05"))
+	}
+	return msg
 }
 
 // RunServer 是服务进程的入口：监听本地端点并处理请求。
@@ -154,7 +222,7 @@ func RunServer(svc *Service, endpoint string) error {
 	srv := NewServer(svc, ln)
 
 	// 收到退出信号时停止接受连接，让 Serve 返回；
-	// 调用方随后通过 defer 执行登出，释放服务端会话。
+	// 调用方随后执行登出，释放服务端会话。
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	go func() {

@@ -3,8 +3,8 @@
 // 传输层是本地套接字（Linux 用 unix socket，Windows 用命名管道），
 // 应用层是一行一条的文本协议：
 //
-//	请求  <命令> [参数...]\n
-//	响应  <状态码> <一行文本>\n
+//	请求  <命令> [参数...] 换行
+//	响应  <状态码> <一行文本> 换行
 //
 // 状态码沿用 HTTP 的语义：200 成功，4xx 客户端错误，5xx 服务端错误。
 // 这里没有用 HTTP，因为本地 IPC 不需要分帧、头字段和内容协商。
@@ -12,6 +12,7 @@ package ipc
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -28,11 +29,21 @@ const (
 
 // 响应状态码。
 const (
-	CodeOK          = 200
-	CodeBadRequest  = 400
-	CodeRejected    = 409 // 当前状态不允许该操作
-	CodeServerError = 500
+	CodeOK           = 200
+	CodeBadRequest   = 400 // 参数不对，例如验证码错误
+	CodeRejected     = 409 // 当前状态不允许该操作
+	CodeAuthRequired = 428 // 需要提交验证码才能继续（不是错误）
+	CodeServerError  = 500
 )
+
+// MaxLineBytes 是单行请求或响应的长度上限。
+//
+// 没有上限时，一个只发不换行的连接就能让服务进程的内存无界增长：
+// bufio 的 ReadString 会一直扩容直到读到换行为止。
+const MaxLineBytes = 64 * 1024
+
+// ErrLineTooLong 表示收到的行超过 MaxLineBytes。
+var ErrLineTooLong = errors.New("报文行超过长度上限")
 
 // Request 是一条解析后的请求。
 type Request struct {
@@ -84,9 +95,29 @@ func sanitize(s string) string {
 	return s
 }
 
+// readLine 读一行，超过上限直接报错。
+func readLine(r *bufio.Reader) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if sb.Len()+len(chunk) > MaxLineBytes {
+			return "", ErrLineTooLong
+		}
+		sb.Write(chunk)
+		switch {
+		case err == nil:
+			return sb.String(), nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		default:
+			return "", err
+		}
+	}
+}
+
 // ReadRequest 从连接上读一条请求。
 func ReadRequest(r *bufio.Reader) (Request, error) {
-	line, err := r.ReadString('\n')
+	line, err := readLine(r)
 	if err != nil {
 		return Request{}, err
 	}
@@ -101,7 +132,7 @@ func WriteResponse(w io.Writer, resp Response) error {
 
 // ReadResponse 从连接上读一条响应。
 func ReadResponse(r *bufio.Reader) (Response, error) {
-	line, err := r.ReadString('\n')
+	line, err := readLine(r)
 	if err != nil {
 		return Response{}, err
 	}

@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -45,21 +46,37 @@ func TestControlErrorUnknownCode(t *testing.T) {
 	}
 }
 
-func TestRetryDelayGrowsAndCaps(t *testing.T) {
+func TestRetryPolicyDelayGrowsAndCaps(t *testing.T) {
+	policy := RetryPolicy{Attempts: 4, Base: 2 * time.Second, Max: 30 * time.Second}
 	cases := []struct {
 		attempt int
 		want    time.Duration
 	}{
+		{0, 0},
 		{1, 2 * time.Second},
 		{2, 4 * time.Second},
 		{3, 8 * time.Second},
 		{4, 16 * time.Second},
-		{5, streamRetryMax}, // 32 秒超过上限，取 30 秒
-		{9, streamRetryMax},
+		{5, 30 * time.Second}, // 32 秒超过上限
+		{9, 30 * time.Second},
+		{40, 30 * time.Second}, // 移位溢出必须被挡住，不能变成 0
 	}
 	for _, c := range cases {
-		if got := retryDelay(c.attempt); got != c.want {
-			t.Errorf("retryDelay(%d) = %v，期望 %v", c.attempt, got, c.want)
+		if got := policy.delay(c.attempt); got != c.want {
+			t.Errorf("delay(%d) = %v，期望 %v", c.attempt, got, c.want)
 		}
+	}
+}
+
+func TestRetryableClassifiesControlErrors(t *testing.T) {
+	if retryable(&ControlError{Code: ControlShutdown}) {
+		t.Error("Shutdown 不应被判为可重试")
+	}
+	if !retryable(&ControlError{Code: ControlIPBusy}) {
+		t.Error("IpBusy 应被判为可重试")
+	}
+	// 普通网络错误是暂时性的，值得重试。
+	if !retryable(errors.New("connection reset")) {
+		t.Error("普通错误应被判为可重试")
 	}
 }

@@ -1,10 +1,12 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -17,286 +19,488 @@ import (
 // ErrNotRunning 表示服务进程还没有建立隧道。
 var ErrNotRunning = errors.New("隧道未运行")
 
+// ErrAuthRequired 表示需要提交验证码才能继续。
+var ErrAuthRequired = errors.New("需要二次验证")
+
+// ErrShuttingDown 表示服务进程正在退出，不再接受新命令。
+var ErrShuttingDown = errors.New("服务进程正在退出")
+
+// closeGrace 是 Close 等待 actor 收尾的上限。正常收尾就是一次登出请求，
+// 登出自身有 10 秒超时，所以这里给足余量但不无限等。
+const closeGrace = 20 * time.Second
+
+type commandKind int
+
+const (
+	cmdStart commandKind = iota
+	cmdAuth
+	cmdStop
+	cmdTunnelDown
+)
+
+type command struct {
+	kind  commandKind
+	code  string
+	gen   uint64
+	err   error
+	reply chan error
+}
+
 // Service 持有一次隧道连接的全部资源。
+//
+// 所有会改状态的操作都在 loop 这一个协程里执行：调用方把命令放进 cmds，
+// 等一个回复。这样就不需要在持锁状态下做网络 I/O——旧实现在 Start 全程
+// 持有互斥锁，网络一慢，退出路径的登出就永远拿不到锁。
 type Service struct {
-	cfg   *config.Config
-	state *machine
+	cfg    *config.Config
+	status *statusStore
 
-	mu        sync.Mutex
-	client    *vpn.Client
-	relay     *wireguard.Relay
-	endpoint  *vpn.TunnelEndpoint
-	twfID     string
-	authKind  error // 上一次登录要求的二次验证方式
-	queryConn net.Conn
+	cmds      chan *command
+	closed    chan struct{}
+	actorDone chan struct{}
+	closeOnce sync.Once
+
+	mu       sync.Mutex
+	opCancel context.CancelFunc
+
+	// 以下字段只在 actor 协程里访问，不需要加锁。
+	clientFactory func(cfg *config.Config) (*vpn.Client, error)
+	client        *vpn.Client
+	session       *vpn.Session
+	relay         *wireguard.Relay
+	runCancel     context.CancelFunc
+	gen           uint64
+	pendingAuth   *vpn.AuthRequiredError
 }
 
-// New 构造服务对象。
+// New 构造服务对象并启动命令循环。
 func New(cfg *config.Config) *Service {
-	return &Service{cfg: cfg, state: newMachine()}
+	s := &Service{
+		cfg:       cfg,
+		status:    newStatusStore(),
+		cmds:      make(chan *command),
+		closed:    make(chan struct{}),
+		actorDone: make(chan struct{}),
+	}
+	go s.loop()
+	return s
 }
 
-// Status 返回当前状态。
-func (s *Service) Status() Status { return s.state.Get() }
+// Status 返回当前状态快照。它不经过 actor，永远立即可用。
+func (s *Service) Status() Status { return s.status.Get() }
+
+// SetClientFactory 注入协议客户端的构造方式，供测试注入假的 portal 与隧道。
+//
+// 必须在第一次调用 Start 之前设置：真正读取它的只有 actor 协程，
+// 而第一次命令的发送建立了 happens-before 关系。
+func (s *Service) SetClientFactory(f func(cfg *config.Config) (*vpn.Client, error)) {
+	s.clientFactory = f
+}
 
 // Start 建立隧道。
 //
 // 若服务端要求二次验证，会切到 auth_pending 并返回 ErrAuthRequired，
 // 由调用方通过 Auth 提交验证码后继续。
 func (s *Service) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	cur := s.state.Get().State
-	// 等待验证码时再次 start，意味着用户没收到码、想重新要一条。
-	// 旧 TwfID 上重复请求会被服务端拒绝（unexpected user service），
-	// 所以丢弃旧会话，重新走一遍登录拿新的。
-	if cur == StateAuthPending {
-		s.release()
-		if err := s.state.Transition(StateIdle, "重新登录"); err != nil {
-			return err
-		}
-		cur = StateIdle
-	}
-
-	if cur != StateIdle && cur != StateError {
-		return fmt.Errorf("当前状态是 %s，无法开始新的连接", cur)
-	}
-
-	if err := s.state.Transition(StateLoggingIn, "正在登录"); err != nil {
-		return err
-	}
-
-	dialFn, err := dial.New(s.cfg.Proxy)
-	if err != nil {
-		s.fail(err)
-		return err
-	}
-	s.client = vpn.NewClient(s.cfg.ServerAddr(), dialFn)
-	if addr := s.cfg.DialAddr(); addr != "" {
-		s.client.WithDialAddr(addr)
-	}
-
-	// TOTP 密钥存在时无人值守完成验证，省掉人工介入。
-	code := ""
-	if s.cfg.TOTPSecret != "" {
-		code, err = vpn.GenerateTOTP(s.cfg.TOTPSecret)
-		if err != nil {
-			s.fail(err)
-			return err
-		}
-	}
-
-	res, err := s.client.Probe(s.cfg.Username, s.cfg.Password, "", code, false, nil)
-	// Probe 失败时也要先记下 TWFID：登录可能已经成功，只是后续建隧道失败。
-	// 不记的话 fail → release → logoutLocked 会因为 twfID 为空而跳过登出，
-	// 服务端就会留下一个占用名额的会话。
-	if res != nil && res.TwfID != "" {
-		s.twfID = res.TwfID
-	}
-	if err != nil {
-		s.fail(err)
-		return err
-	}
-	s.authKind = res.NeedAuth
-
-	if res.NeedAuth != nil {
-		return s.awaitAuth()
-	}
-
-	return s.finishConnect(res)
+	return s.call(&command{kind: cmdStart})
 }
 
 // Auth 提交二次验证码。仅在 auth_pending 状态下有效。
 func (s *Service) Auth(code string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.call(&command{kind: cmdAuth, code: code})
+}
 
-	if s.state.Get().State != StateAuthPending {
-		return fmt.Errorf("当前状态是 %s，不需要验证码", s.state.Get().State)
+// Stop 断开隧道并释放资源。
+func (s *Service) Stop() error {
+	return s.call(&command{kind: cmdStop})
+}
+
+// Close 停止命令循环、释放资源并通知服务端登出。可安全重复调用。
+//
+// 与 Stop 的区别是不判断状态、不返回错误：进程退出路径必须执行它。
+// 服务端同一账号只允许一个客户端，残留会话会导致后续建隧道被拒。
+func (s *Service) Close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		// 打断正在进行的网络 I/O，让 actor 尽快回到循环里收尾。
+		s.cancelOp()
+
+		select {
+		case <-s.actorDone:
+		case <-time.After(closeGrace):
+			log.Printf("服务进程收尾超过 %s，放弃等待", closeGrace)
+		}
+	})
+}
+
+// call 把命令交给 actor 并等回复。
+func (s *Service) call(cmd *command) error {
+	cmd.reply = make(chan error, 1)
+
+	select {
+	case s.cmds <- cmd:
+	case <-s.closed:
+		return ErrShuttingDown
+	}
+
+	select {
+	case err := <-cmd.reply:
+		return err
+	case <-s.closed:
+		return ErrShuttingDown
+	}
+}
+
+// setOpCancel 记录当前操作的取消函数。
+func (s *Service) setOpCancel(cancel context.CancelFunc) {
+	s.mu.Lock()
+	s.opCancel = cancel
+	s.mu.Unlock()
+}
+
+// cancelOp 取消正在进行的操作。
+func (s *Service) cancelOp() {
+	s.mu.Lock()
+	cancel := s.opCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// loop 是 actor 主循环。
+func (s *Service) loop() {
+	defer close(s.actorDone)
+	for {
+		select {
+		case <-s.closed:
+			s.teardown("服务进程退出")
+			return
+		case cmd := <-s.cmds:
+			s.dispatch(cmd)
+		}
+	}
+}
+
+// dispatch 执行一条命令。
+//
+// 这里是最外层panic 边界：任何一处未预料到的崩溃都会转成一次失败，
+// 而不是带走整个进程——服务端的会话还开着，进程直接死掉就没人登出了。
+func (s *Service) dispatch(cmd *command) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.setOpCancel(cancel)
+
+	replied := false
+	reply := func(err error) {
+		if replied {
+			return
+		}
+		replied = true
+		select {
+		case cmd.reply <- err:
+		default:
+		}
+	}
+
+	defer func() {
+		s.setOpCancel(nil)
+		cancel()
+
+		if r := recover(); r != nil {
+			err := fmt.Errorf("内部错误: %v", r)
+			log.Printf("%v\n%s", err, debug.Stack())
+			s.teardown("内部错误")
+			_ = s.status.set(StateError, err.Error())
+			reply(err)
+		}
+	}()
+
+	var err error
+	switch cmd.kind {
+	case cmdStart:
+		err = s.start(ctx)
+	case cmdAuth:
+		err = s.auth(ctx, cmd.code)
+	case cmdStop:
+		err = s.stop()
+	case cmdTunnelDown:
+		err = s.tunnelDown(cmd.gen, cmd.err)
+	default:
+		err = fmt.Errorf("未知命令 %d", cmd.kind)
+	}
+	reply(err)
+}
+
+// start 建立隧道。
+func (s *Service) start(ctx context.Context) error {
+	cur := s.status.Get().State
+	switch cur {
+	case StateAuthPending:
+		// 等待验证码时再次 start，意味着用户没收到码、想重新要一条。
+		// 旧 TwfID 上重复请求会被服务端拒绝，所以丢弃旧会话重新登录。
+		s.teardown("重新登录")
+	case StateIdle, StateError:
+		s.teardown("")
+	default:
+		return fmt.Errorf("当前状态是 %s，无法开始新的连接", cur)
+	}
+
+	if err := s.status.set(StateLoggingIn, "正在登录"); err != nil {
+		return err
+	}
+
+	var err error
+	client := (*vpn.Client)(nil)
+	if s.clientFactory != nil {
+		client, err = s.clientFactory(s.cfg)
+	} else {
+		var dialFn vpn.DialFunc
+		dialFn, err = dial.New(s.cfg.Proxy)
+		if err == nil {
+			client = vpn.New(vpn.Options{
+				Server:   s.cfg.ServerAddr(),
+				DialAddr: s.cfg.DialAddr(),
+				Dial:     dialFn,
+			})
+		}
+	}
+	if err != nil {
+		return s.fail(err)
+	}
+	if s.client != nil {
+		s.client.CloseIdleConnections()
+	}
+	s.client = client
+
+	sess, err := client.Connect(ctx, vpn.ConnectOptions{
+		Username:   s.cfg.Username,
+		Password:   s.cfg.Password,
+		TOTPSecret: s.cfg.TOTPSecret,
+		Trace:      &vpn.Trace{},
+	})
+	// 失败时也可能已经拿到 TwfID：会话必须留下来，否则没法登出，
+	// 服务端就会一直挂着一个占名额的会话。
+	s.attach(sess)
+	if err != nil {
+		if authErr, ok := vpn.AsAuthRequired(err); ok {
+			s.pendingAuth = authErr
+			return s.awaitAuth()
+		}
+		return s.fail(err)
+	}
+
+	s.pendingAuth = nil
+	return s.finishConnect(sess)
+}
+
+// auth 提交二次验证码。
+func (s *Service) auth(ctx context.Context, code string) error {
+	cur := s.status.Get().State
+	if cur != StateAuthPending || s.pendingAuth == nil || s.client == nil {
+		return fmt.Errorf("当前状态是 %s，不需要验证码", cur)
 	}
 	if code == "" {
 		return errors.New("验证码为空")
 	}
 
-	res, err := s.client.Probe(s.cfg.Username, s.cfg.Password, s.twfID, code, false, nil)
+	sess, err := s.client.Connect(ctx, vpn.ConnectOptions{
+		Username: s.cfg.Username,
+		Password: s.cfg.Password,
+		TwfID:    s.pendingAuth.TwfID,
+		Code:     code,
+		AuthKind: s.pendingAuth.Kind,
+		Trace:    &vpn.Trace{},
+	})
+	s.attach(sess)
 	if err != nil {
 		// 验证码本身错了不该把整个会话打回 idle：TwfID 还有效，
 		// 用户可以再输一次。这里保持 auth_pending 并带上原因。
-		if isAuthCodeError(err) {
-			s.state.SetDetail(err.Error())
+		if vpn.IsAuthCodeError(err) {
+			s.status.setDetail(err.Error())
 			return err
 		}
-		s.fail(err)
-		return err
-	}
-	if res.NeedAuth != nil {
-		return s.awaitAuth()
+		if authErr, ok := vpn.AsAuthRequired(err); ok {
+			s.pendingAuth = authErr
+			return s.awaitAuth()
+		}
+		return s.fail(err)
 	}
 
-	return s.finishConnect(res)
+	s.pendingAuth = nil
+	return s.finishConnect(sess)
 }
 
-// Stop 断开隧道并释放资源。
-func (s *Service) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.state.Get().State == StateIdle {
+// stop 断开隧道。
+func (s *Service) stop() error {
+	if s.status.Get().State == StateIdle && s.session == nil {
 		return ErrNotRunning
 	}
-	// release 内部会先登出再释放本地资源。
-	s.release()
-	return s.state.Transition(StateIdle, "已断开")
+	s.teardown("已断开")
+	return nil
 }
 
-// Close 无条件释放资源并通知服务端注销会话，可安全重复调用。
+// attach 接管一次连接的结果。
 //
-// 与 Stop 的区别是不判断状态、不返回错误：进程退出路径必须执行它。
-// 服务端同一账号只允许一个客户端（登录响应里 Is_enable_mult_client 为 0），
-// 残留会话会导致后续建隧道被拒，因此退出时宁可多登出一次。
-func (s *Service) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.release()
-}
-
-// release 关闭所有底层资源。调用方需持有 s.mu。
-func (s *Service) release() {
-	s.logoutLocked()
-	s.closeResources()
-}
-
-// logoutLocked 通知服务端注销当前会话。调用方需持有 s.mu。
-//
-// 不登出就丢弃 TWFID，会在服务端留下一个占用名额的会话；
-// 反复失败重试就会把账号的隧道名额耗尽。
-func (s *Service) logoutLocked() {
-	if s.client == nil || s.twfID == "" {
+// 注意失败路径同样要接管：Connect 在部分失败时会返回带 TwfID 的会话，
+// 只有拿着它才能把服务端的会话释放掉。
+func (s *Service) attach(sess *vpn.Session) {
+	if sess == nil {
 		return
 	}
-	if err := s.client.Logout(s.twfID); err != nil {
-		log.Printf("服务端登出未成功: %v", err)
-		return
+	if s.session != nil && s.session != sess {
+		if err := s.session.Close(context.Background()); err != nil {
+			log.Printf("释放上一个会话: %v", err)
+		}
 	}
-	log.Printf("已通知服务端注销会话")
+	s.session = sess
 }
 
-// closeResources 释放本地资源。调用方需持有 s.mu。
-func (s *Service) closeResources() {
-	if s.relay != nil {
-		s.relay.Close()
-		s.relay = nil
+// finishConnect 用一次成功的连接建立 WireGuard 承载。
+func (s *Service) finishConnect(sess *vpn.Session) error {
+	if err := s.status.set(StateConnecting, "正在建立承载"); err != nil {
+		return s.fail(err)
 	}
-	if s.queryConn != nil {
-		s.queryConn.Close()
-		s.queryConn = nil
+
+	mapper, err := wireguard.NewMapper(net.ParseIP(s.cfg.WireGuard.PeerAddress), net.ParseIP(sess.ClientIP()))
+	if err != nil {
+		return s.fail(fmt.Errorf("地址映射: %w", err))
 	}
-	s.endpoint = nil
-	s.client = nil
-	s.twfID = ""
-	s.authKind = nil
+
+	s.relay = wireguard.NewRelay(wireguard.RelayOptions{
+		MTU:      s.cfg.MTU,
+		Endpoint: sess.Endpoint(),
+		Mapper:   mapper,
+	})
+
+	s.status.setAddresses(sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
+	// 先进入 up 再启动隧道协程：如果协程立刻就失败，
+	// tunnelDown 必须能看到 up 才能正确收敛，否则这次失败会被忽略掉。
+	if err := s.status.set(StateUp, "隧道已建立"); err != nil {
+		return s.fail(err)
+	}
+
+	// 隧道协程的生命周期独立于本次命令：Stop/Close 通过 runCancel 结束它。
+	runCtx, cancel := context.WithCancel(context.Background())
+	s.runCancel = cancel
+	s.gen++
+	gen := s.gen
+	go func() {
+		err := sess.RunWithRetry(runCtx, vpn.DefaultRetryPolicy())
+		s.reportTunnelDown(gen, err)
+	}()
+
+	log.Printf("隧道已建立：校园网地址 %s，peer 地址 %s", sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
+	return nil
 }
 
-// awaitAuth 切到等待验证码状态。调用方需持有 s.mu。
+// reportTunnelDown 把隧道协程的退出转成一条命令交给 actor。
+//
+// 必须经过 actor：直接改状态就会和正在执行的命令打架。
+func (s *Service) reportTunnelDown(gen uint64, err error) {
+	select {
+	case s.cmds <- &command{kind: cmdTunnelDown, gen: gen, err: err, reply: make(chan error, 1)}:
+	case <-s.closed:
+	}
+}
+
+// tunnelDown 处理隧道运行期断开。
+//
+// 代次（gen）检查是必须的：Stop 之后旧协程可能还在退避重连，
+// 它退出时新会话早就建立了，不做区分就会把新会话一起拆掉。
+func (s *Service) tunnelDown(gen uint64, err error) error {
+	if gen != s.gen {
+		log.Printf("忽略过期隧道协程的退出（第 %d 代，当前第 %d 代）: %v", gen, s.gen, err)
+		return nil
+	}
+	if s.status.Get().State != StateUp {
+		log.Printf("隧道协程已退出（当前状态 %s）: %v", s.status.Get().State, err)
+		return nil
+	}
+
+	log.Printf("隧道断开: %v", err)
+	s.teardown("")
+	detail := "隧道已断开"
+	if err != nil {
+		detail += ": " + err.Error()
+	}
+	_ = s.status.set(StateError, detail)
+	return nil
+}
+
+// awaitAuth 切到等待验证码状态。
 func (s *Service) awaitAuth() error {
 	var detail string
+	kind := error(nil)
+	if s.pendingAuth != nil {
+		kind = s.pendingAuth.Kind
+	}
 	switch {
-	case errors.Is(s.authKind, vpn.ERR_NEXT_AUTH_TOTP):
+	case errors.Is(kind, vpn.ErrAuthTOTP):
 		detail = "需要 TOTP 验证码，请执行 njuvpn auth <code>"
-	case errors.Is(s.authKind, vpn.ErrSMSSent):
+	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSSent):
 		detail = "验证码已发送到手机，请执行 njuvpn auth <code>"
-	case errors.Is(s.authKind, vpn.ErrSMSTooMany):
+	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSTooMany):
 		detail = "短信发送过于频繁，请稍后再试"
-	case s.authKind != nil:
-		detail = vpn.UserMessage(s.authKind) + "，请执行 njuvpn auth <code>"
+	case s.pendingAuth != nil:
+		detail = vpn.UserMessage(s.pendingAuth) + "，请执行 njuvpn auth <code>"
 	default:
 		detail = "需要短信验证码，请执行 njuvpn auth <code>"
 	}
-	if err := s.state.Transition(StateAuthPending, detail); err != nil {
+	if err := s.status.set(StateAuthPending, detail); err != nil {
 		return err
 	}
 	return fmt.Errorf("%s: %w", detail, ErrAuthRequired)
 }
 
-// finishConnect 用一次成功的探测结果建立 WireGuard 承载。
-func (s *Service) finishConnect(res *vpn.ProbeResult) error {
-	if err := s.state.Transition(StateConnecting, "正在建立 WireGuard 承载"); err != nil {
-		s.fail(err)
-		return err
-	}
-
-	s.endpoint = &vpn.TunnelEndpoint{}
-	s.relay = wireguard.NewRelay(s.cfg.MTU, s.endpoint)
-	s.queryConn = res.QueryConn
-
-	token := (*[48]byte)([]byte(res.Token + res.TwfID))
-	ipRev := res.IPRev
-
-	// 隧道启动放在后台：StartProtocol 会一直阻塞在收发循环里。
-	client := s.client
-	endpoint := s.endpoint
-	go func() {
-		err := client.StartProtocol(endpoint, token, ipRev, false)
-		s.tunnelDown(err)
-	}()
-
-	s.state.SetAddresses(res.ClientIP, s.cfg.WireGuard.PeerAddress)
-	if err := s.state.Transition(StateUp, "隧道已建立"); err != nil {
-		s.fail(err)
-		return err
-	}
-
-	log.Printf("隧道已建立：校园网地址 %s，peer 地址 %s", res.ClientIP, s.cfg.WireGuard.PeerAddress)
-	return nil
+// fail 收敛到 error 状态。只能在 actor 协程内调用。
+func (s *Service) fail(err error) error {
+	s.teardown("")
+	_ = s.status.set(StateError, err.Error())
+	return err
 }
 
-// tunnelDown 处理隧道运行期断开：切到 error 并释放资源。
-//
-// 与 fail 的区别是它从后台协程调用，需要自己加锁，
-// 而且只在状态确实是 up 时才处理——期间可能已经被 Stop 清理过。
-func (s *Service) tunnelDown(err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	cur := s.state.Get().State
-	if cur != StateUp {
-		// 已经不在运行中（被 Stop 或 Close 清理过），无需重复处理。
-		log.Printf("隧道协程已退出（当前状态 %s）: %v", cur, err)
-		return
+// teardown 释放本次连接的全部资源并回到 idle。只能在 actor 协程内调用。
+func (s *Service) teardown(detail string) {
+	if s.runCancel != nil {
+		s.runCancel()
+		s.runCancel = nil
 	}
-
-	log.Printf("隧道断开: %v", err)
-	s.release()
-	_ = s.state.Transition(StateError, "隧道已断开: "+err.Error())
-}
-
-// fail 记录失败状态。调用方需持有 s.mu。
-func (s *Service) fail(err error) {
-	s.release()
-	if cur := s.state.Get().State; cur != StateIdle {
-		_ = s.state.Transition(StateError, err.Error())
+	if s.relay != nil {
+		s.relay.Close()
+		s.relay = nil
 	}
-}
+	if s.session != nil {
+		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，
+		// 而登出本身必须发出去。
+		if err := s.session.Close(context.Background()); err != nil {
+			log.Printf("释放会话时出错: %v", err)
+		}
+		s.session = nil
+	}
+	if s.client != nil {
+		s.client.CloseIdleConnections()
+	}
+	s.pendingAuth = nil
+	s.status.clearAddresses()
 
-// ErrAuthRequired 表示需要提交验证码才能继续。
-var ErrAuthRequired = errors.New("需要二次验证")
-
-// isAuthCodeError 判断错误是否只是验证码不对，而不是会话失效。
-func isAuthCodeError(err error) bool {
-	return errors.Is(err, vpn.ErrSMSWrongCode) ||
-		errors.Is(err, vpn.ErrSMSExpired) ||
-		errors.Is(err, vpn.ErrSMSTooMany)
+	if s.status.Get().State != StateIdle {
+		if detail == "" {
+			detail = "已断开"
+		}
+		if err := s.status.set(StateIdle, detail); err != nil {
+			log.Printf("状态收敛失败: %v", err)
+		}
+	}
 }
 
 // WaitReady 等待隧道进入 up 状态，用于测试和启动检查。
 func (s *Service) WaitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if s.state.Get().State == StateUp {
+		if s.status.Get().State == StateUp {
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("等待隧道就绪超时（当前状态 %s）", s.state.Get().State)
+	return fmt.Errorf("等待隧道就绪超时（当前状态 %s）", s.status.Get().State)
 }

@@ -56,7 +56,7 @@ internal/config/       配置读取与校验
 - [ ] `internal/service`：状态机 `idle / logging_in / auth_pending / connecting / up / error`
 - [ ] `cmd/njuvpn`：把占位函数换成真实调用
 - [ ] 地址映射：WireGuard peer 用固定地址，进出隧道时做 SNAT/DNAT 到服务端分配的内网 IP（需增量更新 IP 头与 TCP/UDP 校验和）
-- [ ] 把 `StartProtocol` 里失败 5 次后的 `panic` 改成返回错误
+- [x] 把 `StartProtocol` 里失败 5 次后的 `panic` 改成返回错误（重构后已不存在该路径）
 
 ## 已知约束
 

@@ -7,7 +7,6 @@ package dial
 
 import (
 	"bufio"
-	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -56,19 +55,11 @@ func New(proxy string) (DialFunc, error) {
 	}
 }
 
-// Transport 返回一个经由 dialFn 建连的 HTTP Transport。
-// 校园服务端用自签证书，调用方需要在 TLSClientConfig 里关掉校验。
-func Transport(dialFn DialFunc) *http.Transport {
-	return &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialFn(network, addr)
-		},
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-}
-
 // httpProxyDialer 通过 HTTP 代理的 CONNECT 方法建到目标地址的隧道。
 func httpProxyDialer(u *url.URL) (DialFunc, error) {
+	// https 代理必须先建立 TLS 再发 CONNECT：否则 Proxy-Authorization
+	// 里的 Basic 凭据是明文（旧实现就是这样把凭据写在裸 TCP 上的）。
+	useTLS := u.Scheme == "https"
 	host := u.Host
 	if u.Port() == "" {
 		if u.Scheme == "https" {
@@ -89,9 +80,9 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 			return nil, fmt.Errorf("HTTP 代理只支持 tcp，收到 %q", network)
 		}
 
-		conn, err := (&net.Dialer{Timeout: dialTimeout}).Dial("tcp", host)
+		conn, err := dialProxy(host, useTLS)
 		if err != nil {
-			return nil, fmt.Errorf("连接代理 %s: %w", host, err)
+			return nil, err
 		}
 
 		if err := conn.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
@@ -285,6 +276,19 @@ func socks5Status(code byte) string {
 	default:
 		return "未知错误 " + strconv.Itoa(int(code))
 	}
+}
+
+// dialProxy 建立到代理的连接。https 代理走 TLS，并校验证书。
+func dialProxy(host string, useTLS bool) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	if !useTLS {
+		return dialer.Dial("tcp", host)
+	}
+	conn, err := tls.DialWithDialer(dialer, "tcp", host, &tls.Config{MinVersion: tls.VersionTLS12})
+	if err != nil {
+		return nil, fmt.Errorf("建立到 https 代理的 TLS 连接 %s: %w", host, err)
+	}
+	return conn, nil
 }
 
 // bufferedConn 让 bufio 预读的字节不丢失。

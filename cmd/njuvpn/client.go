@@ -6,28 +6,43 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"njuvpn/internal/config"
 	"njuvpn/internal/ipc"
 )
 
 // clientConfig 是命令行客户端需要的配置：只有 IPC 端点。
-// 客户端不读账号密码，那些只属于服务进程。
-func clientConfig(configPath string) (*config.Config, error) {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return nil, err
+//
+// 客户端不读账号密码，那些只属于服务进程，所以配置文件读不到或
+// 权限过宽都不该让 CLI 失效——退回默认端点即可。
+func clientConfig(configPath string) *config.Config {
+	cfg, err := config.LoadForClient(configPath)
+	if err == nil {
+		return cfg
 	}
-	return cfg, nil
+	// 用户显式指定的配置读不出来时要说一声，否则会连到默认端点上，
+	// 而用户以为自己在操作另一台服务进程。
+	if configPath != "" {
+		fmt.Fprintf(os.Stderr, "%s: 无法加载配置 %s: %v（改用默认端点）\n", prog, configPath, err)
+	}
+	return &config.Config{}
 }
 
 // call 向服务进程发一条请求并返回响应。
-func call(endpoint string, req ipc.Request) (ipc.Response, error) {
+//
+// 带超时：服务进程可能在等短信验证码、或正在退避重试，
+// 没有超时的客户端会一直挂着，而用户看不出发生了什么。
+func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response, error) {
 	conn, err := ipc.Dial(endpoint)
 	if err != nil {
 		return ipc.Response{}, err
 	}
 	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return ipc.Response{}, err
+	}
 
 	if err := ipc.WriteRequest(conn, req); err != nil {
 		return ipc.Response{}, fmt.Errorf("发送请求: %w", err)
@@ -48,32 +63,32 @@ func endpointOf(cfg *config.Config) string {
 }
 
 // runCommand 是 start/stop/status/auth 的公共实现。
-func runCommand(name string, args []string, req ipc.Request) error {
+//
+// 退出码语义直接由响应状态码决定，不依赖提示文案：
+// 200 与 428（需要验证码）算成功，其余算失败。
+func runCommand(name string, args []string, req ipc.Request, timeout time.Duration) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(splitFlags(args)); err != nil {
 		return err
 	}
 
-	cfg, err := clientConfig(*configPath)
+	cfg := clientConfig(*configPath)
+	resp, err := call(endpointOf(cfg), req, timeout)
 	if err != nil {
 		return err
 	}
-
-	resp, err := call(endpointOf(cfg), req)
-	if err != nil {
-		return err
-	}
-
 	fmt.Println(resp.Message)
-	if resp.Code != ipc.CodeOK {
-		// 409 表示需要验证码，这不是错误，退出码用 0 更符合脚本预期。
-		if resp.Code == ipc.CodeRejected && strings.Contains(resp.Message, "验证码") {
-			return nil
-		}
+
+	switch resp.Code {
+	case ipc.CodeOK:
+		return nil
+	case ipc.CodeAuthRequired:
+		// 需要提交验证码不是错误：脚本据此决定下一步。
+		return nil
+	default:
 		return fmt.Errorf("服务进程返回 %d", resp.Code)
 	}
-	return nil
 }
 
 // promptCode 从终端读验证码。

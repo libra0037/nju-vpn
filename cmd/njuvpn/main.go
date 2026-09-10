@@ -8,12 +8,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"njuvpn/internal/config"
@@ -24,8 +27,6 @@ import (
 )
 
 const prog = "njuvpn"
-
-var errNotImplemented = errors.New("not implemented yet")
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `%s - NJU VPN 服务端与命令行客户端
@@ -42,7 +43,7 @@ func usage() {
 
 全局参数:
   -config <path>                  配置文件路径（默认见下）
-  -proxy <url>                    覆盖配置文件里的出站代理
+  -proxy <url>                    覆盖配置文件里的出站代理（run / probe 可用）
 
 默认配置路径:
   Linux    /etc/njuvpn/config.yaml
@@ -93,7 +94,8 @@ func main() {
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if err := fs.Parse(args); err != nil {
+	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
+	if err := fs.Parse(splitFlags(args)); err != nil {
 		return err
 	}
 
@@ -101,9 +103,15 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *proxy != "" {
+		cfg.Proxy = *proxy
+	}
 
 	log.SetFlags(log.LstdFlags)
-	log.Printf("njuvpn 服务进程启动，目标 %s", cfg.ServerAddr())
+	log.Printf("%s 服务进程启动，目标 %s", prog, cfg.ServerAddr())
+	for _, w := range cfg.Warnings() {
+		log.Printf("警告: %s", w)
+	}
 	if cfg.Proxy != "" {
 		log.Printf("出站路径: %s", cfg.Proxy)
 	}
@@ -113,32 +121,32 @@ func cmdRun(args []string) error {
 	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
-	return service.RunServer(svc, cfg.IPC.Endpoint)
+	return service.RunPlatform(svc, cfg.IPC.Endpoint)
 }
 
 func cmdStart(args []string) error {
-	return runCommand("start", args, ipc.Request{Command: ipc.CmdStart})
+	return runCommand("start", args, ipc.Request{Command: ipc.CmdStart}, 5*time.Minute)
 }
 
 func cmdStop(args []string) error {
-	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop})
+	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop}, time.Minute)
 }
 
 func cmdStatus(args []string) error {
-	return runCommand("status", args, ipc.Request{Command: ipc.CmdStatus})
+	return runCommand("status", args, ipc.Request{Command: ipc.CmdStatus}, 30*time.Second)
 }
 
 // cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。
 func cmdAuth(args []string) error {
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	// 验证码通常写成 `auth 123456`，后面还可能跟 -config，
+	// 验证码通常写成 auth 123456，后面还可能跟 -config，
 	// 所以先把 flag 挑出来再解析，避免位置参数截断解析。
 	if err := fs.Parse(splitFlags(args)); err != nil {
 		return err
 	}
 
-	code := strings.TrimSpace(strings.Join(joinPositional(args), " "))
+	code := strings.TrimSpace(strings.Join(joinPositional(args), ""))
 	if code == "" {
 		var err error
 		if code, err = promptCode(); err != nil {
@@ -146,19 +154,13 @@ func cmdAuth(args []string) error {
 		}
 	}
 
-	cfg, err := clientConfig(*configPath)
-	if err != nil {
+	endpoint := endpointOf(clientConfig(*configPath))
+	// 提交验证码前确认连的是服务进程自己的套接字。
+	if err := ipc.VerifyPeer(endpoint); err != nil {
 		return err
 	}
-	resp, err := call(endpointOf(cfg), ipc.Request{Command: ipc.CmdAuth, Args: []string{code}})
-	if err != nil {
-		return err
-	}
-	fmt.Println(resp.Message)
-	if resp.Code != ipc.CodeOK {
-		return fmt.Errorf("服务进程返回 %d", resp.Code)
-	}
-	return nil
+
+	return runCommand("auth", args, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 2*time.Minute)
 }
 
 // splitFlags 把 -flag value / -flag=value 这类参数挑到前面，其余保持原序。
@@ -202,7 +204,9 @@ func joinPositional(args []string) []string {
 func cmdService(args []string) error {
 	fs := flag.NewFlagSet("service", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if err := fs.Parse(args); err != nil {
+	// flag 解析会在第一个非 flag 参数处停下，service install -config x
+	// 里的 -config 会被静默丢掉，所以先重排参数。
+	if err := fs.Parse(splitFlags(args)); err != nil {
 		return err
 	}
 
@@ -253,11 +257,11 @@ func cmdProbe(args []string) error {
 	configPath := fs.String("config", "", "配置文件路径")
 	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
 	totpCode := fs.String("totp", "", "TOTP 验证码，留空则用配置里的密钥自动生成")
-	twfId := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
+	twfID := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
 	logout := fs.Bool("logout", false, "只调用服务端登出接口然后退出，不建立隧道")
 	keep := fs.Bool("keep", false, "探测结束后不登出，保留服务端会话以便复用")
 	debug := fs.Bool("debug", false, "打印每一步的报文")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(splitFlags(args)); err != nil {
 		return err
 	}
 
@@ -265,33 +269,36 @@ func cmdProbe(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	proxyURL := cfg.Proxy
 	if *proxy != "" {
-		proxyURL = *proxy
+		cfg.Proxy = *proxy
 	}
 
-	dialFn, err := dial.New(proxyURL)
+	dialFn, err := dial.New(cfg.Proxy)
 	if err != nil {
 		return err
 	}
-	if proxyURL == "" {
+	if cfg.Proxy == "" {
 		log.Printf("出站路径: 直连")
 	} else {
-		log.Printf("出站路径: %s", proxyURL)
+		log.Printf("出站路径: %s", cfg.Proxy)
 	}
 
-	client := vpn.NewClient(cfg.ServerAddr(), dialFn)
-	if addr := cfg.DialAddr(); addr != "" {
-		client.WithDialAddr(addr)
-		log.Printf("连接地址覆盖为 %s", addr)
-	}
+	client := vpn.New(vpn.Options{
+		Server:   cfg.ServerAddr(),
+		DialAddr: cfg.DialAddr(),
+		Dial:     dialFn,
+	})
+	defer client.CloseIdleConnections()
+
+	// Ctrl-C 能立刻中断探测，不再需要等满退避。
+	ctx, cancel := signalContext()
+	defer cancel()
 
 	if *logout {
-		if *twfId == "" {
+		if *twfID == "" {
 			return errors.New("-logout 需要配合 -twf-id 指定要登出的会话")
 		}
-		if err := client.Logout(*twfId); err != nil {
+		if err := client.Logout(ctx, *twfID); err != nil {
 			return err
 		}
 		fmt.Println("服务端已注销该会话")
@@ -307,38 +314,77 @@ func cmdProbe(args []string) error {
 		log.Printf("已用配置文件里的密钥生成 TOTP 验证码")
 	}
 
-	res, probeErr := client.Probe(cfg.Username, cfg.Password, *twfId, code, *debug, askCode)
+	trace := &vpn.Trace{}
+	opt := vpn.ConnectOptions{
+		Username: cfg.Username,
+		Password: cfg.Password,
+		TwfID:    *twfID,
+		Code:     code,
+		Debug:    *debug,
+		Trace:    trace,
+	}
 
+	sess, err := client.Connect(ctx, opt)
+	// 服务端要求二次验证时，向终端索取验证码后在同一个会话里继续。
+	if authErr, ok := vpn.AsAuthRequired(err); ok && code == "" {
+		prompted, promptErr := askCode(authErr.Kind)
+		if promptErr != nil {
+			return promptErr
+		}
+		opt.TwfID = authErr.TwfID
+		opt.Code = prompted
+		opt.AuthKind = authErr.Kind
+		sess, err = client.Connect(ctx, opt)
+	}
+
+	printTrace(trace)
+
+	if sess != nil {
+		defer func() {
+			if *keep {
+				sess.CloseLocal()
+				return
+			}
+			if closeErr := sess.Close(context.Background()); closeErr != nil {
+				fmt.Printf("登出未成功: %v\n", closeErr)
+			} else {
+				fmt.Printf("已登出并释放服务端会话\n")
+			}
+		}()
+	}
+	if err != nil {
+		return err
+	}
+
+	if *keep {
+		fmt.Printf("TwfID: %s（可用 -twf-id 复用，跳过再次登录）\n", sess.TwfID())
+	}
+
+	if err := trace.Step("tunnel-handshake", func() error { return sess.CheckTunnel(ctx) }); err != nil {
+		printTrace(trace)
+		return err
+	}
+	printTrace(trace)
+	fmt.Printf("\n%s\n", trace.Summary())
+	return nil
+}
+
+// printTrace 打印各阶段结果。
+func printTrace(t *vpn.Trace) {
 	fmt.Printf("\n%-20s %-10s %s\n", "阶段", "耗时", "结果")
-	for _, s := range res.Stages {
+	for _, s := range t.Stages() {
 		status := "OK"
 		if s.Err != nil {
 			status = s.Err.Error()
 		}
 		fmt.Printf("%-20s %-10s %s\n", s.Name, s.Duration.Round(time.Millisecond), status)
 	}
-	fmt.Printf("\n%s\n", res.Summary())
-	if res.TwfID != "" {
-		if *keep {
-			fmt.Printf("TwfID: %s（可用 -twf-id 复用，跳过再次登录）\n", res.TwfID)
-		} else {
-			// 探测结束后主动登出。不登出会在服务端留下占用名额的会话，
-			// 而服务端同一账号只允许一个客户端，后续建隧道会被拒。
-			if err := client.Logout(res.TwfID); err != nil {
-				fmt.Printf("登出未成功: %v\n", err)
-			} else {
-				fmt.Printf("已登出并释放服务端会话\n")
-			}
-		}
-	}
-
-	return probeErr
 }
 
 // askCode 在服务端要求二次验证时向终端索取验证码。
-// 短信验证码只在当前登录会话内有效，所以必须在同一次 Probe 里提交。
+// 短信验证码只在当前登录会话内有效，所以必须在同一次连接里提交。
 func askCode(kind error) (string, error) {
-	if errors.Is(kind, vpn.ERR_NEXT_AUTH_SMS) {
+	if errors.Is(kind, vpn.ErrAuthSMS) {
 		fmt.Print("服务端已发送短信验证码，请输入: ")
 	} else {
 		fmt.Print("请输入 TOTP 验证码: ")
@@ -348,4 +394,21 @@ func askCode(kind error) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(code), nil
+}
+
+// signalContext 返回一个在收到中断信号时取消的上下文。
+func signalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-signals:
+			fmt.Fprintln(os.Stderr, "已中断")
+			cancel()
+		case <-ctx.Done():
+		}
+		signal.Stop(signals)
+	}()
+	return ctx, cancel
 }
