@@ -151,7 +151,8 @@ func (client *Client) Probe(username, password, twfId, code string, debug bool, 
 			if conn != nil {
 				conn.Close()
 			}
-			if !errors.Is(err, ErrServerBusy) {
+			var ctrl *ControlError
+			if !errors.As(err, &ctrl) || !ctrl.Retryable() {
 				return err
 			}
 			if attempt < queryIPAttempts {
