@@ -476,3 +476,45 @@ njuvpn.exe status   →   idle
 
 结论：**CLI 按需拉起 + 热更新的承载层在 Windows 上工作正常**，Clash 侧配置无需改动
 （服务端公钥与私钥都从原配置继承）。
+
+## 12. Ubuntu 22.04 实测（2026-09-10 晚，临时测试机）
+
+环境：校外云服务器，Ubuntu 22.04.5、x86_64、2 vCPU、用户级 systemd 可用。
+该机 DNS 能解析 `vpn.nju.edu.cn`（→ `202.119.32.69`）、直连 443 返回 200、出口 `个人服务器`。
+**这台机器只是测试用的校外环境，不做实际部署**，测完已清理（见文末）。
+
+### 验证结果
+
+| 项目 | 结果 |
+|---|---|
+| 测试套件 | 8 个包全部通过（配置 / IPC / 替身 / 拨号 / 服务 / 协议 / 承载 / CLI） |
+| 承载层回环测试 | 通过：真实 wireguard-go 设备 + 内存 TUN，握手、加密、双向转发、地址改写 |
+| 按需拉起 | `restart` 在 0.14s 内拉起服务进程；`PPID=1`、独立会话、无终端 |
+| 端点 | `/run/user/1000/njuvpn.sock`，模式 `srw-------`（0600） |
+| 用户级 unit | `systemctl --user start njuvpn` 起来后 CLI 能连上、journal 有日志 |
+| 信号退出 | `kill -TERM` 走与 systemd 相同的收尾路径（日志：收到信号 terminated，准备退出） |
+| 隧道建立 | `auth` 后 `up`，校园网地址 `172.29.56.18` |
+| UDP 监听 | `ss` 确认只绑 `127.0.0.1:51820`（与 6.8 节一致） |
+| 私钥自举 | 首次启动生成、夹紧、就地写回 `~/.config/njuvpn/config.yaml` |
+| 登出 | `stop` 后服务端返回 `logout user success`，名额释放 |
+
+### 两处平台差异（都已在实测中修正）
+
+1. **端点默认值**：原来的 `/run/njuvpn.sock` 普通用户写不进去，配置里留空即用
+   `$XDG_RUNTIME_DIR`（见第 10 节）。测试时配置里的旧值需要删掉。
+2. **开机自启**：unit 的 `WantedBy=default.target`，而默认 `Linger=no` ——
+   要免登录常驻需要 `loginctl enable-linger <user>`（需提权，本次未做）。
+
+### 没验证到的部分
+
+承载层的**客户端接入**没测：配置里 `peer_public_key` 为空，`wg-stats` 报
+「承载层没有接入的 peer」；而 UDP 只绑回环，外部客户端也连不进来。
+要验证需要两步：`listen_host: all` + 云安全组放行 UDP，以及
+`njuvpn wg-peer <客户端公钥>`（热更新，不重建隧道、不耗短信）。
+
+### 测试机的清理
+
+- 删 `~/.config/systemd/user/njuvpn.service`（先 `systemctl --user stop`）
+- 删除 `~/.config/njuvpn/`（配置里有账号口令，日志一并删）
+- 删除测试二进制目录 `~/njt`（67MB）
+- 保留 `~/njuvpn/njuvpn`（只读二进制，不含凭据），下次测试可直接用
