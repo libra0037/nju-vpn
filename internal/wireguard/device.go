@@ -26,6 +26,8 @@ type DeviceOptions struct {
 	PrivateKey Key
 	// ListenPort 是监听的 UDP 端口。
 	ListenPort int
+	// ListenHost 决定绑定在回环还是全部网卡。零值是回环。
+	ListenHost ListenHost
 	// PeerPublicKey 是唯一允许接入的客户端公钥；为零值时设备照常监听，
 	// 但没有任何客户端能接入。
 	PeerPublicKey Key
@@ -70,7 +72,7 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 
 	bind := opts.Bind
 	if bind == nil {
-		bind = conn.NewDefaultBind()
+		bind = newBind(opts.ListenHost)
 	}
 	level := device.LogLevelError
 	if opts.Verbose {

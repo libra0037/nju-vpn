@@ -255,6 +255,31 @@ Shutdown(8) 拒绝。现在 `attach` 与 `auth` 都会识别"同一个服务端�
 （客户端）+ 内存 TUN 做回环，覆盖握手、加密、双向包转发、地址改写、
 未授权客户端被拒、Close 后停止转发。不需要网卡也不需要 root。
 
+## 6.8 UDP 监听范围（默认只监听回环）
+
+同机方案下服务端与客户端在同一台机器上，没有理由把隧道端口暴露给整个局域网。
+wireguard-go 自带的绑定用的是 `":port"`（即 0.0.0.0:port），所以
+`internal/wireguard/bind.go` 里自己实现了一个最小 `conn.Bind`：
+
+- 只 `ListenUDP` 在 `127.0.0.1`，批量大小固定 1，不用 GSO/PKTINFO/SO_MARK
+- 端点直接复用上游的 `conn.StdNetEndpoint`，行为一致
+- 关闭后接收函数返回 `net.ErrClosed`，设备的接收协程能正常退出
+
+配置项 `wireguard.listen_host`：
+
+| 取值 | 含义 |
+|---|---|
+| `loopback`（默认，也接受 `local` / `127.0.0.1`） | 只绑 127.0.0.1，同机客户端用这个 |
+| `all`（也接受 `any` / `0.0.0.0`） | 绑全部网卡，需要其他机器接入时用 |
+
+拼错的值会被拒绝，不会静默放开监听范围（配置校验与 `wireguard.ParseListenHost`
+两处都要能识别；因为依赖方向的原因，配置包里重复了一份取值集合）。
+
+验证方式不是发包探测，而是"能不能在同一个端口的另一个地址上再绑一次"：
+绑到 0.0.0.0 时再绑具体地址会 EADDRINUSE，只绑回环时绑其他本机地址仍然成功。
+`bind_test.go` 里既有绑定层的用例，也有设备层的用例
+（`TestDeviceBindsOnlyLoopbackByDefault`），确保设备真的用了这个绑定。
+
 ## 7. 参考实现（协议对照）
 
 1. **sunnysab/smelly-connect**（Rust）— 含 `smelly-tls`，从零实现的 TLS 1.1 客户端。

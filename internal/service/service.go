@@ -419,6 +419,7 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 		Mapper:        mapper,
 		PrivateKey:    privateKey,
 		ListenPort:    s.cfg.WireGuard.ListenPort,
+		ListenHost:    listenHost(s.cfg.WireGuard.ListenHost),
 		PeerPublicKey: peerKey,
 		PeerAddress:   net.ParseIP(s.cfg.WireGuard.PeerAddress),
 		Verbose:       s.cfg.Log.Level == "debug",
@@ -485,6 +486,15 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 	return nil
 }
 
+// listenHost 解析配置里的监听范围，非法值在配置校验阶段已经拦下。
+func listenHost(s string) wireguard.ListenHost {
+	host, err := wireguard.ParseListenHost(s)
+	if err != nil {
+		return wireguard.ListenLoopback
+	}
+	return host
+}
+
 // bearerSummary 描述承载层的监听状态。
 //
 // 配置里端口写 0 时由系统分配，日志要给出真实端口而不是一个 0。
@@ -497,10 +507,14 @@ func (s *Service) bearerSummary(dev *wireguard.Device, peerKey wireguard.Key) st
 	if port == 0 {
 		listen = "UDP 端口由系统分配"
 	}
-	if peerKey.IsZero() {
-		return listen + " 在监听，但没有配置 peer_public_key，任何客户端都无法接入"
+	scope := "仅本机（127.0.0.1）"
+	if listenHost(s.cfg.WireGuard.ListenHost) == wireguard.ListenAll {
+		scope = "全部网卡"
 	}
-	return fmt.Sprintf("%s，peer %s，端口对外开放后客户端即可接入", listen, s.cfg.WireGuard.PeerAddress)
+	if peerKey.IsZero() {
+		return fmt.Sprintf("%s（%s）在监听，但没有配置 peer_public_key，任何客户端都无法接入", listen, scope)
+	}
+	return fmt.Sprintf("%s（%s），peer %s", listen, scope, s.cfg.WireGuard.PeerAddress)
 }
 
 // logTrace 把各阶段耗时与结果写进日志，供失败后定位。

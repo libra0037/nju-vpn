@@ -34,7 +34,9 @@ type Config struct {
 }
 
 type WireGuard struct {
-	ListenPort    int    `yaml:"listen_port"`
+	ListenPort int `yaml:"listen_port"`
+	// ListenHost 是 loopback（默认）或 all。
+	ListenHost    string `yaml:"listen_host"`
 	PrivateKey    string `yaml:"private_key"`
 	PeerPublicKey string `yaml:"peer_public_key"`
 	PeerAddress   string `yaml:"peer_address"`
@@ -181,8 +183,11 @@ func (c *Config) validate() error {
 	if c.MTU < MinMTU || c.MTU > MaxMTU {
 		return fmt.Errorf("mtu 超出范围: %d（应在 %d-%d 之间，1320 适合默认隧道）", c.MTU, MinMTU, MaxMTU)
 	}
-	if p := c.WireGuard.ListenPort; p < 1 || p > 65535 {
+	if p := c.WireGuard.ListenPort; p < 0 || p > 65535 {
 		return fmt.Errorf("wireguard.listen_port 超出范围: %d", p)
+	}
+	if err := validateListenHost(c.WireGuard.ListenHost); err != nil {
+		return err
 	}
 	if ip := net.ParseIP(c.WireGuard.PeerAddress); ip == nil || ip.To4() == nil {
 		return fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址: %q", c.WireGuard.PeerAddress)
@@ -200,6 +205,19 @@ func (c *Config) Warnings() []string {
 		out = append(out, "未配置 totp_secret，需要手工执行 njuvpn auth <code> 完成二次验证")
 	}
 	return out
+}
+
+// validateListenHost 校验监听范围。
+//
+// 这里不引用 wireguard 包：那会让 config → wireguard → vpn 形成依赖，
+// 而 vpn 的测试又要读配置。取值集合必须与 wireguard.ParseListenHost 一致。
+func validateListenHost(s string) error {
+	switch s {
+	case "", "loopback", "local", "127.0.0.1", "all", "any", "0.0.0.0":
+		return nil
+	default:
+		return fmt.Errorf("wireguard.listen_host 只能是 loopback 或 all，收到 %q", s)
+	}
 }
 
 // validateHost 检查目标主机名。写成 "host:port" 是最常见的错误：
