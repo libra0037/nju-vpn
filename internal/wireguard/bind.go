@@ -32,14 +32,6 @@ func ParseListenHost(s string) (ListenHost, error) {
 	}
 }
 
-// String 返回配置里使用的写法。
-func (h ListenHost) String() string {
-	if h == ListenAll {
-		return "all"
-	}
-	return "loopback"
-}
-
 // newBind 按监听范围创建绑定。
 func newBind(host ListenHost) conn.Bind {
 	if host == ListenAll {

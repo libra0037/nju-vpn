@@ -42,7 +42,6 @@ const (
 	cmdStop
 	cmdTunnelDown
 	cmdSetPeer
-	cmdWGStats
 )
 
 type command struct {
@@ -72,7 +71,13 @@ type Service struct {
 	// device 由 actor 协程写、Status 之外的只读查询读，用 s.mu 保护。
 
 	// 以下字段只在 actor 协程里访问，不需要加锁。
-	clientFactory func(cfg *config.Config) (*vpn.Client, error)
+	// dialer 与 clientOptions 是测试注入点。
+	//
+	// 注意注入的是"额外的 Options 字段"，不是整个 Client 的构造方式：
+	// Server / DialAddr / Dial 这些生产接线仍然由 start 算出来，测试能覆盖到
+	//（以前整体替换构造方式，server_ip → DialAddr 这条线根本没进过测试）。
+	dialer        vpn.DialFunc
+	clientOptions func(*vpn.Options)
 	client        *vpn.Client
 	session       *vpn.Session
 	device        *wireguard.Device
@@ -97,13 +102,15 @@ func New(cfg *config.Config) *Service {
 // Status 返回当前状态快照。它不经过 actor，永远立即可用。
 func (s *Service) Status() Status { return s.status.Get() }
 
-// SetClientFactory 注入协议客户端的构造方式，供测试注入假的 portal 与隧道。
+// SetDialer 替换出站拨号函数（测试用）。
 //
 // 必须在第一次调用 Start 之前设置：真正读取它的只有 actor 协程，
 // 而第一次命令的发送建立了 happens-before 关系。
-func (s *Service) SetClientFactory(f func(cfg *config.Config) (*vpn.Client, error)) {
-	s.clientFactory = f
-}
+func (s *Service) SetDialer(f vpn.DialFunc) { s.dialer = f }
+
+// SetClientOptions 覆盖客户端构造时的额外字段（测试用，例如注入假的
+// portal HTTP 客户端与隧道拨号）。
+func (s *Service) SetClientOptions(f func(*vpn.Options)) { s.clientOptions = f }
 
 // Start 建立隧道。
 //
@@ -305,23 +312,24 @@ func (s *Service) start(ctx context.Context) error {
 	}
 
 	var err error
-	client := (*vpn.Client)(nil)
-	if s.clientFactory != nil {
-		client, err = s.clientFactory(s.cfg)
+	var dialFn vpn.DialFunc
+	if s.dialer != nil {
+		dialFn = s.dialer
 	} else {
-		var dialFn vpn.DialFunc
 		dialFn, err = dial.New(s.cfg.Proxy)
-		if err == nil {
-			client = vpn.New(vpn.Options{
-				Server:   s.cfg.ServerAddr(),
-				DialAddr: s.cfg.DialAddr(),
-				Dial:     dialFn,
-			})
-		}
 	}
 	if err != nil {
 		return s.fail(err)
 	}
+	opts := vpn.Options{
+		Server:   s.cfg.ServerAddr(),
+		DialAddr: s.cfg.DialAddr(),
+		Dial:     dialFn,
+	}
+	if s.clientOptions != nil {
+		s.clientOptions(&opts)
+	}
+	client := vpn.New(opts)
 	if s.client != nil {
 		s.client.CloseIdleConnections()
 	}
@@ -701,16 +709,4 @@ func (s *Service) teardown(detail string) {
 			log.Printf("状态收敛失败: %v", err)
 		}
 	}
-}
-
-// WaitReady 等待隧道进入 up 状态，用于测试和启动检查。
-func (s *Service) WaitReady(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if s.status.Get().State == StateUp {
-			return nil
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return fmt.Errorf("等待隧道就绪超时（当前状态 %s）", s.status.Get().State)
 }

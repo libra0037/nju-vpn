@@ -1,6 +1,6 @@
 module njuvpn
 
-go 1.24
+go 1.26.6
 
 require (
 	github.com/Microsoft/go-winio v0.6.2

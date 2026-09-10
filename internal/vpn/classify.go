@@ -86,14 +86,18 @@ func smsCooldownSeconds(body string) int {
 	return 0
 }
 
-// SMSCooldown 从错误里解析出前端按钮的禁用倒计时。
+// smsCooldownRe 匹配错误文本里嵌的倒计时。两种文案都要认：
+// "179 秒内请勿重复请求"（真的发了）与"还需等待 102 秒"（冷却期内没重发）。
+var smsCooldownRe = regexp.MustCompile("([0-9]+) 秒")
+
+// SMSCooldown 从错误里取出前端按钮的禁用倒计时。
 // 这只影响"能否立刻再点一次发送"，与验证码是否有效无关。
 // 解析不出来时返回 0。
 func SMSCooldown(err error) time.Duration {
 	if err == nil {
 		return 0
 	}
-	m := regexp.MustCompile("([0-9]+) 秒内请勿重复请求").FindStringSubmatch(err.Error())
+	m := smsCooldownRe.FindStringSubmatch(err.Error())
 	if m == nil {
 		return 0
 	}

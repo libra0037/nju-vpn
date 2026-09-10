@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 	"strings"
 )
 
@@ -165,6 +166,13 @@ func (c *Client) webLogin(ctx context.Context, username, password string) (strin
 
 // requestSMS 请求服务端发送一条短信验证码。
 //
+// minRSAModulusBits 是接受服务端加密公钥的下限。
+//
+// 注意这只挡住"明显不对"的公钥：整条链路仍然没有证书校验，
+// 主动中间人可以换成自己的 2048 位公钥。口令的保密性等价于
+// "没有主动中间人"，见 REVIEW.md 的 D1。
+const minRSAModulusBits = 1024
+
 // 返回的 state 非 nil 表示请求被受理（ErrSMSSent / ErrSMSTooMany 等），
 // 由上层决定怎么提示用户。
 func (c *Client) requestSMS(ctx context.Context, twfID string) (error, error) {
@@ -172,11 +180,20 @@ func (c *Client) requestSMS(ctx context.Context, twfID string) (error, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 原始响应记进日志：这个接口用同一组字段表达"发了新码"和"还在冷却，
-	// 没发"，只靠文案判断必然误判，出问题时必须有原文可查。
-	// 内容只有脱敏手机号与倒计时，没有凭据。
-	log.Printf("短信接口响应: %s", strings.Join(strings.Fields(string(body)), " "))
-	return classifySMSRequest(body)
+	state, classifyErr := classifySMSRequest(body)
+	// 只记分类结果与倒计时，不记原文：这个接口的响应里带着手机号的前 3 后 4 位
+	// 与 USER_PHONE 字段，而标签集合由服务端决定（login_sms1.csp 就会回 TwfID，
+	// 一旦这个接口也回，会话标识就进日志了）。需要原文时用 live 诊断测试。
+	if classifyErr == nil {
+		if cd := SMSCooldown(state); cd > 0 {
+			log.Printf("短信接口: %v（倒计时 %s）", state, cd.Round(time.Second))
+		} else {
+			log.Printf("短信接口: %v", state)
+		}
+	} else {
+		log.Printf("短信接口: 响应无法分类（%d 字节）: %v", len(body), classifyErr)
+	}
+	return state, classifyErr
 }
 
 // authSMS 提交短信验证码，返回更新后的 TwfID。
@@ -284,6 +301,11 @@ func parsePublicKey(step, keyHex, exp string) (*rsa.PublicKey, error) {
 	modulus := new(big.Int)
 	if _, ok := modulus.SetString(strings.TrimSpace(keyHex), 16); !ok || modulus.Sign() <= 0 {
 		return nil, &ProtocolError{Step: step, Reason: "RSA_ENCRYPT_KEY 不是合法的十六进制大整数"}
+	}
+	// 模数太小说明对端不是我们认识的那个服务端（正常是 2048 位）。
+	// 口令是用这个公钥加密发出去的，太小的模数不值得信任。
+	if modulus.BitLen() < minRSAModulusBits {
+		return nil, &ProtocolError{Step: step, Reason: fmt.Sprintf("RSA_ENCRYPT_KEY 只有 %d 位，低于 %d 位的下限", modulus.BitLen(), minRSAModulusBits)}
 	}
 	return &rsa.PublicKey{N: modulus, E: e}, nil
 }

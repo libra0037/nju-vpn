@@ -22,6 +22,8 @@ type harness struct {
 	svc    *Service
 	portal *vpntest.Portal
 	tunnel *vpntest.Tunnel
+	// lastOptions 是生产代码算出、测试再补过的构造参数。
+	lastOptions vpn.Options
 }
 
 func newHarness(t *testing.T) *harness {
@@ -52,18 +54,19 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	svc := New(cfg)
-	svc.SetClientFactory(func(*config.Config) (*vpn.Client, error) {
-		return vpn.New(vpn.Options{
-			Server:    cfg.ServerAddr(),
-			HTTP:      portal.HTTPClient(),
-			PortalTLS: tunnel.Dial,
-			TunnelTLS: tunnel.Dial,
-			Timeouts:  vpn.Timeouts{HTTP: 5 * time.Second, Handshake: 5 * time.Second},
-		}), nil
+	h := &harness{svc: svc, portal: portal, tunnel: tunnel}
+	// 只补协议层内部的注入点；Server / DialAddr / Dial 由生产代码算，
+	// 顺便记下来供 TestClientOptionsUseProductionWiring 断言。
+	svc.SetClientOptions(func(opts *vpn.Options) {
+		h.lastOptions = *opts
+		opts.HTTP = portal.HTTPClient()
+		opts.PortalTLS = tunnel.Dial
+		opts.TunnelTLS = tunnel.Dial
+		opts.Timeouts = vpn.Timeouts{HTTP: 5 * time.Second, Handshake: 5 * time.Second}
 	})
 	t.Cleanup(svc.Close)
 
-	return &harness{svc: svc, portal: portal, tunnel: tunnel}
+	return h
 }
 
 // testPrivateKey 生成一个测试用的 WireGuard 私钥。
@@ -253,13 +256,10 @@ func TestCurrentTunnelExitTransitionsToError(t *testing.T) {
 func TestCloseInterruptsLongOperation(t *testing.T) {
 	h := newHarness(t)
 	blocked := make(chan struct{})
-	h.svc.SetClientFactory(func(cfg *config.Config) (*vpn.Client, error) {
-		return vpn.New(vpn.Options{
-			Server:    cfg.ServerAddr(),
-			HTTP:      &http.Client{Transport: blockingTransport{unblock: blocked}},
-			PortalTLS: h.tunnel.Dial,
-			TunnelTLS: h.tunnel.Dial,
-		}), nil
+	h.svc.SetClientOptions(func(opts *vpn.Options) {
+		opts.HTTP = &http.Client{Transport: blockingTransport{unblock: blocked}}
+		opts.PortalTLS = h.tunnel.Dial
+		opts.TunnelTLS = h.tunnel.Dial
 	})
 
 	go func() { _ = h.svc.Start() }()
@@ -282,13 +282,10 @@ func TestCloseInterruptsLongOperation(t *testing.T) {
 // 回归：任何一处 panic 都不该带走整个进程——服务端的会话还开着。
 func TestPanicInOperationIsContained(t *testing.T) {
 	h := newHarness(t)
-	h.svc.SetClientFactory(func(cfg *config.Config) (*vpn.Client, error) {
-		return vpn.New(vpn.Options{
-			Server:    cfg.ServerAddr(),
-			HTTP:      &http.Client{Transport: panicTransport{}},
-			PortalTLS: h.tunnel.Dial,
-			TunnelTLS: h.tunnel.Dial,
-		}), nil
+	h.svc.SetClientOptions(func(opts *vpn.Options) {
+		opts.HTTP = &http.Client{Transport: panicTransport{}}
+		opts.PortalTLS = h.tunnel.Dial
+		opts.TunnelTLS = h.tunnel.Dial
 	})
 
 	err := h.svc.Start()
@@ -353,13 +350,10 @@ func TestCloseLogsOutOnce(t *testing.T) {
 func TestStatusNeverBlocksDuringLongOperation(t *testing.T) {
 	h := newHarness(t)
 	blocked := make(chan struct{})
-	h.svc.SetClientFactory(func(cfg *config.Config) (*vpn.Client, error) {
-		return vpn.New(vpn.Options{
-			Server:    cfg.ServerAddr(),
-			HTTP:      &http.Client{Transport: blockingTransport{unblock: blocked}},
-			PortalTLS: h.tunnel.Dial,
-			TunnelTLS: h.tunnel.Dial,
-		}), nil
+	h.svc.SetClientOptions(func(opts *vpn.Options) {
+		opts.HTTP = &http.Client{Transport: blockingTransport{unblock: blocked}}
+		opts.PortalTLS = h.tunnel.Dial
+		opts.TunnelTLS = h.tunnel.Dial
 	})
 	go func() { _ = h.svc.Start() }()
 	waitState(t, h.svc, StateLoggingIn, 2*time.Second)
@@ -558,12 +552,12 @@ func TestSetPeerPersistsAndApplies(t *testing.T) {
 	if err := h.svc.SetPeer(secondPub.String()); err != nil {
 		t.Fatalf("热更新 peer 失败: %v", err)
 	}
-	n, err := h.svc.device.PeerCount()
+	stats, err := h.svc.device.Stats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("peer 数量 = %d，期望 1（replace_peers 应清掉旧的）", n)
+	if len(stats) != 1 {
+		t.Errorf("peer 数量 = %d，期望 1（replace_peers 应清掉旧的）", len(stats))
 	}
 	// 隧道本身不该被影响。
 	if st := h.svc.Status().State; st != StateUp {
@@ -579,6 +573,37 @@ func TestSetPeerRejectsBadKey(t *testing.T) {
 	}
 	if err := h.svc.SetPeer(""); err == nil {
 		t.Error("空公钥应被拒绝")
+	}
+}
+
+// 回归（原 E5）：注入点以前是"整体替换 Client 的构造方式"，于是
+// Server / DialAddr 这条生产接线从没进过测试——server_ip 是个必须用的
+// 字段（校园内 DNS 解析不了域名），接错了也照样全绿。
+func TestClientOptionsUseProductionWiring(t *testing.T) {
+	h := newHarness(t)
+	h.svc.cfg.ServerIP = "202.119.32.69"
+
+	h.portal.Set("/por/login_psw.csp", vpntest.Response{
+		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
+	})
+	h.portal.Set("/por/login_sms.csp", vpntest.Response{
+		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
+	})
+	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
+		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
+	})
+	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	}
+
+	if got, want := h.lastOptions.Server, h.svc.cfg.ServerAddr(); got != want {
+		t.Errorf("Server = %q，期望 %q", got, want)
+	}
+	if got, want := h.lastOptions.DialAddr, "202.119.32.69:443"; got != want {
+		t.Errorf("DialAddr = %q，期望 %q（server_ip 必须生效）", got, want)
+	}
+	if h.lastOptions.Dial == nil {
+		t.Error("Dial 没接上：出站路径会直接 panic")
 	}
 }
 

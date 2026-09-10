@@ -54,16 +54,6 @@ func (s *Session) ClientIP() string {
 // Endpoint 返回承载侧使用的隧道端点。
 func (s *Session) Endpoint() *TunnelEndpoint { return s.ep }
 
-// Trace 返回本次连接的阶段记录。
-func (s *Session) Trace() *Trace { return s.trace }
-
-// QueryConn 返回 query-ip 建立的连接。它由 Session 持有，调用方不应关闭。
-func (s *Session) QueryConn() net.Conn {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.queryConn
-}
-
 // track 登记运行期连接，供 Close 统一关闭。
 func (s *Session) track(conn net.Conn) {
 	s.mu.Lock()

@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
 
@@ -20,10 +19,4 @@ func GenerateTOTP(secret string) (string, error) {
 		return "", fmt.Errorf("生成 TOTP 验证码: %w", err)
 	}
 	return code, nil
-}
-
-// ValidateTOTPSecret 检查密钥格式是否合法。
-func ValidateTOTPSecret(secret string) error {
-	_, err := otp.NewKeyFromURL("otpauth://totp/x?secret=" + strings.TrimSpace(secret))
-	return err
 }

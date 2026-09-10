@@ -47,7 +47,6 @@ type DeviceOptions struct {
 // 承载端是内存里的 Relay，客户端自带用户态网络栈。
 type Device struct {
 	dev   *device.Device
-	relay *Relay
 
 	closeOnce sync.Once
 }
@@ -95,7 +94,7 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		return nil, fmt.Errorf("启动 WireGuard 设备: %w", err)
 	}
 
-	return &Device{dev: dev, relay: relay}, nil
+	return &Device{dev: dev}, nil
 }
 
 // uapiConfig 组装 wireguard-go 的 UAPI 配置文本。
@@ -218,20 +217,6 @@ func (d *Device) Stats() ([]PeerStats, error) {
 	return stats, nil
 }
 
-// PeerCount 返回设备上的 peer 数量，供状态检查使用。
-func (d *Device) PeerCount() (int, error) {
-	out, err := d.dev.IpcGet()
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(line, "public_key=") {
-			n++
-		}
-	}
-	return n, nil
-}
 
 // Close 停止设备。可安全重复调用。
 func (d *Device) Close() error {

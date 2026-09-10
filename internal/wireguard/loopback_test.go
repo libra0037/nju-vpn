@@ -180,8 +180,8 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 	}
 	defer server.Close()
 
-	if n, err := server.PeerCount(); err != nil || n != 1 {
-		t.Fatalf("peer 数量 = %d, err = %v，期望 1", n, err)
+	if stats, err := server.Stats(); err != nil || len(stats) != 1 {
+		t.Fatalf("peer 数量 = %d, err = %v，期望 1", len(stats), err)
 	}
 
 	// 客户端：一台真实的 WireGuard 设备 + 内存 TUN。

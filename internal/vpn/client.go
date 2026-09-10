@@ -71,11 +71,6 @@ type Client struct {
 	timeouts  Timeouts
 }
 
-// NewClient 用直连或自定义拨号函数构造客户端，保持最简调用方式。
-func NewClient(server string, dialFn DialFunc) *Client {
-	return New(Options{Server: server, Dial: dialFn})
-}
-
 // New 按 Options 构造客户端。
 func New(opts Options) *Client {
 	if opts.Dial == nil {
@@ -112,12 +107,6 @@ func New(opts Options) *Client {
 	}
 	return c
 }
-
-// Server 返回 "host:port" 形式的目标地址。
-func (c *Client) Server() string { return c.server }
-
-// Timeouts 返回当前生效的超时设置。
-func (c *Client) Timeouts() Timeouts { return c.timeouts }
 
 // Dial 建立一条到服务端的 TCP 连接。
 func (c *Client) Dial() (net.Conn, error) {
