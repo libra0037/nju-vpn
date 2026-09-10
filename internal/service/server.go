@@ -23,6 +23,8 @@ const (
 	idleTimeout = 60 * time.Second
 	// writeTimeout 限制一次写响应的时间。
 	writeTimeout = 15 * time.Second
+	// shutdownWaitTimeout 是退出时等待在处理的请求写完响应的上限。
+	shutdownWaitTimeout = 3 * time.Second
 )
 
 // Server 在本地端点上提供服务，把 IPC 请求转成对 Service 的调用。
@@ -32,6 +34,8 @@ type Server struct {
 
 	closing chan struct{}
 	once    sync.Once
+	quit     chan struct{}
+	quitOnce sync.Once
 	wg      sync.WaitGroup
 }
 
@@ -41,6 +45,7 @@ func NewServer(svc *Service, listener net.Listener) *Server {
 		svc:      svc,
 		listener: listener,
 		closing:  make(chan struct{}),
+		quit:     make(chan struct{}),
 	}
 }
 
@@ -62,6 +67,13 @@ func (s *Server) isClosing() bool {
 	}
 }
 
+// Done 在收到 shutdown 命令时关闭；系统信号不走这里。
+func (s *Server) Done() <-chan struct{} { return s.quit }
+
+// requestShutdown 记录"客户端要求退出"。真正的收尾在 RunServer 里做
+//（它会返回，让调用方执行登出）。
+func (s *Server) requestShutdown() { s.quitOnce.Do(func() { close(s.quit) }) }
+
 // Serve 开始接受连接，直到 listener 被关闭。
 func (s *Server) Serve() error {
 	for {
@@ -81,8 +93,21 @@ func (s *Server) Serve() error {
 	}
 }
 
-// Wait 等待所有在处理的连接结束，仅用于测试与优雅退出。
-func (s *Server) Wait() { s.wg.Wait() }
+// Wait 等待在处理的连接结束，最多等 timeout。
+//
+// 退出时不等待会把"已经成功、只差回包"的请求截断，客户端看到的是连接断开。
+func (s *Server) Wait(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("仍有请求在处理，等待超过 %s，继续退出", timeout)
+	}
+}
 
 // handle 处理一条客户端连接。
 func (s *Server) handle(conn net.Conn) {
@@ -125,6 +150,12 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 	switch req.Command {
 	case ipc.CmdPing:
 		return ipc.Response{Code: ipc.CodeOK, Message: "pong"}
+
+	case ipc.CmdShutdown:
+		// 先安排退出再回包（回包由 handle 写到这条连接上）：
+		// 客户端要能确认命令被接受，而不是看到一个断掉的连接。
+		s.requestShutdown()
+		return ipc.Response{Code: ipc.CodeOK, Message: "服务进程正在退出"}
 
 	case ipc.CmdStatus:
 		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(s.svc.Status())}
@@ -236,18 +267,24 @@ func RunServer(svc *Service, endpoint string) error {
 
 	srv := NewServer(svc, ln)
 
-	// 收到退出信号时停止接受连接，让 Serve 返回；
-	// 调用方随后执行登出，释放服务端会话。
+	// 两条退出路径：系统信号（Ctrl-C / systemd / 任务计划程序），
+	// 以及 shutdown 命令（njuvpn restart 用的就是它）。
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		sig := <-signals
-		log.Printf("收到信号 %v，准备退出", sig)
+		select {
+		case sig := <-signals:
+			log.Printf("收到信号 %v，准备退出", sig)
+		case <-srv.Done():
+			log.Printf("收到 shutdown 命令，准备退出")
+		}
 		srv.Shutdown()
 	}()
 	defer signal.Stop(signals)
 
 	err = srv.Serve()
 	srv.Shutdown()
+	// 等在处理的请求写完响应再返回：调用方随后就会登出并退出。
+	srv.Wait(shutdownWaitTimeout)
 	return err
 }

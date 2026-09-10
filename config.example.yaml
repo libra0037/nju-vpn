@@ -43,7 +43,10 @@ wireguard:
 
 # --- 服务进程与命令行客户端通信 ---
 ipc:
-  endpoint: /run/njuvpn.sock   # Windows 下忽略，固定用 \\.\pipe\njuvpn
+  # 留空表示用平台默认端点：Linux 是 $XDG_RUNTIME_DIR/njuvpn.sock
+  #（取不到时退回 /tmp 下的私有目录），Windows 是命名管道。
+  # 服务进程由 njuvpn start 按需拉起，不需要手工运行 njuvpn run。
+  endpoint: ""
 
 # MTU：底层隧道 1400，再减去 WireGuard 封装开销
 mtu: 1320

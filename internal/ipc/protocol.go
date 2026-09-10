@@ -25,6 +25,8 @@ const (
 	CmdStatus = "status" // 查询状态
 	CmdAuth   = "auth"   // 提交验证码
 	CmdPing   = "ping"   // 探活
+	// CmdShutdown 让服务进程收尾（含登出）后退出，供 njuvpn restart 使用。
+	CmdShutdown = "shutdown"
 	// CmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
 	CmdSetPeer = "wg-peer"
 	// CmdWGStats 查询 WireGuard 收发统计，用来判断客户端到底通没通。

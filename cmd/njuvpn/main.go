@@ -67,8 +67,10 @@ func main() {
 		err = cmdRun(args)
 	case "start":
 		err = cmdStart(args)
-	case "stop":
+case "stop":
 		err = cmdStop(args)
+	case "restart":
+		err = cmdRestart(args)
 	case "status":
 		err = cmdStatus(args)
 	case "auth":
@@ -79,8 +81,6 @@ func main() {
 		err = runCommand("wg-stats", args, ipc.Request{Command: ipc.CmdWGStats}, time.Minute)
 	case "probe":
 		err = cmdProbe(args)
-	case "service":
-		err = cmdService(args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -136,7 +136,7 @@ func cmdRun(args []string) error {
 	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
-	return service.RunPlatform(svc, cfg.IPC.Endpoint)
+	return service.RunServer(svc, cfg.IPC.Endpoint)
 }
 
 // generateWireGuardKey 生成私钥并写回配置文件。
@@ -173,11 +173,44 @@ func logWireGuardPublicKey(cfg *config.Config) {
 }
 
 func cmdStart(args []string) error {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	if err := fs.Parse(splitFlags(args)); err != nil {
+		return err
+	}
+	// 服务进程没在跑就先拉起来：这是"按需拉起"的入口。
+	if err := ensureService(*configPath); err != nil {
+		return err
+	}
 	return runCommand("start", args, ipc.Request{Command: ipc.CmdStart}, 5*time.Minute)
 }
 
 func cmdStop(args []string) error {
 	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop}, time.Minute)
+}
+
+// cmdRestart 重启服务进程：先请它自己退出（会登出），再拉起一个新的。
+//
+// 改完配置用它，不必手工杀进程——手工杀会跳过登出，服务端那条名额
+// 要等它自己超时才释放，期间同一个账号建不上隧道。
+func cmdRestart(args []string) error {
+	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	if err := fs.Parse(splitFlags(args)); err != nil {
+		return err
+	}
+
+	endpoint := serviceEndpoint(*configPath)
+	if err := shutdownService(endpoint); err != nil {
+		log.Printf("服务进程未在运行（%v），直接拉起", err)
+	} else if err := waitServiceGone(endpoint, serviceStopTimeout); err != nil {
+		return err
+	}
+	if err := ensureService(*configPath); err != nil {
+		return err
+	}
+	fmt.Println("服务进程已重启")
+	return nil
 }
 
 func cmdStatus(args []string) error {
@@ -251,57 +284,6 @@ func joinPositional(args []string) []string {
 		}
 	}
 	return rest
-}
-
-// cmdService 管理操作系统服务（systemd / Windows SCM）。
-//
-//	njuvpn service install|uninstall|start|stop|restart|status
-func cmdService(args []string) error {
-	fs := flag.NewFlagSet("service", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	// flag 解析会在第一个非 flag 参数处停下，service install -config x
-	// 里的 -config 会被静默丢掉，所以先重排参数。
-	if err := fs.Parse(splitFlags(args)); err != nil {
-		return err
-	}
-
-	action := ""
-	if rest := fs.Args(); len(rest) > 0 {
-		action = rest[0]
-	}
-	if action == "" {
-		return errors.New("用法: njuvpn service install|uninstall|start|stop|restart|status")
-	}
-
-	switch action {
-	case "install":
-		if err := service.InstallService(*configPath); err != nil {
-			return err
-		}
-		fmt.Println("服务已安装，可用 njuvpn service start 启动")
-		return nil
-	case "uninstall":
-		if err := service.UninstallService(*configPath); err != nil {
-			return err
-		}
-		fmt.Println("服务已卸载")
-		return nil
-	case "status":
-		st, err := service.ServiceStatus(*configPath)
-		if err != nil {
-			return err
-		}
-		fmt.Println(st)
-		return nil
-	case "start", "stop", "restart":
-		if err := service.ControlService(*configPath, action); err != nil {
-			return err
-		}
-		fmt.Printf("服务已 %s\n", action)
-		return nil
-	default:
-		return fmt.Errorf("未知操作 %q", action)
-	}
 }
 
 // cmdProbe 走一遍完整的协议握手，用来验证服务端仍然接受当前的客户端实现。
