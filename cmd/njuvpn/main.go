@@ -250,6 +250,7 @@ func cmdProbe(args []string) error {
 	totpCode := fs.String("totp", "", "TOTP 验证码，留空则用配置里的密钥自动生成")
 	twfId := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
 	logout := fs.Bool("logout", false, "只调用服务端登出接口然后退出，不建立隧道")
+	keep := fs.Bool("keep", false, "探测结束后不登出，保留服务端会话以便复用")
 	debug := fs.Bool("debug", false, "打印每一步的报文")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -313,7 +314,17 @@ func cmdProbe(args []string) error {
 	}
 	fmt.Printf("\n%s\n", res.Summary())
 	if res.TwfID != "" {
-		fmt.Printf("TwfID: %s（可用 -twf-id 复用，跳过再次登录）\n", res.TwfID)
+		if *keep {
+			fmt.Printf("TwfID: %s（可用 -twf-id 复用，跳过再次登录）\n", res.TwfID)
+		} else {
+			// 探测结束后主动登出。不登出会在服务端留下占用名额的会话，
+			// 而服务端同一账号只允许一个客户端，后续建隧道会被拒。
+			if err := client.Logout(res.TwfID); err != nil {
+				fmt.Printf("登出未成功: %v\n", err)
+			} else {
+				fmt.Printf("已登出并释放服务端会话\n")
+			}
+		}
 	}
 
 	return probeErr
