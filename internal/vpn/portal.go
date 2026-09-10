@@ -13,17 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"time"
 	"strings"
+	"time"
 )
-
-// portalErr 是 portal 接口返回的错误，附带服务端说明。
-type portalErr struct {
-	Step   string
-	Reason string
-}
-
-func (e *portalErr) Error() string { return e.Step + ": " + e.Reason }
 
 // readBody 读完整响应体，带长度上限。
 //
@@ -68,7 +60,7 @@ func (c *Client) do(ctx context.Context, method, path string, form url.Values, t
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, &portalErr{Step: path, Reason: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, serverMessage(body))}
+		return nil, &ProtocolError{Step: path, Reason: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, serverMessage(body))}
 	}
 	return body, nil
 }
@@ -150,10 +142,10 @@ func (c *Client) webLogin(ctx context.Context, username, password string) (strin
 	}
 
 	if hasTag(body, "NextAuth") && !tagContains(body, "NextAuth", "-1") {
-		return "", &portalErr{Step: step, Reason: "不支持的二次验证方式: " + serverMessage(body)}
+		return "", &ProtocolError{Step: step, Reason: "不支持的二次验证方式: " + serverMessage(body)}
 	}
 	if !tagContains(body, "Result", "1") {
-		return "", &portalErr{Step: step, Reason: "登录失败: " + serverMessage(body)}
+		return "", &ProtocolError{Step: step, Reason: "登录失败: " + serverMessage(body)}
 	}
 
 	if v, ok := tagValue(body, "TwfID"); ok && v != "" {

@@ -32,11 +32,11 @@ type Server struct {
 	svc      *Service
 	listener net.Listener
 
-	closing chan struct{}
-	once    sync.Once
+	closing  chan struct{}
+	once     sync.Once
 	quit     chan struct{}
 	quitOnce sync.Once
-	wg      sync.WaitGroup
+	wg       sync.WaitGroup
 }
 
 // NewServer 构造服务端。
@@ -71,7 +71,7 @@ func (s *Server) isClosing() bool {
 func (s *Server) Done() <-chan struct{} { return s.quit }
 
 // requestShutdown 记录"客户端要求退出"。真正的收尾在 RunServer 里做
-//（它会返回，让调用方执行登出）。
+// （它会返回，让调用方执行登出）。
 func (s *Server) requestShutdown() { s.quitOnce.Do(func() { close(s.quit) }) }
 
 // Serve 开始接受连接，直到 listener 被关闭。

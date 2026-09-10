@@ -69,12 +69,15 @@ func endpointOf(cfg *config.Config) string {
 func runCommand(name string, args []string, req ipc.Request, timeout time.Duration) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if err := fs.Parse(splitFlags(args)); err != nil {
+	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
+	return runAt(endpointOf(clientConfig(*configPath)), req, timeout)
+}
 
-	cfg := clientConfig(*configPath)
-	resp, err := call(endpointOf(cfg), req, timeout)
+// runAt 向指定端点发一条请求，并按响应状态码决定退出码。
+func runAt(endpoint string, req ipc.Request, timeout time.Duration) error {
+	resp, err := call(endpoint, req, timeout)
 	if err != nil {
 		return err
 	}

@@ -67,7 +67,7 @@ func main() {
 		err = cmdRun(args)
 	case "start":
 		err = cmdStart(args)
-case "stop":
+	case "stop":
 		err = cmdStop(args)
 	case "restart":
 		err = cmdRestart(args)
@@ -101,7 +101,7 @@ func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
-	if err := fs.Parse(splitFlags(args)); err != nil {
+	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
 
@@ -175,7 +175,7 @@ func logWireGuardPublicKey(cfg *config.Config) {
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if err := fs.Parse(splitFlags(args)); err != nil {
+	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
 	// 服务进程没在跑就先拉起来：这是"按需拉起"的入口。
@@ -196,7 +196,7 @@ func cmdStop(args []string) error {
 func cmdRestart(args []string) error {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if err := fs.Parse(splitFlags(args)); err != nil {
+	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
 
@@ -221,28 +221,33 @@ func cmdStatus(args []string) error {
 //
 //	njuvpn wg-peer <客户端公钥>
 func cmdSetPeer(args []string) error {
-	key := strings.TrimSpace(strings.Join(joinPositional(args), ""))
+	fs := flag.NewFlagSet("wg-peer", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	positional, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	key := strings.TrimSpace(strings.Join(positional, ""))
 	if key == "" {
 		return errors.New("用法: njuvpn wg-peer <客户端公钥>")
 	}
-	return runCommand("wg-peer", args, ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
+	return runAt(endpointOf(clientConfig(*configPath)),
+		ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
 }
 
 // cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。
 func cmdAuth(args []string) error {
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
-	// -config 仍要能解析（值由下面的 runCommand 自己再解析一遍用来定位端点），
-	// 这里只注册、不读。
-	_ = fs.String("config", "", "配置文件路径")
-	// 验证码通常写成 auth 123456，后面还可能跟 -config，
-	// 所以先把 flag 挑出来再解析，避免位置参数截断解析。
-	if err := fs.Parse(splitFlags(args)); err != nil {
+	configPath := fs.String("config", "", "配置文件路径")
+	// 验证码通常写成 auth 123456，后面还可能跟 -config：
+	// 两种写法都能解析出正确的位置参数。
+	positional, err := parseInterleaved(fs, args)
+	if err != nil {
 		return err
 	}
 
-	code := strings.TrimSpace(strings.Join(joinPositional(args), ""))
+	code := strings.TrimSpace(strings.Join(positional, ""))
 	if code == "" {
-		var err error
 		if code, err = promptCode(); err != nil {
 			return err
 		}
@@ -250,42 +255,29 @@ func cmdAuth(args []string) error {
 
 	// 超时给足：服务端最坏路径是 submitCode + portalToken + acquireIP
 	//（3 次尝试 × 30 秒退避），加起来可能超过 3 分钟。
-	return runCommand("auth", args, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 5*time.Minute)
+	return runAt(endpointOf(clientConfig(*configPath)),
+		ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 5*time.Minute)
 }
 
-// splitFlags 把 -flag value / -flag=value 这类参数挑到前面，其余保持原序。
-func splitFlags(args []string) []string {
-	var flags, rest []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "-") {
-			rest = append(rest, a)
-			continue
+// parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。
+//
+// Go 的 flag 包遇到第一个位置参数就停止解析，而命令行里这两者经常混着写
+// （njuvpn auth 123456 -config x.yaml）。这里循环调用 Parse：每轮吃掉一个
+// 位置参数，再从剩下的继续解析。解析语义完全由标准库决定（-flag=value、
+// 布尔 flag、-- 终止符都正确），不再自己维护一份 flag 语法。
+func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
 		}
-		flags = append(flags, a)
-		// -flag value 形式：值不带前缀，且不是下一个 flag
-		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-			flags = append(flags, args[i+1])
-			i++
+		args = fs.Args()
+		if len(args) == 0 {
+			return positional, nil
 		}
+		positional = append(positional, args[0])
+		args = args[1:]
 	}
-	return append(flags, rest...)
-}
-
-// joinPositional 取出不含 flag 的参数。
-func joinPositional(args []string) []string {
-	var rest []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "-") {
-			rest = append(rest, a)
-			continue
-		}
-		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-			i++
-		}
-	}
-	return rest
 }
 
 // cmdProbe 走一遍完整的协议握手，用来验证服务端仍然接受当前的客户端实现。
@@ -300,7 +292,7 @@ func cmdProbe(args []string) error {
 	logout := fs.Bool("logout", false, "只调用服务端登出接口然后退出，不建立隧道")
 	keep := fs.Bool("keep", false, "探测结束后不登出，保留服务端会话以便复用")
 	debug := fs.Bool("debug", false, "打印每一步的报文")
-	if err := fs.Parse(splitFlags(args)); err != nil {
+	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
 

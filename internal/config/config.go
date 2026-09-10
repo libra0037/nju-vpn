@@ -66,7 +66,7 @@ func (c *Config) SetSourcePath(path string) { c.sourcePath = path }
 // DefaultPath 返回当前平台的默认配置文件路径。
 //
 // 两个平台都放在用户自己的目录下：服务进程以普通用户运行，系统目录
-//（/etc、ProgramData）既写不进去，也要求不该有的特权。
+// （/etc、ProgramData）既写不进去，也要求不该有的特权。
 func DefaultPath() string {
 	home, _ := os.UserHomeDir()
 	return defaultPath(runtime.GOOS, os.Getenv, home)

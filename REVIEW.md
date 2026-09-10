@@ -38,19 +38,15 @@
 | B5 | `8a58738` | 去掉 kardianos 与系统服务安装；CLI 按需拉起 + `shutdown` / `restart` |
 | C | `29ada46` | C1–C13、C15–C18（C14 见下） |
 | D + E | `bbccc64` | D1/D4/D10（D9 随 C 批一起做）；E1–E3、E5 |
+| 文档 | `c3f20f4`、`00193dc` | 进度记录；新形态在 Windows 上的端到端实测 |
+| E4 + F + C14 | 本次 | vpntest 死代码与轮询等待、F1–F16（F2 已作废）、重连期间的状态显示 |
 
 新形态已在 Windows 上端到端跑通（2026-09-10 晚，笔记本）：CLI 拉起服务进程 142ms 就绪，
 随后 start → 短信 → up → stop 全程正常，见 HANDOFF 第 11 节。
 
 已经作废、不需要再动的：B1、B2、B4、D2、D3、D5、D6、D7、D8、F2。
 
-剩下：
-
-- **C14**：隧道重连期间状态仍报 up（最长约 30 秒）。计划与 UI 一起做。
-- **E4**：`internal/vpntest` 里的死代码（`SetFallback`、`AllowQueryIP`、`OnUplink`、
-  只写不读的统计字段）。其中 `recvCh` 改成 channel 等待值得单独做：
-  现在的 `WaitRecvStream` 是 5ms 轮询，测试依赖时序。
-- **F 组**：16 条简化，不改行为。F2 已随 B5 作废。
+清单里已无待处理项。剩下两件与真机有关：在 Ubuntu 上跑通、配置开机自启。
 
 过程中发现并顺手修掉的（原清单没有）：
 

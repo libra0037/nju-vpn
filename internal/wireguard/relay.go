@@ -12,7 +12,6 @@ package wireguard
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -31,10 +30,6 @@ const (
 	// queueSize 是隧道下行方向的缓冲包数。WireGuard 读得慢时多出来的包会被丢弃，
 	// 这对承载 TCP 是可接受的：丢包会触发重传，而阻塞读取会拖慢整条隧道。
 	queueSize = 128
-
-	// maxFrameBuffer 限制分帧缓冲区的上限。接不上包的垃圾字节不应该
-	// 让服务进程的内存一直涨。
-	maxFrameBuffer = 64 * 1024
 
 	// dropLogInterval 是丢包日志的最小间隔。
 	dropLogInterval = 5 * time.Second
@@ -65,8 +60,9 @@ type Relay struct {
 	frameMu  sync.Mutex
 	frameBuf []byte
 
-	dropped    atomic.Uint64
-	lastDropAt atomic.Int64
+	// 丢包按原因分开计数：混成一个数字时，"隧道 up 却一个包都过不去"
+	// 这种最常见的问题在日志里没有任何线索。
+	drops [dropReasonCount]dropCounter
 }
 
 // NewRelay 创建 relay，并把两个方向接到 endpoint 上。
@@ -96,6 +92,9 @@ func NewRelay(opts RelayOptions) *Relay {
 //
 // 调用方（隧道读循环）复用读缓冲，所以这里必须拷贝；
 // 而且不能假设"一次读 = 一个包"——粘包与半包都会出现。
+//
+// 缓冲区不会无限涨：切不出包时会把整段丢弃等下一个包同步，
+// 而单个包的长度受 IPv4 总长度（16 位）限制。
 func (r *Relay) deliver(chunk []byte) {
 	select {
 	case <-r.closed:
@@ -120,17 +119,13 @@ func (r *Relay) deliver(chunk []byte) {
 		packets = append(packets, pkt)
 		r.frameBuf = rest
 	}
-	if len(r.frameBuf) > maxFrameBuffer {
-		log.Printf("wireguard: 下行分帧缓冲超过 %d 字节，丢弃", maxFrameBuffer)
-		r.frameBuf = nil
-	}
 	r.frameMu.Unlock()
 
 	for _, pkt := range packets {
 		if r.mapper != nil {
 			rewritten, err := r.mapper.Downlink(pkt)
 			if err != nil {
-				r.countDrop()
+				r.countDrop(dropDownlinkAddr)
 				continue
 			}
 			pkt = rewritten
@@ -141,7 +136,7 @@ func (r *Relay) deliver(chunk []byte) {
 			return
 		default:
 			// 队列满，丢弃。隧道里的 TCP 会重传，UDP 本来就允许丢。
-			r.countDrop()
+			r.countDrop(dropDownlinkFull)
 		}
 	}
 }
@@ -157,9 +152,6 @@ func splitPacket(buf []byte) (pkt []byte, rest []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if total > maxFrameBuffer {
-		return nil, nil, fmt.Errorf("IPv4 总长度 %d 超出上限", total)
-	}
 	if len(buf) < total {
 		return nil, buf, nil
 	}
@@ -168,15 +160,73 @@ func splitPacket(buf []byte) (pkt []byte, rest []byte, err error) {
 	return pkt, buf[total:], nil
 }
 
-// countDrop 记录丢包并按间隔限速打日志。
-func (r *Relay) countDrop() {
-	n := r.dropped.Add(1)
-	now := time.Now().UnixNano()
-	last := r.lastDropAt.Load()
-	if now-last < int64(dropLogInterval) || !r.lastDropAt.CompareAndSwap(last, now) {
+// dropReason 是丢包原因。每种原因单独计数、单独限速打日志。
+type dropReason int
+
+const (
+	// dropDownlinkInvalid：隧道下行来的字节切不出 IPv4 包。
+	dropDownlinkInvalid dropReason = iota
+	// dropDownlinkAddr：下行包的目的地址不是本次分配到的校园网地址。
+	// 客户端 allowed_ips 写错、或 connect 时分配了新地址时会出现。
+	dropDownlinkAddr
+	// dropDownlinkFull：下行队列满（WireGuard 读得慢）。
+	dropDownlinkFull
+	// dropUplinkNotIPv4：WireGuard 解出来的不是 IPv4 包。
+	dropUplinkNotIPv4
+	// dropUplinkAddr：上行包的源地址不是 peer 地址——最典型的成因是
+	// 客户端配置里的 ip 与 wireguard.peer_address 不一致。
+	dropUplinkAddr
+	// dropNoBuffer：读缓冲装不下这个包（见 Read 的注释）。
+	dropNoBuffer
+
+	dropReasonCount
+)
+
+var dropReasonText = [dropReasonCount]string{
+	dropDownlinkInvalid: "下行数据切不出 IPv4 包",
+	dropDownlinkAddr:    "下行包的目的地址不是本次分配到的地址（检查客户端 allowed_ips 与 peer_address）",
+	dropDownlinkFull:    "下行队列已满",
+	dropUplinkNotIPv4:   "上行解出来的不是 IPv4 包",
+	dropUplinkAddr:      "上行包的源地址不是 peer_address（客户端 ip 配置不一致？）",
+	dropNoBuffer:        "读缓冲装不下这个包",
+}
+
+// dropCounter 是一种原因的计数与限速状态。
+type dropCounter struct {
+	n        atomic.Uint64
+	lastLog  atomic.Int64
+	firstLog atomic.Bool
+}
+
+// countDrop 记录一次丢包，并按原因限速打日志。
+//
+// 每种原因第一次出现必定打一条（否则用户第一次踩配置错误时什么都没看到），
+// 之后按间隔限速。
+func (r *Relay) countDrop(reason dropReason) {
+	c := &r.drops[reason]
+	n := c.n.Add(1)
+	if c.firstLog.CompareAndSwap(false, true) {
+		c.lastLog.Store(time.Now().UnixNano())
+		log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
 		return
 	}
-	log.Printf("wireguard: 下行队列已满或包不合法，累计丢弃 %d 个包", n)
+	now := time.Now().UnixNano()
+	last := c.lastLog.Load()
+	if now-last < int64(dropLogInterval) || !c.lastLog.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
+}
+
+// DropStats 返回每种原因的累计丢包数，供测试与排查使用。
+func (r *Relay) DropStats() map[string]uint64 {
+	out := make(map[string]uint64, dropReasonCount)
+	for reason := dropReason(0); reason < dropReasonCount; reason++ {
+		if n := r.drops[reason].n.Load(); n > 0 {
+			out[dropReasonText[reason]] = n
+		}
+	}
+	return out
 }
 
 // File 返回 nil：这里没有操作系统层面的网卡文件描述符。
@@ -203,7 +253,7 @@ func (r *Relay) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 				// 协程收到非 ErrClosed 的错误会直接 go device.Close()，一个
 				// 超长包就能把整条承载层悄悄关掉（Windows 上缓冲区只有 2000
 				// 字节，而隧道侧允许更大的包）。丢包由上层重传兜住。
-				r.countDrop()
+				r.countDrop(dropNoBuffer)
 				continue
 			}
 			sizes[0] = copy(dst, pkt)
@@ -233,13 +283,13 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 		}
 		if _, err := parseIPv4(pkt); err != nil {
 			// WireGuard 解出来的应该是 IPv4 包，其它一律丢弃。
-			r.countDrop()
+			r.countDrop(dropUplinkNotIPv4)
 			continue
 		}
 		if r.mapper != nil {
 			rewritten, err := r.mapper.Uplink(pkt)
 			if err != nil {
-				r.countDrop()
+				r.countDrop(dropUplinkAddr)
 				continue
 			}
 			pkt = rewritten

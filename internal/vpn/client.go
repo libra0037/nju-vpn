@@ -184,7 +184,9 @@ func (c *Client) dialTunnelTLS(ctx context.Context) (net.Conn, error) {
 	conn.HandshakeState.Hello.CipherSuites = tunnelHelloCipherSuites()
 	conn.HandshakeState.Hello.CompressionMethods = tunnelHelloCompression()
 	conn.HandshakeState.Hello.SessionId = tunnelHelloSessionID()
-	return &utlsTunnelConn{UConn: conn}, nil
+	// 隧道方向不需要实现 sessionIDSource（SessionId 是客户端自己构造的），
+	// 直接返回底层连接即可。
+	return conn, nil
 }
 
 // 隧道 ClientHello 的畸形参数。这些值是与服务端的契约，改动前先看

@@ -7,8 +7,10 @@ import (
 	"log"
 	"net"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"njuvpn/internal/config"
@@ -41,6 +43,7 @@ const (
 	cmdAuth
 	cmdStop
 	cmdTunnelDown
+	cmdTunnelRetry
 	cmdSetPeer
 )
 
@@ -68,7 +71,9 @@ type Service struct {
 
 	mu       sync.Mutex
 	opCancel context.CancelFunc
-	// device 由 actor 协程写、Status 之外的只读查询读，用 s.mu 保护。
+	// device 由 actor 协程写、只读查询（wg-stats）读。它只是指针交换，
+	// 用 atomic.Pointer 比"谁在锁里访问"的约定更省心。
+	device atomic.Pointer[wireguard.Device]
 
 	// 以下字段只在 actor 协程里访问，不需要加锁。
 	// dialer 与 clientOptions 是测试注入点。
@@ -80,7 +85,6 @@ type Service struct {
 	clientOptions func(*vpn.Options)
 	client        *vpn.Client
 	session       *vpn.Session
-	device        *wireguard.Device
 	runCancel     context.CancelFunc
 	gen           uint64
 	pendingAuth   *vpn.AuthRequiredError
@@ -187,16 +191,12 @@ func (s *Service) call(cmd *command) error {
 
 // setDevice 记录承载设备。actor 协程与只读查询都会访问这个字段。
 func (s *Service) setDevice(dev *wireguard.Device) {
-	s.mu.Lock()
-	s.device = dev
-	s.mu.Unlock()
+	s.device.Store(dev)
 }
 
 // currentDevice 返回当前承载设备，可能为 nil。
 func (s *Service) currentDevice() *wireguard.Device {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.device
+	return s.device.Load()
 }
 
 // setOpCancel 记录当前操作的取消函数。
@@ -270,7 +270,7 @@ func (s *Service) dispatch(cmd *command) {
 			err := fmt.Errorf("内部错误: %v", r)
 			log.Printf("%v\n%s", err, debug.Stack())
 			s.teardown("内部错误")
-			_ = s.status.set(StateError, err.Error())
+			s.status.set(StateError, err.Error())
 			reply(err)
 		}
 	}()
@@ -285,6 +285,8 @@ func (s *Service) dispatch(cmd *command) {
 		err = s.stop()
 	case cmdTunnelDown:
 		err = s.tunnelDown(cmd.gen, cmd.err)
+	case cmdTunnelRetry:
+		err = s.tunnelRetry(cmd.gen, cmd.arg, cmd.err)
 	case cmdSetPeer:
 		err = s.setPeer(cmd.arg)
 	default:
@@ -307,9 +309,7 @@ func (s *Service) start(ctx context.Context) error {
 		return fmt.Errorf("%w: 当前状态是 %s", ErrBadState, cur)
 	}
 
-	if err := s.status.set(StateLoggingIn, "正在登录"); err != nil {
-		return err
-	}
+	s.status.set(StateLoggingIn, "正在登录")
 
 	var err error
 	var dialFn vpn.DialFunc
@@ -490,9 +490,7 @@ func (s *Service) attach(sess *vpn.Session) {
 
 // finishConnect 用一次成功的连接建立 WireGuard 承载。
 func (s *Service) finishConnect(sess *vpn.Session) error {
-	if err := s.status.set(StateConnecting, "正在建立承载"); err != nil {
-		return s.fail(err)
-	}
+	s.status.set(StateConnecting, "正在建立承载")
 
 	mapper, err := wireguard.NewMapper(net.ParseIP(s.cfg.WireGuard.PeerAddress), net.ParseIP(sess.ClientIP()))
 	if err != nil {
@@ -532,9 +530,7 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 	s.status.setAddresses(sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
 	// 先进入 up 再启动隧道协程：如果协程立刻就失败，
 	// tunnelDown 必须能看到 up 才能正确收敛，否则这次失败会被忽略掉。
-	if err := s.status.set(StateUp, "隧道已建立"); err != nil {
-		return s.fail(err)
-	}
+	s.status.set(StateUp, "隧道已建立")
 
 	// 隧道协程的生命周期独立于本次命令：Stop/Close 通过 runCancel 结束它。
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -551,12 +547,33 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 				s.reportTunnelDown(gen, panicErr)
 			}
 		}()
-		err := sess.RunWithRetry(runCtx, vpn.DefaultRetryPolicy())
+		// 重连尝试每次都在退避前经 actor 上报：状态仍是 up（隧道对象还在），
+		// 但说明文字会变成"正在重连"，用户不至于以为链路正常。
+		err := sess.RunWithRetryNotify(runCtx, vpn.DefaultRetryPolicy(), func(attempt int, retryErr error) {
+			s.reportTunnelRetry(gen, attempt, retryErr)
+		})
 		s.reportTunnelDown(gen, err)
 	}()
 
 	log.Printf("隧道已建立：校园网地址 %s，peer 地址 %s", sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
 	return nil
+}
+
+// reportTunnelRetry 上报一次重连尝试。
+//
+// 与 reportTunnelDown 一样必须经过 actor；这条只改说明文字，不改状态：
+// 隧道对象还在，WireGuard 设备也还在，只是底层流断了正在重连。
+func (s *Service) reportTunnelRetry(gen uint64, attempt int, err error) {
+	select {
+	case s.cmds <- &command{
+		kind:  cmdTunnelRetry,
+		arg:   strconv.Itoa(attempt),
+		gen:   gen,
+		err:   err,
+		reply: make(chan error, 1),
+	}:
+	case <-s.closed:
+	}
 }
 
 // reportTunnelDown 把隧道协程的退出转成一条命令交给 actor。
@@ -589,7 +606,22 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 	if err != nil {
 		detail += ": " + err.Error()
 	}
-	_ = s.status.set(StateError, detail)
+	s.status.set(StateError, detail)
+	return nil
+}
+
+// tunnelRetry 在状态里标出"正在重连"。
+//
+// 只改说明文字：状态仍是 up，因为隧道对象与承载层都还在，
+// 重连成功后不需要重建它们。
+func (s *Service) tunnelRetry(gen uint64, attemptText string, err error) error {
+	if gen != s.gen {
+		return nil
+	}
+	if s.status.Get().State != StateUp && s.status.Get().State != StateError {
+		return nil
+	}
+	s.status.setDetail(fmt.Sprintf("隧道断开，正在重连（第 %s 次）: %v", attemptText, err))
 	return nil
 }
 
@@ -655,24 +687,22 @@ func (s *Service) awaitAuth() error {
 	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSStillValid):
 		// 冷却期内服务端不会重发，上一条验证码仍然有效——不能提示"已发送"，
 		// 否则用户会一直等一条不会来的短信。
-		detail = vpn.UserMessage(s.pendingAuth) + "，请用上一条验证码执行 njuvpn auth <code>"
+		detail = s.pendingAuth.UserText() + "，请用上一条验证码执行 njuvpn auth <code>"
 	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSTooMany):
 		detail = "短信发送过于频繁，请稍后再试"
 	case s.pendingAuth != nil:
-		detail = vpn.UserMessage(s.pendingAuth) + "，请执行 njuvpn auth <code>"
+		detail = s.pendingAuth.UserText() + "，请执行 njuvpn auth <code>"
 	default:
 		detail = "需要短信验证码，请执行 njuvpn auth <code>"
 	}
-	if err := s.status.set(StateAuthPending, detail); err != nil {
-		return err
-	}
+	s.status.set(StateAuthPending, detail)
 	return fmt.Errorf("%s: %w", detail, ErrAuthRequired)
 }
 
 // fail 收敛到 error 状态。只能在 actor 协程内调用。
 func (s *Service) fail(err error) error {
 	s.teardown("")
-	_ = s.status.set(StateError, err.Error())
+	s.status.set(StateError, err.Error())
 	return err
 }
 
@@ -705,8 +735,6 @@ func (s *Service) teardown(detail string) {
 		if detail == "" {
 			detail = "已断开"
 		}
-		if err := s.status.set(StateIdle, detail); err != nil {
-			log.Printf("状态收敛失败: %v", err)
-		}
+		s.status.set(StateIdle, detail)
 	}
 }

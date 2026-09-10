@@ -15,7 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // 请求命令。
@@ -74,24 +76,44 @@ func ParseRequest(line string) (Request, error) {
 
 // FormatResponse 把响应编码成一行。
 func FormatResponse(r Response) string {
-	return fmt.Sprintf("%d %s\n", r.Code, sanitize(r.Message))
+	msg := sanitize(r.Message)
+	// 客户端会拒绝超长行，与其让对端收到一个与真实错误无关的提示
+	//（"报文行超过长度上限"），不如在这里截断并标出来。
+	const reserved = len("4294967295 ")
+	if max := MaxLineBytes - reserved; len(msg) > max {
+		msg = truncateUTF8(msg, max-len("…（已截断）")) + "…（已截断）"
+	}
+	return fmt.Sprintf("%d %s\n", r.Code, msg)
 }
 
 // ParseResponse 解析一行响应。
 func ParseResponse(line string) (Response, error) {
 	line = strings.TrimRight(line, "\r\n")
-	if len(line) < 3 {
+	// 状态码与消息之间必须有一个空格：以前用 Sscanf 读前三个字符、
+	// 再硬切第 5 列，"2000 x" 会被读成 code=200、msg="1 x"。
+	codeText, msg, ok := strings.Cut(line, " ")
+	if !ok {
 		return Response{}, fmt.Errorf("响应过短: %q", line)
 	}
-	var code int
-	if _, err := fmt.Sscanf(line[:3], "%d", &code); err != nil {
+	if len(codeText) < 3 || len(codeText) > 4 {
+		return Response{}, fmt.Errorf("响应状态码位数不对: %q", line)
+	}
+	code, err := strconv.Atoi(codeText)
+	if err != nil {
 		return Response{}, fmt.Errorf("响应状态码非法: %q", line)
 	}
-	msg := ""
-	if len(line) > 4 {
-		msg = line[4:]
-	}
 	return Response{Code: code, Message: msg}, nil
+}
+
+// truncateUTF8 按字节上限截断，但不切断多字节字符。
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // sanitize 保证消息只占一行，避免破坏行协议。

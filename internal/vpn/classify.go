@@ -108,21 +108,6 @@ func SMSCooldown(err error) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// UserMessage 去掉内部错误的前缀，只保留给用户看的部分。
-func UserMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	msg := err.Error()
-	if i := strings.LastIndex(msg, "\n"); i >= 0 {
-		msg = msg[i+1:]
-	}
-	if i := strings.LastIndex(msg, ": "); i >= 0 {
-		return msg[i+2:]
-	}
-	return msg
-}
-
 // classifySMSAuth 判断提交验证码的结果。
 func classifySMSAuth(body []byte) (state error, err error) {
 	s := string(body)

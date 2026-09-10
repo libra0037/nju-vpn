@@ -51,11 +51,6 @@ func (c *utlsPortalConn) ServerHelloSessionID() ([]byte, error) {
 	return c.HandshakeState.ServerHello.SessionId, nil
 }
 
-// utlsTunnelConn 是隧道方向的 uTLS 连接。
-type utlsTunnelConn struct {
-	*utls.UConn
-}
-
 // serverSessionID 取出连接上的 SessionId。
 func serverSessionID(conn net.Conn) ([]byte, error) {
 	src, ok := conn.(sessionIDSource)

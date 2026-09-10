@@ -170,6 +170,14 @@ func (s *Session) Run(ctx context.Context) error {
 // 终止性错误（ControlError 里不可重试的控制码）立刻返回：
 // 继续重试只会被服务端继续拒绝，还会把账号打进限流状态。
 func (s *Session) RunWithRetry(ctx context.Context, policy RetryPolicy) error {
+	return s.RunWithRetryNotify(ctx, policy, nil)
+}
+
+// RunWithRetryNotify 与 RunWithRetry 相同，但在每次重连前回调通知。
+//
+// 调用方（服务层）靠它把"正在重连"告诉用户：重连期间隧道是断的，
+// 而状态如果一直显示 up，用户会以为链路正常、只是"网慢"。
+func (s *Session) RunWithRetryNotify(ctx context.Context, policy RetryPolicy, onRetry func(attempt int, err error)) error {
 	if policy.Attempts < 1 || policy.Base <= 0 || policy.Max <= 0 {
 		policy = DefaultRetryPolicy()
 	}
@@ -191,6 +199,9 @@ func (s *Session) RunWithRetry(ctx context.Context, policy RetryPolicy) error {
 		}
 		delay := policy.delay(attempt)
 		log.Printf("隧道断开（第 %d 次）: %v，%s 后重连", attempt, err, delay)
+		if onRetry != nil {
+			onRetry(attempt, err)
+		}
 		if err := sleepCtx(ctx, delay); err != nil {
 			return err
 		}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -207,6 +208,39 @@ func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 	}
 }
 
+// 回归（原 F11）：丢包原因必须分开计数。
+//
+// 以前 5 种原因共用一个计数器与一句话，最容易踩的那类问题——
+// 客户端的 ip 与 wireguard.peer_address 不一致——只表现为
+// "隧道是 up 的，但一个包都过不去"，日志里没有任何线索。
+func TestDropReasonsAreDistinguished(t *testing.T) {
+	ep := vpn.NewEndpoint()
+	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRelay(RelayOptions{MTU: 1320, Endpoint: ep, Mapper: mapper})
+	defer r.Close()
+
+	// 上行：源地址不是 peer 地址，会被 mapper 拒绝。
+	ep.SetUplink(func([]byte) error { return nil })
+	wrongSrc := ipv4Pkt([4]byte{10, 66, 66, 99}, [4]byte{1, 1, 1, 1}, 8)
+	if _, err := r.Write([][]byte{wrongSrc}, 0); err != nil {
+		t.Fatalf("Write 不该报错: %v", err)
+	}
+
+	stats := r.DropStats()
+	var gotAddr bool
+	for reason := range stats {
+		if strings.Contains(reason, "peer_address") {
+			gotAddr = true
+		}
+	}
+	if !gotAddr {
+		t.Errorf("应记录「上行源地址不对」，实际 %v", stats)
+	}
+}
+
 // 回归：缓冲区装不下的包必须丢掉，绝不能返回错误。
 //
 // wireguard-go 的 TUN 读协程收到非 ErrClosed 的错误会直接 go device.Close()，
@@ -230,7 +264,7 @@ func TestRelayReadDropsOversizedPacket(t *testing.T) {
 	if n != 1 || sizes[0] != 40 {
 		t.Fatalf("应交出后面那个 40 字节的包（20 头部 + 20 载荷），得到 n=%d size=%d", n, sizes[0])
 	}
-	if r.dropped.Load() == 0 {
+	if len(r.DropStats()) == 0 {
 		t.Error("超长包应计入丢弃统计")
 	}
 }

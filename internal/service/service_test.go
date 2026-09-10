@@ -552,7 +552,7 @@ func TestSetPeerPersistsAndApplies(t *testing.T) {
 	if err := h.svc.SetPeer(secondPub.String()); err != nil {
 		t.Fatalf("热更新 peer 失败: %v", err)
 	}
-	stats, err := h.svc.device.Stats()
+	stats, err := h.svc.currentDevice().Stats()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,6 +604,68 @@ func TestClientOptionsUseProductionWiring(t *testing.T) {
 	}
 	if h.lastOptions.Dial == nil {
 		t.Error("Dial 没接上：出站路径会直接 panic")
+	}
+}
+
+// 回归（原 C14）：隧道重连期间，对外状态必须说明"正在重连"。
+//
+// 以前重连要退避 2+4+8+16 秒才返回，这期间状态一直是 up，
+// 用户/客户端看到"已建立"却没有流量，只能以为网慢。
+func TestTunnelRetryUpdatesDetail(t *testing.T) {
+	h := newHarness(t)
+	h.portal.Set("/por/login_psw.csp", vpntest.Response{
+		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
+	})
+	h.portal.Set("/por/login_sms.csp", vpntest.Response{
+		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
+	})
+	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
+		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
+	})
+	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	}
+	if err := h.svc.Auth("123456"); err != nil {
+		t.Fatalf("提交验证码失败: %v", err)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	// 模拟隧道协程上报一次重连。
+	gen := h.svc.gen
+	reply := make(chan error, 1)
+	select {
+	case h.svc.cmds <- &command{kind: cmdTunnelRetry, arg: "1", gen: gen, err: errors.New("流断开"), reply: reply}:
+	case <-time.After(time.Second):
+		t.Fatal("命令通道阻塞")
+	}
+	select {
+	case <-reply:
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 actor 处理超时")
+	}
+
+	st := h.svc.Status()
+	if st.State != StateUp {
+		t.Errorf("状态应保持 up（隧道对象还在），实际 %s", st.State)
+	}
+	if !strings.Contains(st.Detail, "正在重连") {
+		t.Errorf("说明文字应提示正在重连，实际 %q", st.Detail)
+	}
+}
+
+// 过期代次的重连上报必须被忽略：否则旧协程会把新会话的状态改坏。
+func TestStaleTunnelRetryIsIgnored(t *testing.T) {
+	h := newHarness(t)
+	before := h.svc.Status()
+	reply := make(chan error, 1)
+	h.svc.cmds <- &command{kind: cmdTunnelRetry, arg: "3", gen: h.svc.gen + 99, err: errors.New("旧协程"), reply: reply}
+	select {
+	case <-reply:
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 actor 处理超时")
+	}
+	if got := h.svc.Status(); got.Detail != before.Detail {
+		t.Errorf("过期代次不该改状态：%q → %q", before.Detail, got.Detail)
 	}
 }
 

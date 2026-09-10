@@ -6,7 +6,7 @@
 package service
 
 import (
-	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -65,17 +65,20 @@ func (s *statusStore) Get() Status {
 	return s.status
 }
 
-// set 迁移到 next 状态，非法迁移返回错误。
-func (s *statusStore) set(next State, detail string) error {
+// set 迁移到 next 状态。
+//
+// 非法迁移会写日志并照样迁移：调用点分布在错误路径上，返回错误只会被
+// 丢掉（以前 8 个调用点里有 5 个写成下划线），结果是状态静默停在原地，
+// 对外还是一个看起来正常的状态，比迁移错误本身更难排查。
+func (s *statusStore) set(next State, detail string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	cur := s.status.State
 	if cur != next && !allowed(cur, next) {
-		return fmt.Errorf("状态不允许从 %s 迁移到 %s", cur, next)
+		log.Printf("状态从 %s 迁移到 %s 不在预期内（继续迁移）", cur, next)
 	}
 	s.applyLocked(next, detail)
-	return nil
 }
 
 // setDetail 只更新说明文字。

@@ -58,9 +58,7 @@ type Response struct {
 
 // Request 是一条被记录下来的请求。
 type Request struct {
-	Method string
 	Path   string
-	Query  url.Values
 	Form   url.Values
 	Cookie string
 }
@@ -70,7 +68,6 @@ type Portal struct {
 	mu       sync.Mutex
 	routes   map[string][]Response
 	requests []Request
-	fallback func(path string) Response
 }
 
 // NewPortal 构造一个空的 portal 替身。未注册的路径返回 404。
@@ -95,12 +92,6 @@ func (p *Portal) Set(path string, resps ...Response) *Portal {
 }
 
 // SetFallback 设置未命中路径时的响应。
-func (p *Portal) SetFallback(f func(path string) Response) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.fallback = f
-}
-
 // Requests 返回已记录的请求。
 func (p *Portal) Requests() []Request {
 	p.mu.Lock()
@@ -137,9 +128,7 @@ func (p *Portal) HTTPClient() *http.Client { return &http.Client{Transport: p} }
 // RoundTrip 实现 http.RoundTripper。
 func (p *Portal) RoundTrip(req *http.Request) (*http.Response, error) {
 	rec := Request{
-		Method: req.Method,
 		Path:   req.URL.Path,
-		Query:  req.URL.Query(),
 		Cookie: req.Header.Get("Cookie"),
 	}
 	if req.Body != nil {
@@ -198,9 +187,6 @@ func (p *Portal) next(path string) (Response, bool) {
 		}
 		return resp, true
 	}
-	if p.fallback != nil {
-		return p.fallback(path), true
-	}
 	return Response{}, false
 }
 
@@ -231,12 +217,10 @@ func (r *chunkReader) Close() error { return nil }
 
 // TunnelStats 是一次测试里假隧道服务端的统计。
 type TunnelStats struct {
-	Connections int
-	QueryIP     int
-	Streams     []byte
-	Closed      int
-	Uplink      [][]byte
-	Downlink    int
+	// Closed 是服务端侧关闭的连接数，用来断言"流被关掉了"。
+	Closed int
+	// Uplink 是上行方向收到的数据。
+	Uplink [][]byte
 }
 
 // Tunnel 是假隧道服务端：每次建连返回一条内存管道，并按协议应答。
@@ -249,20 +233,18 @@ type Tunnel struct {
 	rejectQueryIP byte
 	rejectStream  map[byte]byte
 
-	connections int
-	queryIP     int
-	streams     []byte
-	closed      int
-	uplink      [][]byte
-	downlink    int
+	closed int
+	uplink [][]byte
 
 	// 最近一次收到的握手报文原文，用于逐字节核对线上格式。
 	queryFrame  []byte
 	streamFrame map[byte][]byte
 
 	recvConn net.Conn
-	recvCh   chan struct{}
-	onUplink func([]byte)
+	// recvReady 在下行流建立时被关闭（只关一次），供 WaitRecvStream 等待，
+	// 避免测试靠轮询赌时序。
+	recvReady chan struct{}
+	recvOnce  sync.Once
 }
 
 // NewTunnel 构造假隧道服务端。
@@ -271,7 +253,7 @@ func NewTunnel() *Tunnel {
 		sessionID:    []byte("0123456789abcdef0123456789abcdef"),
 		ip:           [4]byte{172, 29, 56, 18},
 		rejectStream: make(map[byte]byte),
-		recvCh:       make(chan struct{}, 8),
+		recvReady:    make(chan struct{}),
 		streamFrame:  make(map[byte][]byte),
 	}
 }
@@ -297,24 +279,10 @@ func (t *Tunnel) RejectQueryIP(code byte) {
 	t.mu.Unlock()
 }
 
-// AllowQueryIP 恢复正常应答。
-func (t *Tunnel) AllowQueryIP() {
-	t.mu.Lock()
-	t.rejectQueryIP = 0
-	t.mu.Unlock()
-}
-
 // RejectStream 让指定方向的流握手用指定控制码拒绝。
 func (t *Tunnel) RejectStream(kind, code byte) {
 	t.mu.Lock()
 	t.rejectStream[kind] = code
-	t.mu.Unlock()
-}
-
-// OnUplink 注册上行数据回调。
-func (t *Tunnel) OnUplink(f func([]byte)) {
-	t.mu.Lock()
-	t.onUplink = f
 	t.mu.Unlock()
 }
 
@@ -323,31 +291,22 @@ func (t *Tunnel) Stats() TunnelStats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	stats := TunnelStats{
-		Connections: t.connections,
-		QueryIP:     t.queryIP,
-		Closed:      t.closed,
-		Downlink:    t.downlink,
+		Closed: t.closed,
 	}
-	stats.Streams = append(stats.Streams, t.streams...)
 	for _, p := range t.uplink {
 		stats.Uplink = append(stats.Uplink, append([]byte(nil), p...))
 	}
 	return stats
 }
 
-// WaitRecvStream 等待下行流建立。
+// WaitRecvStream 等待下行流建立，超时返回错误。
 func (t *Tunnel) WaitRecvStream(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		t.mu.Lock()
-		conn := t.recvConn
-		t.mu.Unlock()
-		if conn != nil {
-			return nil
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-t.recvReady:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("等待下行流建立超时")
 	}
-	return fmt.Errorf("等待下行流建立超时")
 }
 
 // SendDownlink 从服务端侧往客户端推一个下行包。
@@ -361,9 +320,6 @@ func (t *Tunnel) SendDownlink(pkt []byte) error {
 	if _, err := conn.Write(pkt); err != nil {
 		return err
 	}
-	t.mu.Lock()
-	t.downlink++
-	t.mu.Unlock()
 	return nil
 }
 
@@ -395,7 +351,6 @@ func (t *Tunnel) StreamFrame(kind byte) []byte {
 func (t *Tunnel) Dial(ctx context.Context) (net.Conn, error) {
 	client, server := net.Pipe()
 	t.mu.Lock()
-	t.connections++
 	id := append([]byte(nil), t.sessionID...)
 	t.mu.Unlock()
 
@@ -463,7 +418,6 @@ func (t *Tunnel) serveQueryIP(r *bufio.Reader, server net.Conn, head []byte) {
 	reject := t.rejectQueryIP
 	ip := t.ip
 	t.queryFrame = frame
-	t.queryIP++
 	t.mu.Unlock()
 
 	if reject != 0 {
@@ -491,17 +445,13 @@ func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head [
 	t.mu.Lock()
 	reject := t.rejectStream[kind]
 	t.streamFrame[kind] = frame
-	t.streams = append(t.streams, kind)
 	if kind == 0x06 {
 		t.recvConn = server
 	}
 	t.mu.Unlock()
 
 	if kind == 0x06 {
-		select {
-		case t.recvCh <- struct{}{}:
-		default:
-		}
+		t.recvOnce.Do(func() { close(t.recvReady) })
 	}
 
 	if reject != 0 {
@@ -525,11 +475,7 @@ func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head [
 			pkt := append([]byte(nil), buf[:n]...)
 			t.mu.Lock()
 			t.uplink = append(t.uplink, pkt)
-			cb := t.onUplink
 			t.mu.Unlock()
-			if cb != nil {
-				cb(pkt)
-			}
 		}
 		if err != nil {
 			return

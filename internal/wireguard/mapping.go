@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"sync/atomic"
 )
 
 // Mapper 在两类地址之间改写 IP 包的源/目的地址：
@@ -18,6 +20,9 @@ import (
 type Mapper struct {
 	peerIP   [4]byte // 客户端 peer 的地址，例如 10.66.66.2
 	publicIP [4]byte // 隧道分配的地址，例如 172.29.56.18
+
+	// 未支持的传输层协议只提示一次，避免每包都打日志。
+	unsupportedLogged atomic.Bool
 }
 
 // NewMapper 构造地址映射。两个地址都必须是 IPv4。
@@ -93,8 +98,8 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 		c := binary.BigEndian.Uint16(buf[off:])
 		c = updateChecksum(c, binary.BigEndian.Uint16(old[0:2]), binary.BigEndian.Uint16(new[0:2]))
 		c = updateChecksum(c, binary.BigEndian.Uint16(old[2:4]), binary.BigEndian.Uint16(new[2:4]))
-		// RFC 768：算出来是 0 时线上要写全 1。写成 0x0000 会被接收端
-		// 理解成"发送端没算校验和"，从而跳过校验。
+		// 算出来是 0 时线上写全 1（RFC 1071）：UDP 里 0x0000 的含义是
+		// "发送端没算校验和"，接收端会跳过校验。
 		if c == 0 {
 			c = 0xffff
 		}
@@ -118,7 +123,45 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 			c = 0xffff
 		}
 		binary.BigEndian.PutUint16(buf[off:], c)
+
+	default:
+		// 还有别的协议把地址算进校验和（SCTP 132、DCCP 33、UDP-Lite 136）。
+		// 不白名单化：ICMP 这类没有伪头校验和的协议会被误伤，而校园网里
+		// 这些协议基本不会出现。真出现了至少留一条线索——校验和坏掉的
+		// 表现是"包发出去了但没回应"，光看现象查不出来。
+		if hasPseudoHeaderChecksum(hdr.protocol) && m.unsupportedLogged.CompareAndSwap(false, true) {
+			log.Printf("wireguard: 改写了含地址的 %s 校验和未更新，该协议可能不通（只提示一次）",
+				protocolName(hdr.protocol))
+		}
 	}
+}
+
+// hasPseudoHeaderChecksum 报告该协议是否把地址算进校验和。
+//
+// 只列校园网里理论上可能出现的：SCTP、DCCP、UDP-Lite。
+func hasPseudoHeaderChecksum(protocol byte) bool {
+	switch protocol {
+	case protocolSCTP, protocolDCCP, protocolUDPLite:
+		return true
+	}
+	return false
+}
+
+// protocolName 返回协议名，用于日志。
+func protocolName(protocol byte) string {
+	switch protocol {
+	case protocolTCP:
+		return "TCP"
+	case protocolUDP:
+		return "UDP"
+	case protocolSCTP:
+		return "SCTP"
+	case protocolDCCP:
+		return "DCCP"
+	case protocolUDPLite:
+		return "UDP-Lite"
+	}
+	return fmt.Sprintf("协议 %d", protocol)
 }
 
 type ipv4Header struct {
@@ -139,6 +182,11 @@ const (
 	fragmentMask    = 0x1fff
 	protocolTCP     = 6
 	protocolUDP     = 17
+	// 同样把地址算进校验和的协议：改写地址后它们的校验和会失效，
+	// 只提示一次（见 rewriteAddr 的 default 分支）。
+	protocolDCCP    = 33
+	protocolSCTP    = 132
+	protocolUDPLite = 136
 	tcpChecksumOff  = 16
 	udpChecksumOff  = 6
 	udpChecksumZero = 0

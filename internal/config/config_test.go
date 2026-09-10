@@ -155,6 +155,7 @@ func TestLoadForClientReadsEndpoint(t *testing.T) {
 		t.Errorf("端点 = %q", got)
 	}
 }
+
 // 回归：默认路径以前是坏的——Windows 分支的反斜杠全丢，njuvpn 被吃成 juvpn，
 // 中间还夹了一个真实换行。参数化之后两个平台都能在这里断言。
 func TestDefaultPath(t *testing.T) {

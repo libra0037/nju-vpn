@@ -60,6 +60,24 @@ func (e *AuthRequiredError) Unwrap() []error {
 	return []error{e.Kind, e.State}
 }
 
+// UserText 返回给用户看的那一句：优先用状态（"上一条验证码仍然有效"），
+// 没有状态时用种类（"需要短信验证码"）。
+//
+// 以前是拿 Error() 拼好的字符串再用 LastIndex 拆回来，一旦状态文案里
+// 自带冒号就会被切错位置。
+func (e *AuthRequiredError) UserText() string {
+	if e == nil {
+		return ""
+	}
+	if e.State != nil {
+		return e.State.Error()
+	}
+	if e.Kind != nil {
+		return e.Kind.Error()
+	}
+	return ""
+}
+
 // AsAuthRequired 取出错误里的 AuthRequiredError。
 func AsAuthRequired(err error) (*AuthRequiredError, bool) {
 	var target *AuthRequiredError
@@ -81,6 +99,9 @@ func IsAuthCodeError(err error) bool {
 //
 // 所有"对端给了意外数据"的分支都必须返回它，而不是让索引、切片越界
 // 或者解引用空指针——那会直接把服务进程带走，而服务端的会话还留着。
+//
+// portal 接口返回的错误（HTTP 状态码、登录被拒、不支持的验证方式）
+// 也用同一个类型：格式都是"阶段 + 原因"，分成两个类型纯属历史残留。
 type ProtocolError struct {
 	Step   string
 	Reason string
@@ -88,7 +109,7 @@ type ProtocolError struct {
 
 func (e *ProtocolError) Error() string {
 	if e.Step == "" {
-		return "服务端响应不符合协议: " + e.Reason
+		return e.Reason
 	}
-	return e.Step + ": 服务端响应不符合协议: " + e.Reason
+	return e.Step + ": " + e.Reason
 }

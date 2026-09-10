@@ -3,9 +3,9 @@ package vpn
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
-	"sync"
 )
 
 // 协议里固定的长度。
@@ -23,19 +23,47 @@ const (
 	maxBodyBytes = 1 << 20
 )
 
-// tagRegexps 缓存标签正则。协议里用的标签是有限集合，正则只编译一次。
-var tagRegexps sync.Map
+// tagRegexps 是协议里用到的全部标签正则，启动时编译一次。
+//
+// 标签是固定的小集合，查表比 sync.Map 省一次接口断言——这条路径在
+// 每次解析响应时都会走到。漏了哪个标签会被 init 的断言挡住（见 tagRegexp）。
+var tagRegexps = map[string]*regexp.Regexp{
+	"TwfID":              tagPattern("TwfID"),
+	"Result":             tagPattern("Result"),
+	"NextAuth":           tagPattern("NextAuth"),
+	"NextService":        tagPattern("NextService"),
+	"NextServiceSubType": tagPattern("NextServiceSubType"),
+	"ErrorCode":          tagPattern("ErrorCode"),
+	"Message":            tagPattern("Message"),
+	"CSRF_RAND_CODE":     tagPattern("CSRF_RAND_CODE"),
+	"RSA_ENCRYPT_KEY":    tagPattern("RSA_ENCRYPT_KEY"),
+	"RSA_ENCRYPT_EXP":    tagPattern("RSA_ENCRYPT_EXP"),
+	"IS_IN_PERIOD":       tagPattern("IS_IN_PERIOD"),
+	"SmsSendInterval":    tagPattern("SmsSendInterval"),
+	"USER_PHONE":         tagPattern("USER_PHONE"),
+	"T_SMSINFOR":         tagPattern("T_SMSINFOR"),
+	"SMS_INTERVAL":       tagPattern("SMS_INTERVAL"),
+	"g_DisableTime":      tagPattern("g_DisableTime"),
+}
+
+// tagPattern 编译一个标签的取值正则。
+//
+// (?s) 让点号也匹配换行（服务端会在 CDATA 里放多行文本），
+// 非贪婪避免同一行出现两个同名标签时从第一个开标签吃到最后一个闭标签。
+func tagPattern(tag string) *regexp.Regexp {
+	quoted := regexp.QuoteMeta(tag)
+	return regexp.MustCompile("(?s)<" + quoted + ">(.*?)</" + quoted + ">")
+}
 
 func tagRegexp(tag string) *regexp.Regexp {
-	if v, ok := tagRegexps.Load(tag); ok {
-		return v.(*regexp.Regexp)
+	if re, ok := tagRegexps[tag]; ok {
+		return re
 	}
-	quoted := regexp.QuoteMeta(tag)
-	// (?s) 让点号也匹配换行：服务端会在 CDATA 里放多行文本，
-	// 不跨行匹配会取不到值，报成"缺少该标签"。
-	re := regexp.MustCompile("(?s)<" + quoted + ">(.*?)</" + quoted + ">")
-	actual, _ := tagRegexps.LoadOrStore(tag, re)
-	return actual.(*regexp.Regexp)
+	// 不在表里的标签：协议里不该出现，但解析器不能因此崩掉。
+	// 编译结果不进表（表是只读的），顺手记一条日志方便发现。
+	re := tagPattern(tag)
+	log.Printf("vpn: 未登记的标签 %q，已临时编译正则", tag)
+	return re
 }
 
 // tagValue 取出 <tag>...</tag> 的内容，标签不存在时 ok 为 false。

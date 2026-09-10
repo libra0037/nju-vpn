@@ -46,7 +46,7 @@ type DeviceOptions struct {
 // 反向则把隧道收到的包加密送回客户端。这里不创建 TUN 网卡：
 // 承载端是内存里的 Relay，客户端自带用户态网络栈。
 type Device struct {
-	dev   *device.Device
+	dev *device.Device
 
 	closeOnce sync.Once
 }
@@ -145,24 +145,60 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	return nil
 }
 
+// uapiConfig 是一次 IpcGet 的解析结果。
+//
+// 以前 ListenPort 与 Stats 各自把整份 UAPI 配置序列化并解析一遍，
+// 而且 Stats 用指向切片元素的指针，靠"同一 peer 的字段总在下一个 append
+// 之前写完"才成立——按索引写就没有这种隐式前提了。
+type deviceConfig struct {
+	listenPort int
+	peers      []PeerStats
+}
+
+// parseUAPI 解析 UAPI 的 key=value 文本。
+func parseUAPI(out string) deviceConfig {
+	var cfg deviceConfig
+	for _, line := range strings.Split(out, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "listen_port":
+			cfg.listenPort, _ = strconv.Atoi(strings.TrimSpace(value))
+		case "public_key":
+			cfg.peers = append(cfg.peers, PeerStats{PublicKey: value})
+		case "rx_bytes":
+			if i := len(cfg.peers) - 1; i >= 0 {
+				cfg.peers[i].RxBytes, _ = strconv.ParseInt(value, 10, 64)
+			}
+		case "tx_bytes":
+			if i := len(cfg.peers) - 1; i >= 0 {
+				cfg.peers[i].TxBytes, _ = strconv.ParseInt(value, 10, 64)
+			}
+		case "last_handshake_time_sec":
+			if i := len(cfg.peers) - 1; i >= 0 {
+				if sec, _ := strconv.ParseInt(value, 10, 64); sec > 0 {
+					cfg.peers[i].LastHandshake = time.Unix(sec, 0)
+				}
+			}
+		}
+	}
+	return cfg
+}
+
 // ListenPort 返回设备实际监听的 UDP 端口。
 //
 // 配置里写 0 时由系统分配，只有回读才知道真实端口，测试依赖这一点。
 func (d *Device) ListenPort() (int, error) {
-	out, err := d.dev.IpcGet()
+	cfg, err := d.config()
 	if err != nil {
 		return 0, err
 	}
-	for _, line := range strings.Split(out, "\n") {
-		if rest, ok := strings.CutPrefix(line, "listen_port="); ok {
-			port, err := strconv.Atoi(strings.TrimSpace(rest))
-			if err != nil {
-				return 0, fmt.Errorf("解析 listen_port: %w", err)
-			}
-			return port, nil
-		}
+	if cfg.listenPort == 0 {
+		return 0, fmt.Errorf("读取不到 listen_port")
 	}
-	return 0, fmt.Errorf("读取不到 listen_port")
+	return cfg.listenPort, nil
 }
 
 // PeerStats 是某个 peer 的流量统计。
@@ -181,42 +217,21 @@ type PeerStats struct {
 // 这是"隧道到底通没通"最直接的判据：Clash 一旦握手成功，
 // 这里就会有非零的收发与握手时间。
 func (d *Device) Stats() ([]PeerStats, error) {
-	out, err := d.dev.IpcGet()
+	cfg, err := d.config()
 	if err != nil {
 		return nil, err
 	}
-
-	var stats []PeerStats
-	var cur *PeerStats
-	for _, line := range strings.Split(out, "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		switch key {
-		case "public_key":
-			stats = append(stats, PeerStats{PublicKey: value})
-			cur = &stats[len(stats)-1]
-		case "rx_bytes":
-			if cur != nil {
-				cur.RxBytes, _ = strconv.ParseInt(value, 10, 64)
-			}
-		case "tx_bytes":
-			if cur != nil {
-				cur.TxBytes, _ = strconv.ParseInt(value, 10, 64)
-			}
-		case "last_handshake_time_sec":
-			if cur != nil {
-				sec, _ := strconv.ParseInt(value, 10, 64)
-				if sec > 0 {
-					cur.LastHandshake = time.Unix(sec, 0)
-				}
-			}
-		}
-	}
-	return stats, nil
+	return cfg.peers, nil
 }
 
+// config 读一次 UAPI 配置并解析。
+func (d *Device) config() (deviceConfig, error) {
+	out, err := d.dev.IpcGet()
+	if err != nil {
+		return deviceConfig{}, err
+	}
+	return parseUAPI(out), nil
+}
 
 // Close 停止设备。可安全重复调用。
 func (d *Device) Close() error {
