@@ -40,6 +40,7 @@ func usage() {
   %s auth <code>                  提交短信或 TOTP 验证码
   %s probe                        探测协议可用性
   %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
+  %s wg-stats                      查看 WireGuard 收发统计
   %s service install|uninstall    安装 / 卸载操作系统服务
   %s service start|stop|status    控制操作系统服务
 
@@ -50,7 +51,7 @@ func usage() {
 默认配置路径:
   Linux    /etc/njuvpn/config.yaml
   Windows  C:\ProgramData\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -75,6 +76,8 @@ func main() {
 		err = cmdAuth(args)
 	case "wg-peer":
 		err = cmdSetPeer(args)
+	case "wg-stats":
+		err = runCommand("wg-stats", args, ipc.Request{Command: ipc.CmdWGStats}, time.Minute)
 	case "probe":
 		err = cmdProbe(args)
 	case "service":

@@ -38,6 +38,7 @@ const (
 	cmdStop
 	cmdTunnelDown
 	cmdSetPeer
+	cmdWGStats
 )
 
 type command struct {
@@ -64,6 +65,7 @@ type Service struct {
 
 	mu       sync.Mutex
 	opCancel context.CancelFunc
+	// device 由 actor 协程写、Status 之外的只读查询读，用 s.mu 保护。
 
 	// 以下字段只在 actor 协程里访问，不需要加锁。
 	clientFactory func(cfg *config.Config) (*vpn.Client, error)
@@ -120,6 +122,17 @@ func (s *Service) SetPeer(publicKey string) error {
 	return s.call(&command{kind: cmdSetPeer, arg: publicKey})
 }
 
+// WireGuardStats 返回承载层的收发统计。
+//
+// 它不经过 actor：只读设备状态，与命令执行无关，用读锁保护字段快照即可。
+func (s *Service) WireGuardStats() ([]wireguard.PeerStats, error) {
+	dev := s.currentDevice()
+	if dev == nil {
+		return nil, ErrNotRunning
+	}
+	return dev.Stats()
+}
+
 // Stop 断开隧道并释放资源。
 func (s *Service) Stop() error {
 	return s.call(&command{kind: cmdStop})
@@ -159,6 +172,20 @@ func (s *Service) call(cmd *command) error {
 	case <-s.closed:
 		return ErrShuttingDown
 	}
+}
+
+// setDevice 记录承载设备。actor 协程与只读查询都会访问这个字段。
+func (s *Service) setDevice(dev *wireguard.Device) {
+	s.mu.Lock()
+	s.device = dev
+	s.mu.Unlock()
+}
+
+// currentDevice 返回当前承载设备，可能为 nil。
+func (s *Service) currentDevice() *wireguard.Device {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.device
 }
 
 // setOpCancel 记录当前操作的取消函数。
@@ -377,8 +404,8 @@ func (s *Service) setPeer(publicKey string) error {
 	}
 
 	applied := false
-	if s.device != nil {
-		if err := s.device.SetPeer(key, net.ParseIP(s.cfg.WireGuard.PeerAddress)); err != nil {
+	if dev := s.currentDevice(); dev != nil {
+		if err := dev.SetPeer(key, net.ParseIP(s.cfg.WireGuard.PeerAddress)); err != nil {
 			return err
 		}
 		applied = true
@@ -471,7 +498,7 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 	if err != nil {
 		return s.fail(fmt.Errorf("启动 WireGuard 承载: %w", err))
 	}
-	s.device = dev
+	s.setDevice(dev)
 
 	log.Printf("WireGuard 承载已启动: %s", s.bearerSummary(dev, peerKey))
 
@@ -619,9 +646,9 @@ func (s *Service) teardown(detail string) {
 		s.runCancel()
 		s.runCancel = nil
 	}
-	if s.device != nil {
-		s.device.Close()
-		s.device = nil
+	if dev := s.currentDevice(); dev != nil {
+		dev.Close()
+		s.setDevice(nil)
 	}
 	if s.session != nil {
 		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，

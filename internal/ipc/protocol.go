@@ -27,6 +27,8 @@ const (
 	CmdPing   = "ping"   // 探活
 	// CmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
 	CmdSetPeer = "wg-peer"
+	// CmdWGStats 查询 WireGuard 收发统计，用来判断客户端到底通没通。
+	CmdWGStats = "wg-stats"
 )
 
 // 响应状态码。

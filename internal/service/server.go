@@ -186,6 +186,26 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		}
 		return ipc.Response{Code: ipc.CodeOK, Message: "已更新 WireGuard 接入公钥"}
 
+	case ipc.CmdWGStats:
+		stats, err := s.svc.WireGuardStats()
+		if err != nil {
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
+		}
+		if len(stats) == 0 {
+			return ipc.Response{Code: ipc.CodeOK, Message: "承载层没有接入的 peer"}
+		}
+		parts := make([]string, 0, len(stats))
+		for _, st := range stats {
+			line := fmt.Sprintf("peer %s: 收 %d 字节 / 发 %d 字节", st.PublicKey, st.RxBytes, st.TxBytes)
+			if st.LastHandshake.IsZero() {
+				line += "，尚未握手"
+			} else {
+				line += fmt.Sprintf("，最近握手 %s", st.LastHandshake.Format("15:04:05"))
+			}
+			parts = append(parts, line)
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: strings.Join(parts, " | ")}
+
 	case ipc.CmdStop:
 		err := s.svc.Stop()
 		switch {

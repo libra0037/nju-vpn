@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -163,6 +164,58 @@ func (d *Device) ListenPort() (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("读取不到 listen_port")
+}
+
+// PeerStats 是某个 peer 的流量统计。
+type PeerStats struct {
+	// PublicKey 是 peer 的公钥（base64）。
+	PublicKey string
+	// RxBytes / TxBytes 是设备视角的收发字节数。
+	RxBytes int64
+	TxBytes int64
+	// LastHandshake 是最近一次握手的时间，零值表示从未握手。
+	LastHandshake time.Time
+}
+
+// Stats 返回所有 peer 的流量统计。
+//
+// 这是"隧道到底通没通"最直接的判据：Clash 一旦握手成功，
+// 这里就会有非零的收发与握手时间。
+func (d *Device) Stats() ([]PeerStats, error) {
+	out, err := d.dev.IpcGet()
+	if err != nil {
+		return nil, err
+	}
+
+	var stats []PeerStats
+	var cur *PeerStats
+	for _, line := range strings.Split(out, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "public_key":
+			stats = append(stats, PeerStats{PublicKey: value})
+			cur = &stats[len(stats)-1]
+		case "rx_bytes":
+			if cur != nil {
+				cur.RxBytes, _ = strconv.ParseInt(value, 10, 64)
+			}
+		case "tx_bytes":
+			if cur != nil {
+				cur.TxBytes, _ = strconv.ParseInt(value, 10, 64)
+			}
+		case "last_handshake_time_sec":
+			if cur != nil {
+				sec, _ := strconv.ParseInt(value, 10, 64)
+				if sec > 0 {
+					cur.LastHandshake = time.Unix(sec, 0)
+				}
+			}
+		}
+	}
+	return stats, nil
 }
 
 // PeerCount 返回设备上的 peer 数量，供状态检查使用。

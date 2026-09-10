@@ -280,6 +280,69 @@ wireguard-go 自带的绑定用的是 `":port"`（即 0.0.0.0:port），所以
 `bind_test.go` 里既有绑定层的用例，也有设备层的用例
 （`TestDeviceBindsOnlyLoopbackByDefault`），确保设备真的用了这个绑定。
 
+## 6.9 端到端打通（2026-09-10 晚，笔记本 + Clash Verge）
+
+**链路已被验证可用**：Clash Verge（mihomo v1.19.25）→ WireGuard 出站 →
+njuvpn 承载层（127.0.0.1:51820）→ 校园网隧道 → 校园网。
+
+验证方法（只读，不改配置）：用 mihomo 的 API 对该出站做延迟测试——
+它会让请求**真的穿过这条出站**，成功即证明整条链路成立：
+
+```
+GET /proxies/njuvpn-campus/delay?timeout=8000&url=https://www.nju.edu.cn
+  Authorization: Bearer <secret>
+
+njuvpn-campus → https://www.nju.edu.cn : 7ms
+njuvpn-campus → http://www.nju.edu.cn  : 3ms
+Private Server → https://www.nju.edu.cn : 33ms（对照，走上海代理）
+```
+
+3-7ms 与本机到服务端的往返一致，说明请求确实经过了隧道。
+
+### 部署位置：Windows，不是 WSL（重要）
+
+这台笔记本的 WSL 用 `networkingMode=VirtioProxy`（不是 mirrored），实测：
+
+| 方向 | 结果 |
+|---|---|
+| WSL → Windows `127.0.0.1`（TCP/UDP） | 通 |
+| Windows → WSL `127.0.0.1`（TCP） | 通 |
+| Windows → WSL `127.0.0.1`（**UDP**） | **不通** |
+| Windows → WSL 局域网地址（UDP） | 不通 |
+
+WireGuard 只能走 UDP，所以客户端在 Windows 时，服务进程也必须跑在
+Windows 上（Clash 与它同机走 loopback UDP）。宿主是 Win10，
+njuvpn.exe 直接运行即可，不需要管理员权限、不建网卡。
+
+WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能承载这条路。
+
+### 两个查错时踩过的坑（别再犯）
+
+1. **`Get-CimInstance Win32_Process` 的 Read/WriteTransferCount 不是网络流量**，
+   它是进程的文件 I/O 计数。用它判断"隧道有没有搬包"会得到完全错误的结论。
+   要判断承载层是否在工作，用 mihomo 的延迟测试，或给设备加统计。
+2. **不要用 grep Clash 的配置文件来判断节点是否存在**：Clash Verge 的运行配置
+   由 GUI 重新生成，位置和时机都不受我们控制。要查就查 mihomo 的 API
+   （`/proxies`），那才是运行时的事实。
+
+### 用户侧配置（Clash Verge，通过 profile 的 proxies 扩展文件）
+
+```yaml
+- name: njuvpn-campus
+  type: wireguard
+  server: 127.0.0.1
+  port: 51820
+  ip: 10.66.66.2
+  private-key: <客户端私钥>
+  public-key: <服务端公钥，njuvpn 启动日志里打印>
+  allowed-ips: ["0.0.0.0/0"]
+  udp: true
+  mtu: 1320
+```
+
+`allowed-ips` 必须是 0.0.0.0/0，否则默认路由不进隧道。
+`ip` 必须与服务端的 `peer_address` 一致。
+
 ## 7. 参考实现（协议对照）
 
 1. **sunnysab/smelly-connect**（Rust）— 含 `smelly-tls`，从零实现的 TLS 1.1 客户端。
@@ -290,7 +353,7 @@ wireguard-go 自带的绑定用的是 `":port"`（即 0.0.0.0:port），所以
 
 ## 8. 待办
 
-- [ ] 端到端联调：服务进程 `start` → `auth` → 状态 `up` → WireGuard 客户端接入
+- [x] 端到端联调：服务进程 start → auth → up → Clash Verge 接入（见 6.9 节）
 - [x] WireGuard 私钥首次启动自动生成并写回配置
 - [ ] 真机验证 `service install` 与 systemd 单元
 - [x] 配置文件权限检查（拒绝 group/other 可读）
