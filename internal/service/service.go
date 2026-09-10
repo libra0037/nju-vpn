@@ -272,12 +272,20 @@ func (s *Service) start(ctx context.Context) error {
 	}
 	s.client = client
 
+	trace := &vpn.Trace{}
 	sess, err := client.Connect(ctx, vpn.ConnectOptions{
 		Username:   s.cfg.Username,
 		Password:   s.cfg.Password,
 		TOTPSecret: s.cfg.TOTPSecret,
-		Trace:      &vpn.Trace{},
+		Trace:      trace,
 	})
+	// 失败时把各阶段打出来：否则远程排查只能看到最后一行错误，
+	// 分不清是登录、取 token、还是建隧道出的问题。
+	defer func() {
+		if err != nil || sess == nil {
+			logTrace(trace, err)
+		}
+	}()
 	// 失败时也可能已经拿到 TwfID：会话必须留下来，否则没法登出，
 	// 服务端就会一直挂着一个占名额的会话。
 	s.attach(sess)
@@ -303,14 +311,20 @@ func (s *Service) auth(ctx context.Context, code string) error {
 		return errors.New("验证码为空")
 	}
 
+	trace := &vpn.Trace{}
 	sess, err := s.client.Connect(ctx, vpn.ConnectOptions{
 		Username: s.cfg.Username,
 		Password: s.cfg.Password,
 		TwfID:    s.pendingAuth.TwfID,
 		Code:     code,
 		AuthKind: s.pendingAuth.Kind,
-		Trace:    &vpn.Trace{},
+		Trace:    trace,
 	})
+	defer func() {
+		if err != nil || sess == nil {
+			logTrace(trace, err)
+		}
+	}()
 	s.attach(sess)
 	if err != nil {
 		// 验证码本身错了不该把整个会话打回 idle：TwfID 还有效，
@@ -425,6 +439,22 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 	}
 	_ = s.status.set(StateError, detail)
 	return nil
+}
+
+// logTrace 把各阶段耗时与结果写进日志，供失败后定位。
+func logTrace(trace *vpn.Trace, err error) {
+	stages := trace.Stages()
+	if len(stages) == 0 {
+		return
+	}
+	log.Printf("连接阶段明细（最终错误: %v）:", err)
+	for _, s := range stages {
+		result := "OK"
+		if s.Err != nil {
+			result = s.Err.Error()
+		}
+		log.Printf("  %-20s %-10s %s", s.Name, s.Duration.Round(time.Millisecond), result)
+	}
 }
 
 // awaitAuth 切到等待验证码状态。
