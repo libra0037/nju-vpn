@@ -2,6 +2,9 @@
 
 NJU VPN 的重新实现。协议层从旧仓库 `NJUConnect`（只读参考）迁移而来。
 
+> 本仓库唯一的项目文档：架构、协议、实测结论与待办都在这里。
+> 逐条的代码审查清单与修复决策见 [REVIEW.md](REVIEW.md)。
+
 **当前状态：可用的。** 2026-09-10 实测完整协议流程通过，分配隧道地址成功。
 
     web-login        OK
@@ -9,6 +12,9 @@ NJU VPN 的重新实现。协议层从旧仓库 `NJUConnect`（只读参考）�
     query-ip         OK
     tunnel-handshake OK
     全部 4 个阶段通过，分配地址 172.29.56.18
+
+**当前部署**：服务进程跑在笔记本的 Windows 上，客户端（Clash Verge）经 WireGuard 接入，
+链路已端到端验证（见 6.9 节）。
 
 ## 1. 关键结论：直连可用，代理不可用
 
@@ -28,8 +34,7 @@ NJU VPN 的重新实现。协议层从旧仓库 `NJUConnect`（只读参考）�
 反过来，本项目在**学院楼有线**（官方客户端从未测过的环境）成功建立过隧道，
 因此「实现有问题」的可能性进一步降低。
 
-未做的对照：把本项目拿到**笔记本 + 宿舍无线/手机热点**（官方客户端的成功环境）
-跑一次。测试包在 `build_assets/njuvpn-laptop-test.tar.gz`，说明见包内 `说明.md`。
+那次对照后来做了：本项目现在就跑在笔记本上，并已端到端打通（见 6.9 节）。
 
 排查了整整一晚，根因不在协议实现，而在**出站路径**。
 
@@ -56,19 +61,14 @@ IPv4 `个人服务器`**，不存在轮换。
 密集重试后即使直连也会被拒，需等待若干分钟恢复。详见 2.0。
 排查期间观察到的成功/失败交替，是配额与路径两个因素叠加的结果。
 
-**该现象的解释（待最终确认）**：那台个人服务器上当时还跑着容器化的官方
-客户端，它占着一条隧道会话。服务端 `Is_enable_mult_client` 为 0，
-只允许同一账号一个客户端，且会话按源 IP 索引。于是：
+**当时对该现象的解释（未证实）**：那台个人服务器上跑着容器化的官方客户端，
+占着一条按源 IP 索引的隧道会话（`Is_enable_mult_client` 为 0，同一账号只允许一个客户端），
+于是经它连接会冲突。
 
-- 经该服务器连接 → 源 IP 与容器相同（`个人服务器`）→ 冲突，被拒；
-- 校园网直连 → 源 IP 是 `校园网内网段`，与容器不同 → 允许。
-
-这与 03:50 的对照完全吻合（同一 TWFID 同一分钟：直连 6/6 成功，
-经该代理 6/6 失败）。
-
-用户已于 04:11 关闭该容器。关闭后立即重测仍失败，因为账号此时已进入
-配额限制状态（见 2.0），需要等若干分钟才能区分。
-**待办**：冷却后经 `Private Server` 单次测试，若通过则假设成立。
+后来在那台服务器上实测官方客户端也能建立隧道，这个解释因此站不住脚。
+可以确定的只有协议层的硬约束：**登录与建隧道必须来自同一个源 IP**，
+这也正是「校园网内直连即可、不要走代理」的由来。代理路径当时 6/6 失败的确切原因
+没有再查清（当时账号已同时进入配额限制，两个因素叠加）。
 
 **所以：校园网内直连即可，不需要代理。**
 
@@ -105,26 +105,31 @@ IPv4 `个人服务器`**，不存在轮换。
     go run ./cmd/njuvpn status -config config.yaml
     go run ./cmd/njuvpn stop -config config.yaml
 
-    # 操作系统服务
-    sudo ./njuvpn service install -config /etc/njuvpn/config.yaml
-    sudo ./njuvpn service start
+    # 注：系统服务安装（service install/start）已决定移除，
+    # 改为 CLI 按需拉起 + njuvpn restart，见第 10 节。
+
+### 2.2 构建
+
+    go build -o njuvpn ./cmd/njuvpn                    # 本平台
+    GOOS=windows go build -o njuvpn.exe ./cmd/njuvpn  # 交叉编译给 Windows
 
 ## 3. 架构
 
-一个二进制，三个角色：服务进程、命令行客户端、系统服务管理。
+一个二进制，两个角色：服务进程、命令行客户端（现状另有 `service` 子命令用于安装系统服务，已决定移除，见第 10 节）。
 承载层用 WireGuard（wireguard-go）：服务进程不需要 root、不建 TUN 网卡，
 客户端（sing-box / Clash.Meta 等）用自带用户态网络栈接入。
 
     cmd/njuvpn/main.go        子命令分发与参数解析
     cmd/njuvpn/client.go      CLI 侧的 IPC 调用
-    internal/vpn/             协议层（login/tunnel/logout/probe/totp/endpoint/client）
+    internal/vpn/             协议层（portal 登录 / connect / tunnel / session / totp / parse / control）
     internal/dial/            出站拨号（直连/HTTP CONNECT/SOCKS5）
     internal/config/          配置读取与校验
     internal/ipc/             本地通信（unix socket / 命名管道）+ 行协议
     internal/wireguard/       tun.Device 实现与地址映射（SNAT/DNAT + 校验和增量修正）
-    internal/service/         状态机、隧道生命周期、IPC 服务端、系统服务安装
+    internal/service/         状态机、隧道生命周期、IPC 服务端（系统服务安装已决定删除，见第 10 节）
+    internal/vpntest/         测试替身（脚本化 portal + 内存隧道服务端）
 
-代码约 3300 行，`go build` / `go vet` / `go test` 全通过，Linux 与 Windows 交叉编译通过。
+代码约 6300 行（2026-09-10 实测 6274 行），另有约 3600 行测试；`go build` / `go vet` / `go test` 全通过，Linux 与 Windows 交叉编译通过。
 
 ## 4. 协议要点
 
@@ -142,6 +147,9 @@ IPv4 `个人服务器`**，不存在轮换。
   前端按钮的禁用倒计时」，**不是**「没重发」。`ErrorCode=1` + 带手机号即表示已发送。
 - **Go 的 nil 接口**：`QueryIp` 失败返回 nil 的 `*tls.UConn`，赋给 `net.Conn` 会得到
   非 nil 接口，`Close()` 会崩。已修，勿回退。
+- **服务端单客户端**：`Is_enable_mult_client` 为 0，同一账号同时只能有一个隧道会话，
+  且会话按源 IP 索引（登录与建隧道必须同源）。异常退出会留下占名额的会话 ——
+  这正是下面「退出时无条件登出」的由来。
 - **登出**：`GET /por/logout.csp` 需携带有效 TWFID。`Stop` 与 `fail` 都会先登出再释放资源。
   服务进程还会在**退出时无条件登出**（相当于 atexit）：`cmdRun` 里 `defer svc.Close()`，
   `RunServer` 捕获 SIGINT/SIGTERM 后停止接受连接让 `Serve` 返回。
@@ -251,6 +259,10 @@ Shutdown(8) 拒绝。现在 `attach` 与 `auth` 都会识别"同一个服务端�
   `udp2raw` 之类的工具把 UDP 映射到一条已打通的 TCP 通道上。
   目前实现里 `wireguard.listen_port` 只在本机监听，没有走代理。
 
+- **与旧实现的差异**：旧仓库（`NJUConnect`）自带 SOCKS5 服务与 gvisor 用户态
+  网络栈，本实现两者都不迁移 —— 承载改用 WireGuard，网络栈交给客户端（Clash / sing-box
+  自带），因此依赖里没有 gvisor。协议层（`internal/vpn`）从旧仓库迁移并重写。
+
 验证方式：`internal/wireguard/loopback_test.go` 用一台真实的 wireguard-go 设备
 （客户端）+ 内存 TUN 做回环，覆盖握手、加密、双向包转发、地址改写、
 未授权客户端被拒、Close 后停止转发。不需要网卡也不需要 root。
@@ -316,6 +328,9 @@ njuvpn.exe 直接运行即可，不需要管理员权限、不建网卡。
 
 WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能承载这条路。
 
+（这是这台笔记本 WSL 网络模式的限制，不是项目限制：**原生 Ubuntu 上服务进程就跑在本机，
+没有跨 WSL 边界的 UDP 问题**。Windows 与 Linux 都是目标平台，见第 10 节。）
+
 ### 两个查错时踩过的坑（别再犯）
 
 1. **`Get-CimInstance Win32_Process` 的 Read/WriteTransferCount 不是网络流量**，
@@ -353,11 +368,19 @@ WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能�
 
 ## 8. 待办
 
+进行中（方向见第 10 节）：
+
+- [ ] 按 REVIEW.md 逐条处理审查清单（A 组优先）
+- [ ] 实现第 10 节的进程模型：CLI 按需拉起 + `shutdown` / `restart`（替代 `service install`）
+- [ ] 在 Ubuntu 真机跑通（服务进程 + 客户端接入）
+- [ ] 开机自启：Windows 任务计划程序 / Linux systemd user unit
+
+已完成：
+
 - [x] 端到端联调：服务进程 start → auth → up → Clash Verge 接入（见 6.9 节）
 - [x] WireGuard 私钥首次启动自动生成并写回配置
-- [ ] 真机验证 `service install` 与 systemd 单元
-- [x] 配置文件权限检查（拒绝 group/other 可读）
 - [x] 协议层与服务层的健壮性重构（见第 9 节）
+- [x] 配置文件权限检查（改代码时按 G1 删除）
 
 ## 9. 重构后的结构
 
@@ -370,7 +393,7 @@ WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能�
 |---|---|
 | `internal/vpn` | 协议层。`Connect` 完成登录并返回 `*Session`；`Session` 持有 TwfID、query-ip 连接与两条数据流，`Run`/`RunWithRetry` 负责转发，`Close` 幂等收尾并登出 |
 | `internal/service` | actor 模型：所有改状态的操作经 `cmds` 通道串行执行，状态快照单独加锁、只读查询永不阻塞 |
-| `internal/ipc` | 行协议（有长度上限与读写超时）、端点权限校验、连接数上限 |
+| `internal/ipc` | 行协议（有长度上限与读写超时）。端点权限校验与连接数上限已决定删除（G2 / G4） |
 | `internal/wireguard` | `tun.Device` 实现：按 IPv4 总长度分帧，按需改写地址 |
 | `internal/vpntest` | 测试替身：脚本化 portal 与内存隧道服务端 |
 
@@ -385,3 +408,34 @@ WSL 侧仍可用于开发与跑测试（`go test./...` 全绿），只是不能�
 ### 回归测试
 
 `go test ./... -race` 不连任何真实服务端：假 portal 是注入的 `RoundTripper`，假隧道是注入的 `net.Pipe`，都在 `internal/vpntest` 里。覆盖的回归点：畸形响应不 panic、SessionId 过短不越界、复用会话时验证码确实提交、部分失败仍能登出、并发 Close 只登出一次、退避能响应 ctx 取消、流断开后另一条也收敛、Close 不被长 I/O 阻塞、panic 不带走进程、IPC 超长行与配置权限。
+
+## 10. 已决定的方向（2026-09-10，尚未实现）
+
+来源：REVIEW.md 的逐条审查与确认。**下面这些都没有落地，当前代码仍是旧形态。**
+
+### 平台
+
+Windows 与 Linux 都要能用 —— Linux 侧不是「只用来跑测试」，用 Ubuntu 做主力机的人应该能直接部署。
+
+### 进程模型：CLI 按需拉起，不再装系统服务
+
+- 删掉 `njuvpn service ...`、`internal/service/install.go`、`windowsProgram`、kardianos 依赖
+- `njuvpn start`：先探端点，连不上就 detached spawn `njuvpn run`，再轮询 `ping` 到就绪
+- 新增 IPC `shutdown`（收尾含登出后退出）与 CLI `njuvpn restart`（改配置、重置进程都靠它）
+- 开机自启按需另配：Windows 用任务计划程序「登录时启动」；Linux 手写 systemd user unit
+  （`~/.config/systemd/user/njuvpn.service`，要免登录也运行再加 `loginctl enable-linger`）
+- 理由：服务进程不需要任何特权（6.9 节实测，普通会话即可）。以 SCM 跑会落到 LocalSystem，
+  命名管道的 DACL 里不含交互用户，五个子命令在 connect 阶段全被拒（见 REVIEW.md 的 B3）
+
+### 路径
+
+- 配置文件：Windows 用 `%LOCALAPPDATA%` 下的 njuvpn 目录，Linux 用 `~/.config/njuvpn/config.yaml`
+  —— 原来的 `/etc/njuvpn/config.yaml` 与 ProgramData 都以特权运行为前提，随之作废
+- IPC 端点：Linux 用 `$XDG_RUNTIME_DIR/njuvpn.sock`（取不到时回落 `/tmp/njuvpn-<uid>.sock`），
+  Windows 命名管道不变
+
+### 安全取舍
+
+个人使用、单用户机器：只对「同机其他用户 / 同机敌意进程」成立的加固不做 ——
+配置文件权限校验（G1）、IPC 对端校验（G2）、argv 可见性（G3）、连接数上限（G4）。
+命名管道 DACL（G5）保留，只把注释改成「只让当前用户与管理员访问」。
