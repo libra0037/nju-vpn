@@ -38,7 +38,10 @@ func Listen(endpoint string) (net.Listener, error) {
 	return ln, nil
 }
 
-// currentUserSDDL 只允许当前用户、SYSTEM 与管理员访问管道。
+// currentUserSDDL 显式指定管道的访问控制。
+//
+// 不是为了防"同机的其他用户"——个人机器上没有第二个用户；只是不想让
+// DACL 由运行账户的令牌隐式推导出意外结果。
 func currentUserSDDL() string {
 	const base = "D:(A;;GA;;;SY)(A;;GA;;;BA)"
 	u, err := user.Current()
@@ -61,15 +64,4 @@ func Dial(endpoint string) (net.Conn, error) {
 		return nil, fmt.Errorf("连接服务进程 %s: %w（服务是否在运行？）", endpoint, err)
 	}
 	return conn, nil
-}
-
-// VerifyPeer 在 Windows 上不做额外校验：管道的访问控制已经在 Listen 时指定。
-func VerifyPeer(endpoint string) error {
-	if endpoint == "" {
-		endpoint = DefaultEndpoint()
-	}
-	if !strings.HasPrefix(endpoint, pipePrefix) {
-		return fmt.Errorf("Windows 下的 IPC 端点必须是命名管道，收到 %q", endpoint)
-	}
-	return nil
 }

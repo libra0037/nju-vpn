@@ -207,16 +207,30 @@ func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 	}
 }
 
-// Read 的缓冲区装不下包时必须报错，不能把超长包截断后当成功返回。
-func TestRelayReadDetectsOversizedPacket(t *testing.T) {
+// 回归：缓冲区装不下的包必须丢掉，绝不能返回错误。
+//
+// wireguard-go 的 TUN 读协程收到非 ErrClosed 的错误会直接 go device.Close()，
+// 一个超长包就能把整条承载层悄悄关掉（Windows 上缓冲区只有 2000 字节，
+// 而隧道侧允许更大的包）。丢包由上层重传兜住，报错则会把承载层带走。
+func TestRelayReadDropsOversizedPacket(t *testing.T) {
 	r, ep := newTestRelay(t)
 	peer := [4]byte{10, 66, 66, 2}
 	pub := [4]byte{172, 29, 56, 18}
+
+	// 先来一个装不下的，再来一个正常的：Read 必须跳过前者、交出后者。
 	ep.Deliver(ipv4Pkt(pub, peer, 900))
+	ep.Deliver(ipv4Pkt(pub, peer, 20))
 
 	bufs := [][]byte{make([]byte, 60)}
 	sizes := []int{0}
-	if _, err := r.Read(bufs, sizes, 0); err == nil {
-		t.Fatal("缓冲区装不下时必须返回错误")
+	n, err := r.Read(bufs, sizes, 0)
+	if err != nil {
+		t.Fatalf("装不下时应丢包而不是报错: %v", err)
+	}
+	if n != 1 || sizes[0] != 40 {
+		t.Fatalf("应交出后面那个 40 字节的包（20 头部 + 20 载荷），得到 n=%d size=%d", n, sizes[0])
+	}
+	if r.dropped.Load() == 0 {
+		t.Error("超长包应计入丢弃统计")
 	}
 }

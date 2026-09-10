@@ -110,18 +110,22 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-// 回归：配置文件里有账号口令，权限放开等于把凭据交给同机其他用户。
-func TestLoadRequiresRestrictedPermissions(t *testing.T) {
+// 回归：不再因为文件权限拒绝加载。
+//
+// 以前要求 0600，理由是"同机其他用户可以读到凭据"——但这是个人机器上的
+// 单用户工具，而服务进程以普通用户运行时，属主不同（例如 root 建的配置文件）
+// 会让它直接起不来。
+func TestLoadIgnoresFilePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 的权限模型不同")
 	}
 	path := writeConfig(t, validConfig, 0o644)
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("权限过宽时必须拒绝加载")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("不该因为权限过宽而拒绝加载: %v", err)
 	}
-	if !strings.Contains(err.Error(), "chmod 600") {
-		t.Errorf("错误信息应给出修复办法: %v", err)
+	if cfg.Username != "u" {
+		t.Errorf("配置没读全: %+v", cfg)
 	}
 }
 
@@ -138,10 +142,6 @@ func TestLoadForClientToleratesUnreadableConfig(t *testing.T) {
 		t.Errorf("空配置里不该有端点: %q", cfg.IPC.Endpoint)
 	}
 
-	path := writeConfig(t, validConfig, 0o644)
-	if _, err := LoadForClient(path); err == nil {
-		t.Error("权限问题应当报错，由调用方决定是否继续")
-	}
 }
 
 func TestLoadForClientReadsEndpoint(t *testing.T) {
@@ -153,5 +153,50 @@ func TestLoadForClientReadsEndpoint(t *testing.T) {
 	}
 	if got := cfg.IPC.Endpoint; got != "/tmp/custom.sock" {
 		t.Errorf("端点 = %q", got)
+	}
+}
+// 回归：默认路径以前是坏的——Windows 分支的反斜杠全丢，njuvpn 被吃成 juvpn，
+// 中间还夹了一个真实换行。参数化之后两个平台都能在这里断言。
+func TestDefaultPath(t *testing.T) {
+	cases := []struct {
+		name string
+		goos string
+		env  map[string]string
+		home string
+		want string
+	}{
+		{
+			"windows 用 LOCALAPPDATA", "windows",
+			map[string]string{"LOCALAPPDATA": `C:\Users\x\AppData\Local`},
+			`C:\Users\x`,
+			`C:\Users\x\AppData\Local\njuvpn\config.yaml`,
+		},
+		{
+			"windows 缺 LOCALAPPDATA 时退回用户目录", "windows", nil,
+			`C:\Users\x`,
+			`C:\Users\x\AppData\Local\njuvpn\config.yaml`,
+		},
+		{
+			"linux 用 XDG_CONFIG_HOME", "linux",
+			map[string]string{"XDG_CONFIG_HOME": "/home/x/.config"},
+			"/home/x",
+			"/home/x/.config/njuvpn/config.yaml",
+		},
+		{
+			"linux 默认 ~/.config", "linux", nil,
+			"/home/x",
+			"/home/x/.config/njuvpn/config.yaml",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := defaultPath(c.goos, func(k string) string { return c.env[k] }, c.home)
+			if got != c.want {
+				t.Errorf("defaultPath = %q，想要 %q", got, c.want)
+			}
+			if strings.ContainsAny(got, "\n\r") {
+				t.Errorf("路径里不能有换行: %q", got)
+			}
+		})
 	}
 }

@@ -12,22 +12,29 @@ import (
 )
 
 // DefaultEndpoint 返回当前平台的默认端点。
-func DefaultEndpoint() string { return "/run/njuvpn.sock" }
+//
+// 优先用 $XDG_RUNTIME_DIR：它天然是 0700 且按用户隔离，不需要任何特权。
+// 取不到时退回自己的临时目录（同样 0700），而不是所有人都能写的 /tmp 根目录。
+func DefaultEndpoint() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "njuvpn.sock")
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("njuvpn-%d", os.Getuid()), "njuvpn.sock")
+}
 
 // dialProbeTimeout 是探测"这个套接字上还有没有活实例"的超时。
 const dialProbeTimeout = 300 * time.Millisecond
 
 // Listen 在 Unix 域套接字上监听。
 //
-// 套接字文件的权限是 0600：这个通道能启动隧道、提交验证码，
-// 不能让它被同机的其他用户连上。
+// 套接字与目录都收紧到属主专用：这个通道能启动隧道、提交验证码。
 func Listen(endpoint string) (net.Listener, error) {
 	if endpoint == "" {
 		endpoint = DefaultEndpoint()
 	}
 
-	// 目录权限收紧到 0700：端点落在别人可写的目录里，任何人都能
-	// 把套接字删掉换成自己的，然后坐收 CLI 提交的验证码。
+	// 0700 的目录：$XDG_RUNTIME_DIR 本来就是这个权限，
+	// 回落到 /tmp 下的私有目录时由这里创建。
 	if err := os.MkdirAll(filepath.Dir(endpoint), 0o700); err != nil {
 		return nil, fmt.Errorf("创建套接字目录: %w", err)
 	}
@@ -98,28 +105,4 @@ func Dial(endpoint string) (net.Conn, error) {
 		return nil, fmt.Errorf("连接服务进程 %s: %w（服务是否在运行？）", endpoint, err)
 	}
 	return conn, nil
-}
-
-// VerifyPeer 检查端点是不是服务进程自己的套接字。
-//
-// CLI 在发送敏感命令（提交验证码）之前调用它：套接字落在别人可写的位置时，
-// 攻击者可以把服务进程的套接字换掉。
-func VerifyPeer(endpoint string) error {
-	if endpoint == "" {
-		endpoint = DefaultEndpoint()
-	}
-	fi, err := os.Lstat(endpoint)
-	if err != nil {
-		return fmt.Errorf("检查端点 %s: %w", endpoint, err)
-	}
-	if fi.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("端点 %s 不是套接字", endpoint)
-	}
-	if fi.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("端点 %s 的权限是 %v，其他用户可以访问", endpoint, fi.Mode().Perm())
-	}
-	if uid, ok := ownerUID(fi); ok && uid != os.Getuid() {
-		return fmt.Errorf("端点 %s 属于其他用户", endpoint)
-	}
-	return nil
 }

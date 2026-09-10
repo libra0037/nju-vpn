@@ -581,3 +581,25 @@ func TestSetPeerRejectsBadKey(t *testing.T) {
 		t.Error("空公钥应被拒绝")
 	}
 }
+
+// 回归：退出期间挤进 actor 的命令必须被拒绝。
+//
+// Close 已经走过登出，此时若还执行 start，就会新建一条没人管的会话，
+// 而服务端同一账号只允许一个客户端——下次启动会直接建不上隧道。
+func TestDispatchRejectsCommandAfterClose(t *testing.T) {
+	h := newHarness(t)
+	h.svc.Close()
+
+	// 模拟"关闭瞬间 actor 恰好取到了一条排队中的命令"。
+	cmd := &command{kind: cmdStart, reply: make(chan error, 1)}
+	h.svc.dispatch(cmd)
+
+	select {
+	case err := <-cmd.reply:
+		if !errors.Is(err, ErrShuttingDown) {
+			t.Errorf("关闭后的命令应被拒绝，得到 %v", err)
+		}
+	default:
+		t.Fatal("关闭后的命令没有收到回复")
+	}
+}

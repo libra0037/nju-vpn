@@ -194,17 +194,23 @@ func (r *Relay) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	default:
 	}
 
-	select {
-	case pkt := <-r.queue:
-		dst := bufs[0][offset:]
-		if len(pkt) > len(dst) {
-			r.countDrop()
-			return 0, fmt.Errorf("wireguard: 包长 %d 超过缓冲区 %d", len(pkt), len(dst))
+	for {
+		select {
+		case pkt := <-r.queue:
+			dst := bufs[0][offset:]
+			if len(pkt) > len(dst) {
+				// 装不下就丢掉这个包，绝不能返回错误：wireguard-go 的 TUN 读
+				// 协程收到非 ErrClosed 的错误会直接 go device.Close()，一个
+				// 超长包就能把整条承载层悄悄关掉（Windows 上缓冲区只有 2000
+				// 字节，而隧道侧允许更大的包）。丢包由上层重传兜住。
+				r.countDrop()
+				continue
+			}
+			sizes[0] = copy(dst, pkt)
+			return 1, nil
+		case <-r.closed:
+			return 0, ErrClosed
 		}
-		sizes[0] = copy(dst, pkt)
-		return 1, nil
-	case <-r.closed:
-		return 0, ErrClosed
 	}
 }
 

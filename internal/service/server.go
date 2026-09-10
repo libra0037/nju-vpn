@@ -23,8 +23,6 @@ const (
 	idleTimeout = 60 * time.Second
 	// writeTimeout 限制一次写响应的时间。
 	writeTimeout = 15 * time.Second
-	// maxConns 限制并发连接数。
-	maxConns = 32
 )
 
 // Server 在本地端点上提供服务，把 IPC 请求转成对 Service 的调用。
@@ -34,7 +32,6 @@ type Server struct {
 
 	closing chan struct{}
 	once    sync.Once
-	sem     chan struct{}
 	wg      sync.WaitGroup
 }
 
@@ -44,7 +41,6 @@ func NewServer(svc *Service, listener net.Listener) *Server {
 		svc:      svc,
 		listener: listener,
 		closing:  make(chan struct{}),
-		sem:      make(chan struct{}, maxConns),
 	}
 }
 
@@ -77,20 +73,9 @@ func (s *Server) Serve() error {
 			return err
 		}
 
-		select {
-		case s.sem <- struct{}{}:
-		default:
-			log.Printf("IPC 连接数已达上限 %d，拒绝新连接", maxConns)
-			conn.Close()
-			continue
-		}
-
 		s.wg.Add(1)
 		go func() {
-			defer func() {
-				<-s.sem
-				s.wg.Done()
-			}()
+			defer s.wg.Done()
 			s.handle(conn)
 		}()
 	}

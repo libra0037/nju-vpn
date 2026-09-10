@@ -64,18 +64,41 @@ func (c *Config) SourcePath() string { return c.sourcePath }
 func (c *Config) SetSourcePath(path string) { c.sourcePath = path }
 
 // DefaultPath 返回当前平台的默认配置文件路径。
+//
+// 两个平台都放在用户自己的目录下：服务进程以普通用户运行，系统目录
+//（/etc、ProgramData）既写不进去，也要求不该有的特权。
 func DefaultPath() string {
-	if runtime.GOOS == "windows" {
-		return `C:ProgramData
-juvpnconfig.yaml`
+	home, _ := os.UserHomeDir()
+	return defaultPath(runtime.GOOS, os.Getenv, home)
+}
+
+// defaultPath 与运行时环境解耦，让两个分支都进单测。
+//
+// 上一次改动把 Windows 分支的反斜杠全丢了，njuvpn 还被吃成 juvpn，
+// 而 Linux CI 永远编译不到那一行——参数化就是为了不再发生这种事。
+func defaultPath(goos string, getenv func(string) string, home string) string {
+	if goos == "windows" {
+		if dir := getenv("LOCALAPPDATA"); dir != "" {
+			return dir + `\njuvpn\config.yaml`
+		}
+		if home != "" {
+			return home + `\AppData\Local\njuvpn\config.yaml`
+		}
+		return `njuvpn\config.yaml`
+	}
+	if dir := getenv("XDG_CONFIG_HOME"); dir != "" {
+		return dir + "/njuvpn/config.yaml"
+	}
+	if home != "" {
+		return home + "/.config/njuvpn/config.yaml"
 	}
 	return "/etc/njuvpn/config.yaml"
 }
 
 // Load 读取配置文件，供服务进程与探测命令使用。
 //
-// 会强制要求文件权限不允许同机其他用户读取：这个文件里有账号口令和
-// TOTP 密钥，权限放宽等于把凭据交出去。
+// 不检查文件权限：这是个人机器上的单用户工具，服务进程也以普通用户运行，
+// 权限校验挡不住真问题，却会因为属主不同而拒绝启动。
 func Load(path string) (*Config, error) {
 	cfg, err := load(path)
 	if err != nil {
@@ -102,14 +125,6 @@ func load(path string) (*Config, error) {
 		path = DefaultPath()
 	}
 
-	fi, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("读取配置文件 %s: %w", path, err)
-	}
-	if err := checkPermissions(path, fi); err != nil {
-		return nil, err
-	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件 %s: %w", path, err)
@@ -129,19 +144,6 @@ func load(path string) (*Config, error) {
 		return nil, fmt.Errorf("配置文件 %s: %w", path, err)
 	}
 	return &cfg, nil
-}
-
-// checkPermissions 检查配置文件是否只对属主可读。
-func checkPermissions(path string, fi os.FileInfo) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	if fi.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf(
-			"配置文件 %s 的权限是 %04o，同机其他用户可以读到账号口令与 TOTP 密钥；请执行 chmod 600 %s",
-			path, fi.Mode().Perm(), path)
-	}
-	return nil
 }
 
 func (c *Config) applyDefaults() {

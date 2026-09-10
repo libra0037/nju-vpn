@@ -71,6 +71,28 @@ func (s *Session) track(conn net.Conn) {
 	s.mu.Unlock()
 }
 
+// untrack 摘掉运行期连接。
+//
+// RunWithRetry 每轮都会重新建两条流，不摘掉的话列表会随着重试一直涨。
+func (s *Session) untrack(conns ...net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.streams[:0]
+	for _, c := range s.streams {
+		drop := false
+		for _, d := range conns {
+			if c == d {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			kept = append(kept, c)
+		}
+	}
+	s.streams = kept
+}
+
 func (s *Session) setRunCancel(cancel context.CancelFunc) {
 	s.mu.Lock()
 	s.runCancel = cancel
@@ -120,6 +142,14 @@ func (s *Session) Run(ctx context.Context) error {
 		return &StreamError{Direction: "下行流建立", Err: err}
 	}
 	s.track(rx)
+
+	// 返回时必须把这两条流关掉：本函数的注释承诺"不留任何连接"，
+	// 而 RunWithRetry 每一轮都会调用它——漏一次就是一组连接堆到会话结束。
+	defer func() {
+		tx.Close()
+		rx.Close()
+		s.untrack(tx, rx)
+	}()
 
 	sink := newUplinkSink(tx)
 	s.ep.SetUplink(sink.Write)

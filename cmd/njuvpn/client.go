@@ -14,8 +14,8 @@ import (
 
 // clientConfig 是命令行客户端需要的配置：只有 IPC 端点。
 //
-// 客户端不读账号密码，那些只属于服务进程，所以配置文件读不到或
-// 权限过宽都不该让 CLI 失效——退回默认端点即可。
+// CLI 只使用端点字段（配置文件里虽然带着账号口令与 TOTP 密钥，但解析后
+// 不读它们），所以配置文件读不到时不该让 CLI 失效——退回默认端点即可。
 func clientConfig(configPath string) *config.Config {
 	cfg, err := config.LoadForClient(configPath)
 	if err == nil {

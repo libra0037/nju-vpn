@@ -239,6 +239,18 @@ func (s *Service) dispatch(cmd *command) {
 		}
 	}
 
+	// 退出期间不再执行新命令：Close 已经走过登出，此时再建隧道会留下
+	// 没人管的会话。cmdTunnelDown 例外——它是隧道协程的收尾报告，
+	// 丢掉它会让状态卡在 up。
+	if cmd.kind != cmdTunnelDown {
+		select {
+		case <-s.closed:
+			reply(ErrShuttingDown)
+			return
+		default:
+		}
+	}
+
 	defer func() {
 		s.setOpCancel(nil)
 		cancel()

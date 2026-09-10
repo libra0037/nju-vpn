@@ -139,6 +139,46 @@ func TestSessionRunClosesStreamsWhenRecvFails(t *testing.T) {
 	}
 }
 
+// 回归：Run 每一轮都会新建两条流，返回时必须关掉并摘出登记表。
+//
+// 以前三条返回路径都不关（注释却写着"不留任何连接"），RunWithRetry
+// 每轮泄漏一组连接，直到整个会话结束。
+func TestSessionRunReleasesStreamsOnReturn(t *testing.T) {
+	s := newScript(t)
+	sess := connectedSession(t, s)
+	closedBefore := s.tunnel.Stats().Closed
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sess.Run(ctx) }()
+	if err := s.tunnel.WaitRecvStream(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("ctx 取消后 Run 没有返回")
+	}
+
+	// 假服务端要收到两条流的关闭（等一小会儿让关闭传播过去）。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && s.tunnel.Stats().Closed < closedBefore+2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.tunnel.Stats().Closed; got < closedBefore+2 {
+		t.Errorf("Run 返回后只关掉了 %d 条流，应为 2 条", got-closedBefore)
+	}
+
+	sess.mu.Lock()
+	left := len(sess.streams)
+	sess.mu.Unlock()
+	if left != 0 {
+		t.Errorf("Run 返回后登记表里还剩 %d 条流", left)
+	}
+}
+
 // 终止性的控制码不该触发重试：反复重试会让账号进入被拒状态。
 func TestRunWithRetryStopsOnTerminalControlCode(t *testing.T) {
 	s := newScript(t)

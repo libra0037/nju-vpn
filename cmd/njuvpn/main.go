@@ -1,10 +1,10 @@
 // Command njuvpn 是 NJU VPN 的服务端与命令行客户端。
 //
-// 同一个二进制承担三种角色：
+// 同一个二进制承担两种角色：
 //
-//	njuvpn run                              以服务进程身份运行（由 systemd / SCM 拉起）
-//	njuvpn start|stop|status|auth           命令行客户端，通过 IPC 与服务进程通信
-//	njuvpn service install|uninstall|...    安装、卸载、控制操作系统服务
+//	njuvpn run                                    服务进程（一般由 start 自动拉起）
+//	njuvpn start|stop|status|auth|restart         命令行客户端，通过本地 IPC 与服务进程通信
+//	njuvpn probe                                  直接连服务端做协议探测，不经过服务进程
 package main
 
 import (
@@ -33,25 +33,24 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `%s - NJU VPN 服务端与命令行客户端
 
 用法:
-  %s run                          以服务进程身份运行
-  %s start                        建立隧道（可能需要 %s auth <code>）
+  %s run                          以服务进程身份运行（一般由 start 自动拉起）
+  %s start                        建立隧道（必要时自动拉起服务进程，可能要 %s auth <code>）
   %s stop                         断开隧道，服务进程继续运行
   %s status                       查看服务与隧道状态
   %s auth <code>                  提交短信或 TOTP 验证码
-  %s probe                        探测协议可用性
+  %s restart                      重启服务进程（改完配置后用它，不必手工杀进程）
+  %s probe                        探测协议可用性（直接连服务端，不经过服务进程）
   %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
   %s wg-stats                      查看 WireGuard 收发统计
-  %s service install|uninstall    安装 / 卸载操作系统服务
-  %s service start|stop|status    控制操作系统服务
 
 全局参数:
   -config <path>                  配置文件路径（默认见下）
   -proxy <url>                    覆盖配置文件里的出站代理（run / probe 可用）
 
 默认配置路径:
-  Linux    /etc/njuvpn/config.yaml
-  Windows  C:\ProgramData\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+  Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
+  Windows  %%LOCALAPPDATA%%\njuvpn\config.yaml
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -199,7 +198,9 @@ func cmdSetPeer(args []string) error {
 // cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。
 func cmdAuth(args []string) error {
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
+	// -config 仍要能解析（值由下面的 runCommand 自己再解析一遍用来定位端点），
+	// 这里只注册、不读。
+	_ = fs.String("config", "", "配置文件路径")
 	// 验证码通常写成 auth 123456，后面还可能跟 -config，
 	// 所以先把 flag 挑出来再解析，避免位置参数截断解析。
 	if err := fs.Parse(splitFlags(args)); err != nil {
@@ -212,12 +213,6 @@ func cmdAuth(args []string) error {
 		if code, err = promptCode(); err != nil {
 			return err
 		}
-	}
-
-	endpoint := endpointOf(clientConfig(*configPath))
-	// 提交验证码前确认连的是服务进程自己的套接字。
-	if err := ipc.VerifyPeer(endpoint); err != nil {
-		return err
 	}
 
 	return runCommand("auth", args, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 2*time.Minute)
@@ -385,6 +380,25 @@ func cmdProbe(args []string) error {
 	}
 
 	sess, err := client.Connect(ctx, opt)
+
+	// 会话从这一刻起归本函数所有：后面任何一条返回路径都要登出，
+	// 否则服务端那条"同一账号只允许一个客户端"的名额会被一直占着
+	//（以前就是在提示输入验证码那一步失败时直接 return，漏掉了登出）。
+	defer func() {
+		if sess == nil {
+			return
+		}
+		if *keep {
+			sess.CloseLocal()
+			return
+		}
+		if closeErr := sess.Close(context.Background()); closeErr != nil {
+			fmt.Printf("登出未成功: %v\n", closeErr)
+		} else {
+			fmt.Printf("已登出并释放服务端会话\n")
+		}
+	}()
+
 	// 服务端要求二次验证时，向终端索取验证码后在同一个会话里继续。
 	if authErr, ok := vpn.AsAuthRequired(err); ok && code == "" {
 		prompted, promptErr := askCode(authErr.Kind)
@@ -394,24 +408,21 @@ func cmdProbe(args []string) error {
 		opt.TwfID = authErr.TwfID
 		opt.Code = prompted
 		opt.AuthKind = authErr.Kind
+		prev := sess
 		sess, err = client.Connect(ctx, opt)
+		// 续用同一个 TwfID 时只能释放本地资源：对旧对象登出会把正在
+		// 续用的服务端会话一起杀掉。
+		if prev != nil && prev != sess {
+			if sess != nil && prev.TwfID() == sess.TwfID() {
+				prev.CloseLocal()
+			} else {
+				_ = prev.Close(context.Background())
+			}
+		}
 	}
 
 	printTrace(trace)
 
-	if sess != nil {
-		defer func() {
-			if *keep {
-				sess.CloseLocal()
-				return
-			}
-			if closeErr := sess.Close(context.Background()); closeErr != nil {
-				fmt.Printf("登出未成功: %v\n", closeErr)
-			} else {
-				fmt.Printf("已登出并释放服务端会话\n")
-			}
-		}()
-	}
 	if err != nil {
 		return err
 	}
