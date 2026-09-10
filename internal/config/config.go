@@ -60,6 +60,9 @@ const (
 // SourcePath 返回这份配置的来源文件路径。
 func (c *Config) SourcePath() string { return c.sourcePath }
 
+// SetSourcePath 记录配置来源，供按配置构造 Config 的调用方（与服务测试）使用。
+func (c *Config) SetSourcePath(path string) { c.sourcePath = path }
+
 // DefaultPath 返回当前平台的默认配置文件路径。
 func DefaultPath() string {
 	if runtime.GOOS == "windows" {
@@ -238,11 +241,19 @@ func validateHost(field, host string) error {
 }
 
 // PersistPrivateKey 把自动生成的 WireGuard 私钥写回配置文件。
-//
-// 就地替换 wireguard 段里的 private_key 行，保留原有的注释——用 YAML
-// 序列化整份配置会把注释全部丢掉，而那份文件是给人看的。
-// 找不到对应行时按情况插入或追加一段。
 func PersistPrivateKey(path, key string) error {
+	return persistWireGuardField(path, "private_key", key)
+}
+
+// PersistPeerPublicKey 把客户端公钥写回配置文件。
+func PersistPeerPublicKey(path, key string) error {
+	return persistWireGuardField(path, "peer_public_key", key)
+}
+
+// persistWireGuardField 就地替换 wireguard 段里的某个字段，保留原有注释——
+// 用 YAML 序列化整份配置会把注释全部丢掉，而那份文件是给人看的。
+// 找不到对应行时按情况插入或追加一段。
+func persistWireGuardField(path, field, value string) error {
 	if path == "" {
 		return fmt.Errorf("没有配置文件路径")
 	}
@@ -281,8 +292,8 @@ func PersistPrivateKey(path, key string) error {
 			continue
 		}
 		sectionEnd = i
-		if strings.HasPrefix(trimmed, "private_key:") {
-			lines[i] = line[:indent] + "private_key: " + key
+		if strings.HasPrefix(trimmed, field+":") {
+			lines[i] = line[:indent] + field + ": " + value
 			return writePreservingMode(path, fi, lines)
 		}
 	}
@@ -291,10 +302,10 @@ func PersistPrivateKey(path, key string) error {
 	case sectionAt >= 0:
 		// 有 wireguard 段但没有 private_key 行，插到段尾。
 		insertAt := sectionEnd + 1
-		lines = append(lines[:insertAt], append([]string{"  private_key: " + key}, lines[insertAt:]...)...)
+		lines = append(lines[:insertAt], append([]string{"  " + field + ": " + value}, lines[insertAt:]...)...)
 	default:
 		// 完全没有 wireguard 段，追加一段。
-		lines = append(lines, "wireguard:", "  private_key: "+key)
+		lines = append(lines, "wireguard:", "  "+field+": "+value)
 	}
 	return writePreservingMode(path, fi, lines)
 }

@@ -39,6 +39,7 @@ func usage() {
   %s status                       查看服务与隧道状态
   %s auth <code>                  提交短信或 TOTP 验证码
   %s probe                        探测协议可用性
+  %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
   %s service install|uninstall    安装 / 卸载操作系统服务
   %s service start|stop|status    控制操作系统服务
 
@@ -49,7 +50,7 @@ func usage() {
 默认配置路径:
   Linux    /etc/njuvpn/config.yaml
   Windows  C:\ProgramData\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -72,6 +73,8 @@ func main() {
 		err = cmdStatus(args)
 	case "auth":
 		err = cmdAuth(args)
+	case "wg-peer":
+		err = cmdSetPeer(args)
 	case "probe":
 		err = cmdProbe(args)
 	case "service":
@@ -177,6 +180,17 @@ func cmdStop(args []string) error {
 
 func cmdStatus(args []string) error {
 	return runCommand("status", args, ipc.Request{Command: ipc.CmdStatus}, 30*time.Second)
+}
+
+// cmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
+//
+//	njuvpn wg-peer <客户端公钥>
+func cmdSetPeer(args []string) error {
+	key := strings.TrimSpace(strings.Join(joinPositional(args), ""))
+	if key == "" {
+		return errors.New("用法: njuvpn wg-peer <客户端公钥>")
+	}
+	return runCommand("wg-peer", args, ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
 }
 
 // cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。

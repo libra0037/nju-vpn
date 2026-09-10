@@ -25,6 +25,8 @@ const (
 	CmdStatus = "status" // 查询状态
 	CmdAuth   = "auth"   // 提交验证码
 	CmdPing   = "ping"   // 探活
+	// CmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
+	CmdSetPeer = "wg-peer"
 )
 
 // 响应状态码。

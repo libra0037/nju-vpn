@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -499,5 +502,82 @@ func TestTeardownToleratesMissingServerSession(t *testing.T) {
 	}
 	if st := h.svc.Status().State; st != StateIdle {
 		t.Errorf("状态应为 idle，实际 %s", st)
+	}
+}
+
+// 回归：peer 更新必须能写回配置文件，且不需要重建隧道。
+func TestSetPeerPersistsAndApplies(t *testing.T) {
+	h := newHarness(t)
+	h.svc.cfg.SetSourcePath(filepath.Join(t.TempDir(), "config.yaml"))
+	// 先写出一份能被解析的配置文件。
+	if err := os.WriteFile(h.svc.cfg.SourcePath(), []byte(
+		"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  listen_port: 51820\n  peer_public_key: \"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.cfg.WireGuard.PeerPublicKey = ""
+
+	peerPriv, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPub, err := peerPriv.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 隧道没建立时也要接受：只写回配置。
+	if err := h.svc.SetPeer(peerPub.String()); err != nil {
+		t.Fatalf("设置 peer 失败: %v", err)
+	}
+	if got := h.svc.cfg.WireGuard.PeerPublicKey; got != peerPub.String() {
+		t.Errorf("内存里的配置没更新: %q", got)
+	}
+
+	raw, err := os.ReadFile(h.svc.cfg.SourcePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "peer_public_key: "+peerPub.String()) {
+		t.Errorf("配置文件没写回:\n%s", raw)
+	}
+
+	// 隧道建立后，更新应当立刻作用到设备上，且 peer 数量仍为 1。
+	if err := h.svc.Start(); err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	second, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPub, err := second.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.SetPeer(secondPub.String()); err != nil {
+		t.Fatalf("热更新 peer 失败: %v", err)
+	}
+	n, err := h.svc.device.PeerCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("peer 数量 = %d，期望 1（replace_peers 应清掉旧的）", n)
+	}
+	// 隧道本身不该被影响。
+	if st := h.svc.Status().State; st != StateUp {
+		t.Errorf("更新 peer 后状态变成了 %s", st)
+	}
+}
+
+// 非法公钥必须被拒绝，且不能动已有配置。
+func TestSetPeerRejectsBadKey(t *testing.T) {
+	h := newHarness(t)
+	if err := h.svc.SetPeer("not-a-key"); err == nil {
+		t.Error("非法公钥应被拒绝")
+	}
+	if err := h.svc.SetPeer(""); err == nil {
+		t.Error("空公钥应被拒绝")
 	}
 }

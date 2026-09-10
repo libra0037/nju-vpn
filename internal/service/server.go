@@ -176,6 +176,16 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
 		}
 
+	case ipc.CmdSetPeer:
+		if len(req.Args) == 0 {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: "用法: wg-peer <客户端公钥>"}
+		}
+		key := strings.TrimSpace(strings.Join(req.Args, ""))
+		if err := s.svc.SetPeer(key); err != nil {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: "已更新 WireGuard 接入公钥"}
+
 	case ipc.CmdStop:
 		err := s.svc.Stop()
 		switch {

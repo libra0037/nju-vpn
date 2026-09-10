@@ -125,6 +125,26 @@ func uapiConfig(opts DeviceOptions) (string, error) {
 	return b.String(), nil
 }
 
+// SetPeer 在不重启设备的前提下替换 peer。
+//
+// 重新生成客户端密钥时不必重建隧道：隧道登录与 WireGuard 设备是两件
+// 独立的事，后者可以就地更新。这一点很实用——重建隧道要重新登录一次。
+func (d *Device) SetPeer(pub Key, addr net.IP) error {
+	if pub.IsZero() {
+		return fmt.Errorf("peer 公钥为空")
+	}
+	if addr == nil || addr.To4() == nil {
+		return fmt.Errorf("peer 地址必须是 IPv4: %v", addr)
+	}
+	conf := "replace_peers=true\n" +
+		"public_key=" + hex.EncodeToString(pub[:]) + "\n" +
+		"allowed_ip=" + addr.To4().String() + "/32\n"
+	if err := d.dev.IpcSet(conf); err != nil {
+		return fmt.Errorf("更新 peer: %w", err)
+	}
+	return nil
+}
+
 // ListenPort 返回设备实际监听的 UDP 端口。
 //
 // 配置里写 0 时由系统分配，只有回读才知道真实端口，测试依赖这一点。

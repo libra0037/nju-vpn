@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,11 +37,12 @@ const (
 	cmdAuth
 	cmdStop
 	cmdTunnelDown
+	cmdSetPeer
 )
 
 type command struct {
 	kind  commandKind
-	code  string
+	arg   string
 	gen   uint64
 	err   error
 	reply chan error
@@ -107,7 +109,15 @@ func (s *Service) Start() error {
 
 // Auth 提交二次验证码。仅在 auth_pending 状态下有效。
 func (s *Service) Auth(code string) error {
-	return s.call(&command{kind: cmdAuth, code: code})
+	return s.call(&command{kind: cmdAuth, arg: code})
+}
+
+// SetPeer 更新 WireGuard 接入方的公钥，并写回配置文件。
+//
+// 不需要重建隧道：校园网隧道与 WireGuard 设备各自独立。这样更换客户端
+// 密钥（例如重新生成 Clash 配置）不必再登录一次、再花一条短信。
+func (s *Service) SetPeer(publicKey string) error {
+	return s.call(&command{kind: cmdSetPeer, arg: publicKey})
 }
 
 // Stop 断开隧道并释放资源。
@@ -220,11 +230,13 @@ func (s *Service) dispatch(cmd *command) {
 	case cmdStart:
 		err = s.start(ctx)
 	case cmdAuth:
-		err = s.auth(ctx, cmd.code)
+		err = s.auth(ctx, cmd.arg)
 	case cmdStop:
 		err = s.stop()
 	case cmdTunnelDown:
 		err = s.tunnelDown(cmd.gen, cmd.err)
+	case cmdSetPeer:
+		err = s.setPeer(cmd.arg)
 	default:
 		err = fmt.Errorf("未知命令 %d", cmd.kind)
 	}
@@ -353,6 +365,38 @@ func (s *Service) auth(ctx context.Context, code string) error {
 
 	s.pendingAuth = nil
 	return s.finishConnect(sess)
+}
+
+// setPeer 更新 WireGuard 接入方的公钥。
+//
+// 即使隧道没建立也接受：配置写回后，下次 start 就会生效。
+func (s *Service) setPeer(publicKey string) error {
+	key, err := wireguard.ParseKey(strings.TrimSpace(publicKey))
+	if err != nil {
+		return fmt.Errorf("peer 公钥: %w", err)
+	}
+
+	applied := false
+	if s.device != nil {
+		if err := s.device.SetPeer(key, net.ParseIP(s.cfg.WireGuard.PeerAddress)); err != nil {
+			return err
+		}
+		applied = true
+	}
+
+	if path := s.cfg.SourcePath(); path != "" {
+		if err := config.PersistPeerPublicKey(path, key.String()); err != nil {
+			return fmt.Errorf("写回配置文件失败: %w", err)
+		}
+	}
+	s.cfg.WireGuard.PeerPublicKey = key.String()
+
+	if applied {
+		log.Printf("已更新 WireGuard peer: %s（隧道未重建）", key.String())
+	} else {
+		log.Printf("已记录 WireGuard peer: %s，将在下次建立隧道时生效", key.String())
+	}
+	return nil
 }
 
 // stop 断开隧道。
