@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -145,6 +146,17 @@ func (s *Service) Stop() error {
 	return s.state.Transition(StateIdle, "已断开")
 }
 
+// Close 无条件释放资源并通知服务端注销会话，可安全重复调用。
+//
+// 与 Stop 的区别是不判断状态、不返回错误：进程退出路径必须执行它。
+// 服务端同一账号只允许一个客户端（登录响应里 Is_enable_mult_client 为 0），
+// 残留会话会导致后续建隧道被拒，因此退出时宁可多登出一次。
+func (s *Service) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.release()
+}
+
 // release 关闭所有底层资源。调用方需持有 s.mu。
 func (s *Service) release() {
 	s.logoutLocked()
@@ -218,7 +230,19 @@ func (s *Service) finishConnect(res *vpn.ProbeResult) error {
 
 	// 隧道启动放在后台：StartProtocol 会一直阻塞在收发循环里。
 	client := s.client
-	go client.StartProtocol(s.endpoint, token, ipRev, false)
+	endpoint := s.endpoint
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 协程里的 panic 不会触发 cmdRun 的 defer，必须在这里登出，
+				// 否则服务端会留下占用名额的会话。
+				log.Printf("隧道收发协程异常终止: %v", r)
+				s.Close()
+				os.Exit(1)
+			}
+		}()
+		client.StartProtocol(endpoint, token, ipRev, false)
+	}()
 
 	s.state.SetAddresses(res.ClientIP, s.cfg.WireGuard.PeerAddress)
 	if err := s.state.Transition(StateUp, "隧道已建立"); err != nil {

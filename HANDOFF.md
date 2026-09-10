@@ -143,6 +143,11 @@ IPv4 `个人服务器`**，不存在轮换。
 - **Go 的 nil 接口**：`QueryIp` 失败返回 nil 的 `*tls.UConn`，赋给 `net.Conn` 会得到
   非 nil 接口，`Close()` 会崩。已修，勿回退。
 - **登出**：`GET /por/logout.csp` 需携带有效 TWFID。`Stop` 与 `fail` 都会先登出再释放资源。
+  服务进程还会在**退出时无条件登出**（相当于 atexit）：`cmdRun` 里 `defer svc.Close()`，
+  `RunServer` 捕获 SIGINT/SIGTERM 后停止接受连接让 `Serve` 返回。
+  隧道收发协程若 panic（`StartProtocol` 失败 5 次的旧行为），
+  也会先登出再 `os.Exit(1)`——协程 panic 不会触发主协程的 defer。
+  登出请求带 10 秒超时，避免网络不通时卡住进程退出。
 - **服务端并发限制**：同一 TWFID 短时间反复建连会被拒，重试越密越失败。probe 只保留 3 次 × 30 秒退避。
 - **日志**：不得打印密码、密文、TWFID 明文（已有 `redact`，勿回退）。
 

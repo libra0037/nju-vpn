@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"njuvpn/internal/ipc"
 )
@@ -17,12 +20,32 @@ type Server struct {
 	svc      *Service
 	listener net.Listener
 
-	wg sync.WaitGroup
+	closing chan struct{}
+	once    sync.Once
 }
 
 // NewServer 构造服务端。
 func NewServer(svc *Service, listener net.Listener) *Server {
-	return &Server{svc: svc, listener: listener}
+	return &Server{svc: svc, listener: listener, closing: make(chan struct{})}
+}
+
+// Shutdown 停止接受新连接。处理中的连接会自然结束，不在退出路径上等待，
+// 以免被 probe 的长时间重试拖住进程退出。
+func (s *Server) Shutdown() {
+	s.once.Do(func() {
+		close(s.closing)
+		s.listener.Close()
+	})
+}
+
+// isClosing 报告服务是否正在关闭。
+func (s *Server) isClosing() bool {
+	select {
+	case <-s.closing:
+		return true
+	default:
+		return false
+	}
 }
 
 // Serve 开始接受连接，直到 listener 被关闭。
@@ -35,18 +58,8 @@ func (s *Server) Serve() error {
 			}
 			return err
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.handle(conn)
-		}()
+		go s.handle(conn)
 	}
-}
-
-// Shutdown 停止接受新连接并等待处理中的连接结束。
-func (s *Server) Shutdown() {
-	s.listener.Close()
-	s.wg.Wait()
 }
 
 func (s *Server) handle(conn net.Conn) {
@@ -54,6 +67,10 @@ func (s *Server) handle(conn net.Conn) {
 
 	reader := bufio.NewReader(conn)
 	for {
+		// 退出过程中不再接受新请求，避免刚登出又被叫起来建隧道。
+		if s.isClosing() {
+			return
+		}
 		req, err := ipc.ReadRequest(reader)
 		if err != nil {
 			return
@@ -133,5 +150,21 @@ func RunServer(svc *Service, endpoint string) error {
 		return err
 	}
 	log.Printf("服务已启动，监听 %s", endpoint)
-	return NewServer(svc, ln).Serve()
+
+	srv := NewServer(svc, ln)
+
+	// 收到退出信号时停止接受连接，让 Serve 返回；
+	// 调用方随后通过 defer 执行登出，释放服务端会话。
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-signals
+		log.Printf("收到信号 %v，准备退出", sig)
+		srv.Shutdown()
+	}()
+	defer signal.Stop(signals)
+
+	err = srv.Serve()
+	srv.Shutdown()
+	return err
 }

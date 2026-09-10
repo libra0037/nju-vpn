@@ -108,7 +108,12 @@ func cmdRun(args []string) error {
 		log.Printf("出站路径: %s", cfg.Proxy)
 	}
 
-	return service.RunServer(service.New(cfg), cfg.IPC.Endpoint)
+	svc := service.New(cfg)
+	// 退出路径上无条件登出：服务端同一账号只允许一个客户端，
+	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
+	defer svc.Close()
+
+	return service.RunServer(svc, cfg.IPC.Endpoint)
 }
 
 func cmdStart(args []string) error {

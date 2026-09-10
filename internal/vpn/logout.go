@@ -1,13 +1,19 @@
 package vpn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"regexp"
+	"time"
 )
+
+// logoutTimeout 限制登出请求的总时长。
+// 登出会出现在进程退出路径上，网络不通时不能把进程卡住。
+const logoutTimeout = 10 * time.Second
 
 // 登出相关的状态。
 var (
@@ -30,7 +36,10 @@ func (client *Client) Logout(twfId string) error {
 	c := client.httpClient()
 	addr := "https://" + client.server + "/por/logout.csp"
 
-	req, err := http.NewRequest("GET", addr, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), logoutTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", addr, nil)
 	if err != nil {
 		return err
 	}
