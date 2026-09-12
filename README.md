@@ -116,6 +116,9 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
+接口上只留这一个地址：多写一个（例如并存两个实例时）内核会拿另一个当源地址，
+包在 WireGuard 层被静默丢弃，表现得像隧道没通。
+
 ```
 sudo wg-quick up njuvpn     # 起隧道
 sudo wg-quick down njuvpn   # 收工
