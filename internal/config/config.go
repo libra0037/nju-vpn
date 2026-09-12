@@ -19,6 +19,8 @@ import (
 type Config struct {
 	// sourcePath 是这份配置的来源文件，用于把生成的内容写回原文件。
 	sourcePath string
+	// permNote 记录加载时对文件权限做了什么，由 Warnings 报给用户。
+	permNote string
 
 	Server string `yaml:"server"`
 	// ServerIP 可选：服务端域名在本机解析不了时，直接连这个地址，
@@ -99,14 +101,43 @@ func defaultPath(goos string, getenv func(string) string, home string) string {
 
 // Load 读取配置文件，供服务进程与探测命令使用。
 //
-// 不检查文件权限：这是个人机器上的单用户工具，服务进程也以普通用户运行，
-// 权限校验挡不住真问题，却会因为属主不同而拒绝启动。
+// 不因为权限拒绝加载（属主可能是别人），但会把过宽的文件权限收紧到 0600：
+// 这是个人机器上的单用户工具，权限不构成隔离边界，凭据也不该默认摊开。
 func Load(path string) (*Config, error) {
 	cfg, err := load(path)
 	if err != nil {
 		return nil, err
 	}
+	cfg.permNote = restrictPermissions(cfg.SourcePath())
 	return cfg, nil
+}
+
+// restrictPermissions 把配置文件的权限收紧到 0600，返回要提示用户的话。
+//
+// 配置里有校园网口令、TOTP 密钥与 WireGuard 私钥，0644 会让它们顺手进备份、
+// 进打包给别人排查的压缩包、进镜像快照。这不是隔离边界（挡不住 root，
+// 也挡不住同账户的进程），只是别让它默认摊开。
+//
+// 收紧失败不阻塞启动：文件属主可能是别人（例如 root 建的配置），
+// 能读到就够了。
+func restrictPermissions(path string) string {
+	if runtime.GOOS == "windows" || path == "" {
+		// Windows 的权限模型是 ACL，另一套动作；那里的默认位置
+		//（%LOCALAPPDATA%）本来就只对本人可见。
+		return ""
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o077 == 0 {
+		return ""
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Sprintf("配置文件 %s 的权限是 %04o（同机其他用户可读），且无法收紧: %v", path, perm, err)
+	}
+	return fmt.Sprintf("配置文件 %s 的权限是 %04o，已收紧为 0600", path, perm)
 }
 
 // LoadForClient 读取命令行客户端需要的部分（只有 IPC 端点）。
@@ -256,6 +287,9 @@ func RedactProxy(proxy string) string {
 
 func (c *Config) Warnings() []string {
 	var out []string
+	if c.permNote != "" {
+		out = append(out, c.permNote)
+	}
 	if c.WireGuard.PeerPublicKey == "" {
 		out = append(out, "未配置 wireguard.peer_public_key，任何客户端都无法接入")
 	}

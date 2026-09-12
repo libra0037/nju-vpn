@@ -138,9 +138,9 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 
 // 回归：不再因为文件权限拒绝加载。
 //
-// 以前要求 0600，理由是"同机其他用户可以读到凭据"——但这是个人机器上的
-// 单用户工具，而服务进程以普通用户运行时，属主不同（例如 root 建的配置文件）
-// 会让它直接起不来。
+// 以前是直接拒绝，理由是"同机其他用户可以读到凭据"——但服务进程以普通用户
+// 运行时，属主不同（例如 root 建的配置文件）会让它直接起不来。现在改成
+// 收紧权限并提示（见 TestLoadRestrictsFilePermissions），不拒绝启动。
 func TestLoadIgnoresFilePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 的权限模型不同")
@@ -152,6 +152,55 @@ func TestLoadIgnoresFilePermissions(t *testing.T) {
 	}
 	if cfg.Username != "u" {
 		t.Errorf("配置没读全: %+v", cfg)
+	}
+}
+
+// 回归（REVIEW C1）：过宽的权限在加载时被收紧到 0600。
+//
+// 配置里有校园网口令、TOTP 密钥与 WireGuard 私钥。按文档"复制一份填写"
+// 出来的文件是 0644；备份、打包给别人排查、镜像快照都会把它们一起带走。
+func TestLoadRestrictsFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 的权限模型不同")
+	}
+	path := writeConfig(t, validConfig, 0o644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("不该因为权限过宽而拒绝加载: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("权限应被收紧为 0600，实际 %04o", perm)
+	}
+	if warnings := strings.Join(cfg.Warnings(), "；"); !strings.Contains(warnings, "已收紧") {
+		t.Fatalf("应当提示权限被收紧，实际 %v", cfg.Warnings())
+	}
+}
+
+// 已经是 0600 的文件不该被碰，也不该有提示。
+func TestLoadLeavesPrivatePermissionsAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 的权限模型不同")
+	}
+	path := writeConfig(t, validConfig, 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("权限被改动了: %04o", perm)
+	}
+	for _, w := range cfg.Warnings() {
+		if strings.Contains(w, "权限") {
+			t.Fatalf("0600 的文件不该有权限提示: %q", w)
+		}
 	}
 }
 

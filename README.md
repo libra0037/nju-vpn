@@ -52,6 +52,9 @@ njuvpn probe            直接连服务端做协议探测（不经过服务进�
 | Linux | `~/.config/njuvpn/config.yaml` |
 | Windows | `%LOCALAPPDATA%\njuvpn\config.yaml` |
 
+配置文件里有账号口令、TOTP 密钥与 WireGuard 私钥；服务进程启动时会把它收紧到
+`0600`（仅属主可读写），复制出来的 0644 文件不会一直摊着。
+
 首次启动会自动生成 WireGuard 私钥并写回配置文件，启动日志里打印服务端公钥。
 
 `njuvpn start` 是唯一的交互入口：配置里没写 `password` 时先问口令（不回显），
