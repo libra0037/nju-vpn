@@ -322,3 +322,127 @@ func dropStats(r *Relay) map[string]uint64 {
 	}
 	return out
 }
+
+// hasDrop 判断某种原因的丢包计到了没有。
+func hasDrop(r *Relay, text string) bool {
+	for reason := dropReason(0); reason < dropReasonCount; reason++ {
+		if dropReasonText[reason] == text && r.drops[reason].n.Load() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// waitDrop 等某种原因的丢包计数涨上来。
+//
+// Read 由另一个协程在跑（见 startRead），它把包从队列里取走、丢掉、计数
+// 需要一点时间：计数没出现之前不能断言"包没被交出去"。
+func waitDrop(t *testing.T, r *Relay, reason dropReason) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !hasDrop(r, dropReasonText[reason]) {
+		if time.Now().After(deadline) {
+			t.Fatalf("等不到「%s」的丢包计数", dropReasonText[reason])
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// readResult 是一次 Read 的结果。
+type readResult struct {
+	n    int
+	size int
+	err  error
+}
+
+// startRead 在后台跑一次 Read，结果从返回的通道里取。
+func startRead(r *Relay, size int) <-chan readResult {
+	bufs := [][]byte{make([]byte, size)}
+	sizes := []int{0}
+	out := make(chan readResult, 1)
+	go func() {
+		n, err := r.Read(bufs, sizes, 0)
+		out <- readResult{n: n, size: sizes[0], err: err}
+	}()
+	return out
+}
+
+// 回归（真机：校外服务器 + 内核 WireGuard 实测）：隧道建好、客户端还没接
+// 进来时，校园网网关仍会往分配到的地址发包。这些包以前会被交给
+// wireguard-go，而它并不知道客户端在哪儿，于是每 5 秒往日志里写一行
+// "Failed to send handshake initiation: no known endpoint for peer"。
+func TestRelayDropsDownlinkUntilPeerSeen(t *testing.T) {
+	r, ep := newTestRelay(t)
+	r.HoldDownlink(true)
+	peer := [4]byte{10, 66, 66, 2}
+	pub := [4]byte{172, 29, 32, 92}
+
+	// 客户端还没露面：这一包必须被丢掉，不能交给 wireguard-go。
+	ep.Deliver(ipv4Pkt(pub, peer, 20))
+	got := startRead(r, 1500)
+	waitDrop(t, r, dropPeerNotReady)
+	select {
+	case res := <-got:
+		t.Fatalf("客户端还没接进来，下行包不该被交出：n=%d size=%d err=%v", res.n, res.size, res.err)
+	default:
+	}
+
+	// 客户端发来一个数据包：说明它已经握手、设备也记住了它的地址。
+	if _, err := r.Write([][]byte{ipv4Pkt(peer, pub, 8)}, 0); err != nil {
+		t.Fatalf("上行写入失败: %v", err)
+	}
+
+	// 之后的下行包照常交出：队列里被扣下的那个不该漏出来。
+	want := ipv4Pkt(pub, peer, 300)
+	ep.Deliver(want)
+	select {
+	case res := <-got:
+		if res.err != nil || res.n != 1 {
+			t.Fatalf("客户端接进来之后，下行包应当照常交出：n=%d err=%v", res.n, res.err)
+		}
+		if res.size != len(want) {
+			t.Fatalf("交出的包长 %d，期望 %d", res.size, len(want))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待下行包超时")
+	}
+}
+
+// 换 key（又调一次 HoldDownlink(true)）之后下行重新关上：客户端必须重新
+// 握手；摘掉 peer（HoldDownlink(false)）之后不再扣，交给 WireGuard。
+func TestRelayHoldDownlinkResetsOnNewPeer(t *testing.T) {
+	r, ep := newTestRelay(t)
+	peer := [4]byte{10, 66, 66, 2}
+	pub := [4]byte{172, 29, 32, 92}
+
+	// 客户端露过面，下行是通的。
+	r.HoldDownlink(true)
+	if _, err := r.Write([][]byte{ipv4Pkt(peer, pub, 8)}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 换 key：设备里的握手状态作废，下行重新关上。
+	r.HoldDownlink(true)
+	ep.Deliver(ipv4Pkt(pub, peer, 20))
+	got := startRead(r, 1500)
+	waitDrop(t, r, dropPeerNotReady)
+	select {
+	case res := <-got:
+		t.Fatalf("换 key 之后下行包不该被交出：n=%d size=%d err=%v", res.n, res.size, res.err)
+	default:
+	}
+
+	// 摘掉 peer：设备里没有 peer 了，包交给 WireGuard 由它按"找不到目的
+	// peer"静默丢弃，relay 不再扣。
+	r.HoldDownlink(false)
+	want := ipv4Pkt(pub, peer, 300)
+	ep.Deliver(want)
+	select {
+	case res := <-got:
+		if res.err != nil || res.n != 1 || res.size != len(want) {
+			t.Fatalf("摘掉 peer 之后包应当照常交出：n=%d size=%d err=%v", res.n, res.size, res.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待下行包超时")
+	}
+}

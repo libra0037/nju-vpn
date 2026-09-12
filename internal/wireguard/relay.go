@@ -59,6 +59,21 @@ type Relay struct {
 	// session 为 nil 表示当前没有校园网会话：客户端发来的包直接丢弃。
 	session atomic.Pointer[relaySession]
 
+	// hold 与 peerSeen 一起决定下行方向要不要把包交给 WireGuard。
+	//
+	// 配好了 peer、客户端还没露面时，设备不知道它在哪儿：包交上去也发不
+	// 出去，只会换来 wireguard-go 每 5 秒一行 ERROR "no known endpoint for
+	// peer"（真机上隧道建好后的 57 秒里刷了 12 行）。而这段窗口可以很长——
+	// 校园网网关自己就会往分配到的地址发包。
+	//
+	// hold 跟着 peer 一起开关（见 Device.SetPeer / ClearPeer），peerSeen 是
+	// "客户端确实接进来了"的证据：收到它解出来的第一个数据包时置位。之所以
+	// 不问设备要 "peer 的地址"：Read 跑在 wireguard-go 的 TUN 读取协程里，
+	// 在那里调 IpcGet 会和它的状态机抢 ipcMutex，实测能把设备锁死（Close
+	// 永远等不到读取协程退出）。
+	hold     atomic.Bool
+	peerSeen atomic.Bool
+
 	events    chan tun.Event
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -102,6 +117,17 @@ func NewRelay(opts RelayOptions) *Relay {
 func (r *Relay) InstallSession(ep *vpn.TunnelEndpoint, mapper *Mapper) {
 	r.session.Store(&relaySession{ep: ep, mapper: mapper})
 	ep.SetDownlink(r.deliver)
+}
+
+// HoldDownlink 开关下行方向的等待：hold 为真表示设备里配好了 peer、客户端
+// 随时会连进来，在它露面之前下行包先扣下（丢掉并计数，见 Read）。
+//
+// 打开时会一并忘掉"客户端露过面"：换 key（SetPeer）之后新客户端必须重新
+// 握手，下行方向才会再次放行。关掉时（ClearPeer 之后设备里根本没有 peer）
+// 包照旧交给 WireGuard，它会因为找不到目的 peer 而静默丢弃。
+func (r *Relay) HoldDownlink(hold bool) {
+	r.peerSeen.Store(false)
+	r.hold.Store(hold)
 }
 
 // ClearSession 摘掉当前会话。设备继续监听，但不再有任何包进出隧道。
@@ -206,6 +232,10 @@ const (
 	// dropUplinkAddr：上行包的源地址不是 peer 地址——最典型的成因是
 	// 客户端配置里的 ip 与 wireguard.peer_address 不一致。
 	dropUplinkAddr
+	// dropPeerNotReady：下行包送到时设备还不知道客户端在哪儿。整批丢掉，
+	// 因为交给 wireguard-go 也发不出去——它只会每 5 秒往日志里写一行
+	// "no known endpoint for peer"。
+	dropPeerNotReady
 	// dropNoBuffer：读缓冲装不下这个包（见 Read 的注释）。
 	dropNoBuffer
 	// dropNoSession：客户端发来的包到达时还没有校园网会话（隧道没建、
@@ -223,9 +253,20 @@ var dropReasonText = [dropReasonCount]string{
 	dropDownlinkFull:    "下行队列已满",
 	dropUplinkNotIPv4:   "上行解出来的不是 IPv4 包",
 	dropUplinkAddr:      "上行包的源地址不是 peer_address（客户端 ip 配置不一致？）",
+	dropPeerNotReady:    "客户端尚未握手，下行包被丢弃（客户端还没连上，或密钥不匹配）",
 	dropNoBuffer:        "读缓冲装不下这个包",
 	dropNoSession:       "隧道尚未建立，客户端发来的包被丢弃",
 	dropNoUplink:        "隧道上行通道未就绪，包被丢弃",
+}
+
+// dropQuietInterval 是几种"预期之内、会一直重复"的丢包原因的日志间隔。
+//
+// 典型的是客户端还没露面：校园网网关自己就会往分配到的地址发包，隧道刚
+// 建好、客户端还没连上时这段窗口可以很长。这类丢包第一次打一条足够用户
+// 知道发生了什么，之后按这个间隔报一次数，不必跟着默认间隔刷屏。
+// 零值表示用默认的 dropLogInterval。
+var dropQuietInterval = [dropReasonCount]time.Duration{
+	dropPeerNotReady: 5 * time.Minute,
 }
 
 // dropCounter 是一种原因的计数与限速状态。
@@ -242,6 +283,10 @@ type dropCounter struct {
 func (r *Relay) countDrop(reason dropReason) {
 	c := &r.drops[reason]
 	n := c.n.Add(1)
+	interval := dropLogInterval
+	if quiet := dropQuietInterval[reason]; quiet > 0 {
+		interval = quiet
+	}
 	if c.firstLog.CompareAndSwap(false, true) {
 		c.lastLog.Store(time.Now().UnixNano())
 		log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
@@ -249,7 +294,7 @@ func (r *Relay) countDrop(reason dropReason) {
 	}
 	now := time.Now().UnixNano()
 	last := c.lastLog.Load()
-	if now-last < int64(dropLogInterval) || !c.lastLog.CompareAndSwap(last, now) {
+	if now-last < int64(interval) || !c.lastLog.CompareAndSwap(last, now) {
 		return
 	}
 	log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
@@ -273,6 +318,12 @@ func (r *Relay) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	for {
 		select {
 		case pkt := <-r.queue:
+			if r.hold.Load() && !r.peerSeen.Load() {
+				// 配了 peer、客户端还没露面：设备不知道它在哪儿，交上去也发不
+				// 出去，只会换来一行 "no known endpoint for peer"。
+				r.countDrop(dropPeerNotReady)
+				continue
+			}
 			dst := bufs[0][offset:]
 			if len(pkt) > len(dst) {
 				// 装不下就丢掉这个包，绝不能返回错误：wireguard-go 的 TUN 读
@@ -306,6 +357,10 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 		r.countDrop(dropNoSession)
 		return len(bufs), nil
 	}
+
+	// 走到这里说明客户端的数据包已经解出来交给我们了：它握手成功、
+	// 而且设备记住了它的地址，下行方向可以放行。
+	r.peerSeen.Store(true)
 
 	n := 0
 	for _, buf := range bufs {

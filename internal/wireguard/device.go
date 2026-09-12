@@ -129,6 +129,8 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	if err := d.dev.IpcSet(conf); err != nil {
 		return fmt.Errorf("更新 peer: %w", err)
 	}
+	// 换了 key 就等于重新开始：客户端得重新握手，下行方向才再次放行。
+	d.relay.HoldDownlink(true)
 	return nil
 }
 
@@ -141,6 +143,9 @@ func (d *Device) ClearPeer() error {
 	if err := d.dev.IpcSet("replace_peers=true\n"); err != nil {
 		return fmt.Errorf("摘除 peer: %w", err)
 	}
+	// 设备里没有 peer 了：交给 WireGuard 的包会因为找不到目的 peer 被静默
+	// 丢弃，这里不必再扣。
+	d.relay.HoldDownlink(false)
 	return nil
 }
 

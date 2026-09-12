@@ -3,9 +3,11 @@ package wireguard
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -363,4 +365,96 @@ func TestDeviceCloseStopsForwarding(t *testing.T) {
 
 	// 关闭后端点上的下行回调应已摘除，再注包不会 panic 也不会转发。
 	ep.Deliver(ipv4Pkt([4]byte{1, 1, 1, 1}, [4]byte{172, 29, 56, 18}, 20))
+}
+
+// captureLogs 在 fn 运行期间把 wireguard-go 的日志（写在 os.Stdout 上）与
+// 本包自己的日志（标准 logger，写在 os.Stderr 上）都接到一个临时文件里，
+// 返回这段时间的日志。
+func captureLogs(t *testing.T, fn func()) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "njuvpn-log")
+	if err != nil {
+		t.Fatalf("建临时日志文件失败: %v", err)
+	}
+	defer f.Close()
+
+	oldStdout, oldWriter := os.Stdout, log.Writer()
+	os.Stdout = f
+	log.SetOutput(f)
+	defer func() {
+		os.Stdout = oldStdout
+		log.SetOutput(oldWriter)
+	}()
+
+	fn()
+
+	out, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	return string(out)
+}
+
+// 回归（真机症状）：隧道刚建好、客户端还没接进来时，校园网网关自己就会往
+// 分配到的地址发包。这些包以前会被交给 wireguard-go，而它不知道客户端在
+// 哪儿，于是每 5 秒往日志里写一行
+//
+//	ERROR: wireguard: peer(...) - Failed to send handshake initiation: no known endpoint for peer
+//
+// （真机上隧道建好后的 57 秒里刷了 12 行）。现在这些包在 Read 里就被丢掉并
+// 计数，日志里只该留下一条说清原因的记录。
+func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 的 ring bind 需要管理员权限")
+	}
+
+	serverPriv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPriv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPub, err := clientPriv.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ep := vpn.NewEndpoint()
+	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 客户端还没接进来：校园网网关往分配到的地址发了好几个包。
+	campus := [4]byte{172, 29, 56, 18}
+
+	logs := captureLogs(t, func() {
+		dev, err := NewDevice(DeviceOptions{
+			MTU: 1420, PrivateKey: serverPriv, ListenPort: freeUDPPort(t),
+		})
+		if err != nil {
+			t.Fatalf("创建承载设备失败: %v", err)
+		}
+		defer dev.Close()
+		dev.SetSession(ep, mapper)
+		if err := dev.SetPeer(clientPub, net.ParseIP("10.66.66.2")); err != nil {
+			t.Fatalf("配置 peer 失败: %v", err)
+		}
+
+		for i := 0; i < 5; i++ {
+			// 网关发给"我们分配到的校园网地址"，映射之后目的地址是 peer 地址。
+			ep.Deliver(ipv4Pkt([4]byte{202, 119, 32, 69}, campus, 20))
+		}
+		// 给 TUN 读取协程一点时间把队列里的包取走。
+		time.Sleep(500 * time.Millisecond)
+	})
+
+	if strings.Contains(logs, "no known endpoint") {
+		t.Fatalf("客户端还没接进来时不该有握手噪声，实际日志：\n%s", logs)
+	}
+	if n := strings.Count(logs, dropReasonText[dropPeerNotReady]); n != 1 {
+		t.Fatalf("被丢掉的下行包应当只留一条记录，实际 %d 条：\n%s", n, logs)
+	}
 }
