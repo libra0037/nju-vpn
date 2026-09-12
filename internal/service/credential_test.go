@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/config"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 	"github.com/libra0037/nju-vpn/internal/vpntest"
 )
 
@@ -105,5 +106,53 @@ func TestSecondStartReusesPassword(t *testing.T) {
 	registerLogin()
 	if err := h.svc.Start(); err != nil && !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("第二次 start 应当复用内存里的口令: %v", err)
+	}
+}
+
+// TestCredentialsNeverLogged 是凭据不入日志的完整回归（REVIEW C3）。
+//
+// 覆盖范围比 TestPasswordNeverLogged 大：口令由 `njuvpn start` 从 stdin 读入后
+// 会以 base64 的形式经 IPC 报文传进来，报文行同样不能出现在日志里；
+// TwfID、CSRF 码与 TOTP 密钥也一样。有人在服务进程里加一行 log.Printf(req)
+// 或 log.Printf(password) 时，这条测试会失败。
+func TestCredentialsNeverLogged(t *testing.T) {
+	const password = "S3cr3t Pa55w0rd" // 含空格：口令要经 base64 才能过行协议
+	const totpSecret = "JBSWY3DPEHPK3PXP"
+
+	h := newHarnessWith(t, func(cfg *config.Config) {
+		cfg.Password = "" // 口令只从本次请求带进来
+		cfg.TOTPSecret = totpSecret
+	})
+
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	endpoint, done := serve(t, h)
+	defer closeServer(t, h, done)
+
+	resp := request(t, endpoint, ipc.Request{
+		Command: ipc.CmdStart,
+		Args:    []string{ipc.EncodeSecret(password)},
+	})
+	if resp.Code != ipc.CodeOK {
+		t.Fatalf("start 失败: %d %s", resp.Code, resp.Message)
+	}
+	waitState(t, h.svc, StateUp, 3*time.Second)
+
+	logs := buf.String()
+	// 后两个值来自假 portal 的固定响应：日志里只该出现脱敏后的前缀。
+	for _, secret := range []struct{ name, value string }{
+		{"口令原文", password},
+		{"口令的 base64 形式", ipc.EncodeSecret(password)},
+		{"TOTP 密钥", totpSecret},
+		{"完整 TwfID", "fedcba9876543210"},
+		{"登录页 TwfID", "0123456789abcdef"},
+		{"CSRF 码", "csrftoken"},
+	} {
+		if strings.Contains(logs, secret.value) {
+			t.Errorf("日志里出现了%s（%q）", secret.name, secret.value)
+		}
 	}
 }

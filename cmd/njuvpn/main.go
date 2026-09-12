@@ -370,7 +370,7 @@ func cmdSetPeer(args []string) error {
 // parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。
 //
 // Go 的 flag 包遇到第一个位置参数就停止解析，而命令行里这两者经常混着写
-// （njuvpn auth 123456 -config x.yaml）。这里循环调用 Parse：每轮吃掉一个
+// （njuvpn wg-peer <公钥> -config x.yaml）。这里循环调用 Parse：每轮吃掉一个
 // 位置参数，再从剩下的继续解析。解析语义完全由标准库决定（-flag=value、
 // 布尔 flag、-- 终止符都正确），不再自己维护一份 flag 语法。
 func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {

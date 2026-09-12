@@ -38,11 +38,21 @@ var ErrShuttingDown = errors.New("服务进程正在退出")
 // 登出自身有 10 秒超时，所以这里给足余量但不无限等。
 const closeGrace = 20 * time.Second
 
+// authWaitTimeout 是等待验证码的上限。
+//
+// 用户在提示符前直接关掉终端时，进程会一直停在 auth_pending，学校侧那条
+// "同一账号只允许一个客户端"的名额也跟着被占住。到点就登出，宁可让用户
+// 重新 start 一次。
+//
+// 用变量而不是常量：测试要把它缩到百毫秒级才能覆盖到这条路径。
+var authWaitTimeout = 10 * time.Minute
+
 type commandKind int
 
 const (
 	cmdStart commandKind = iota
 	cmdAuth
+	cmdAuthTimeout
 	cmdStop
 	cmdTunnelDown
 	cmdTunnelRetry
@@ -104,6 +114,8 @@ type Service struct {
 	runCancel     context.CancelFunc
 	gen           uint64
 	pendingAuth   *vpn.AuthRequiredError
+	// authTimer 只在 auth_pending 期间有效，到点由 actor 收尾。
+	authTimer *time.Timer
 }
 
 // New 构造服务对象并启动命令循环。
@@ -341,6 +353,8 @@ func (s *Service) dispatch(cmd *command) {
 		err = s.start(ctx, cmd.arg)
 	case cmdAuth:
 		err = s.auth(ctx, cmd.arg)
+	case cmdAuthTimeout:
+		err = s.authTimeout()
 	case cmdStop:
 		err = s.stop()
 	case cmdTunnelDown:
@@ -490,6 +504,7 @@ func (s *Service) auth(ctx context.Context, code string) error {
 	}
 
 	s.pendingAuth = nil
+	s.stopAuthTimer()
 	return s.finishConnect(sess)
 }
 
@@ -756,22 +771,63 @@ func (s *Service) awaitAuth() error {
 	}
 	switch {
 	case errors.Is(kind, vpn.ErrAuthTOTP):
-		detail = "需要 TOTP 验证码，请执行 njuvpn auth <code>"
-	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSSent):
-		detail = "验证码已发送到手机，请执行 njuvpn auth <code>"
+		detail = "需要 TOTP 验证码"
 	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSStillValid):
 		// 冷却期内服务端不会重发，上一条验证码仍然有效——不能提示"已发送"，
 		// 否则用户会一直等一条不会来的短信。
-		detail = s.pendingAuth.UserText() + "，请用上一条验证码执行 njuvpn auth <code>"
+		detail = s.pendingAuth.UserText() + "（请用上一条验证码）"
 	case s.pendingAuth != nil && errors.Is(s.pendingAuth, vpn.ErrSMSTooMany):
 		detail = "短信发送过于频繁，请稍后再试"
 	case s.pendingAuth != nil:
-		detail = s.pendingAuth.UserText() + "，请执行 njuvpn auth <code>"
+		detail = s.pendingAuth.UserText()
 	default:
-		detail = "需要短信验证码，请执行 njuvpn auth <code>"
+		detail = "需要短信验证码"
 	}
 	s.status.set(StateAuthPending, detail)
+	s.startAuthTimer()
 	return fmt.Errorf("%s: %w", detail, ErrAuthRequired)
+}
+
+// startAuthTimer 在等待验证码时启动上限。
+//
+// 每次进入 auth_pending 都重新计时：验证码输错后还能再输，不该被上一个
+// 计时器打断。
+func (s *Service) startAuthTimer() {
+	s.stopAuthTimer()
+	s.authTimer = time.AfterFunc(authWaitTimeout, s.reportAuthTimeout)
+}
+
+// stopAuthTimer 取消等待验证码的上限。
+func (s *Service) stopAuthTimer() {
+	if s.authTimer != nil {
+		s.authTimer.Stop()
+		s.authTimer = nil
+	}
+}
+
+// reportAuthTimeout 把"等验证码超时"交给 actor。
+//
+// 与隧道协程的收尾一样必须经过 actor：直接改状态会与正在执行的命令打架。
+func (s *Service) reportAuthTimeout() {
+	select {
+	case s.cmds <- &command{kind: cmdAuthTimeout, reply: make(chan error, 1)}:
+	case <-s.closed:
+	}
+}
+
+// authTimeout 处理"等验证码等到超时"。
+//
+// 只做收尾：用户可能只是走开了，回来后重新 start（会重新登录）即可。
+func (s *Service) authTimeout() error {
+	if s.status.Get().State != StateAuthPending {
+		return nil // 已经不在等验证码，无事可做
+	}
+	s.teardown("")
+	detail := fmt.Sprintf("等待验证码超过 %s，已登出；重新建立隧道请执行 njuvpn start",
+		authWaitTimeout.Round(time.Minute))
+	log.Print(detail)
+	s.status.set(StateError, detail)
+	return nil
 }
 
 // fail 收敛到 error 状态。只能在 actor 协程内调用。
@@ -804,6 +860,7 @@ func (s *Service) teardown(detail string) {
 		s.client.CloseIdleConnections()
 	}
 	s.pendingAuth = nil
+	s.stopAuthTimer()
 	s.status.clearAddresses()
 
 	if s.status.Get().State != StateIdle {
