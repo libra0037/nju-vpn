@@ -9,9 +9,6 @@
 /config.yaml
 *.local.yaml
 
-# WireGuard 自动生成的私钥
-/state/
-
 # 编辑器 / 操作系统
 .idea/
 .vscode/

@@ -203,7 +203,13 @@ func (s *Service) WireGuardStats() ([]wireguard.PeerStats, error) {
 }
 
 // Stop 断开隧道并释放资源。
+//
+// 先打断正在进行的操作再排队：命令在 actor 里串行，而一次登录最坏要走
+// 三分多钟（短信、退避重试），stop 的语义却是"现在就断"。被打断的 start
+// 以取消收场，随后这条 stop 照常执行——用户不必转去手工杀进程，而手工杀
+// 会跳过登出。
 func (s *Service) Stop() error {
+	s.cancelOp()
 	return s.call(&command{kind: cmdStop})
 }
 

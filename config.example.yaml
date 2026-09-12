@@ -22,7 +22,7 @@ password: ""
 proxy: ""
 
 # 可选：TOTP 密钥（Base32）。填了就自动算验证码，服务进程可以无人值守启动；
- # 留空则退化成短信验证：`njuvpn start` 会在需要时提示输入验证码。
+# 留空则退化成短信验证：`njuvpn start` 会在需要时提示输入验证码。
 # 取值方式：VPN 的 TOTP 绑定页面二维码里 otpauth://totp/...?secret=XXXX 的 secret 部分。
 totp_secret: ""
 

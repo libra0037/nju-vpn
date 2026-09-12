@@ -168,9 +168,6 @@ func cmdRun(args []string) error {
 // 同一台机器上跑多个实例时，这是最常见的启动失败原因。
 func precheckListenPort(cfg *config.Config) error {
 	port := cfg.WireGuard.ListenPort
-	if port == 0 {
-		return nil // 交给系统分配，不会冲突
-	}
 	host, err := wireguard.ParseListenHost(cfg.WireGuard.ListenHost)
 	if err != nil {
 		return err

@@ -59,6 +59,19 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		}
 	})
 
+	// listen_port 写 0 表示用默认端口：applyDefaults 会把它换成 51820，
+	// 所以端口预检与承载层都不会见到 0。
+	t.Run("listen_port 0 回落默认端口", func(t *testing.T) {
+		path := writeConfig(t, "server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  listen_port: 0\n", 0o600)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("listen_port 0 应当合法: %v", err)
+		}
+		if cfg.WireGuard.ListenPort != 51820 {
+			t.Fatalf("listen_port 0 应回落 51820，得到 %d", cfg.WireGuard.ListenPort)
+		}
+	})
+
 	cases := []struct {
 		name string
 		body string
@@ -93,6 +106,11 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 			"peer 地址不是 IPv4",
 			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  peer_address: 2001:db8::2\n",
 			"peer_address",
+		},
+		{
+			"log.level 写错",
+			"server: vpn.example.edu\nusername: u\npassword: p\nlog:\n  level: warn\n",
+			"log.level",
 		},
 	}
 	for _, c := range cases {

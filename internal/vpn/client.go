@@ -114,17 +114,22 @@ func (c *Client) Dial() (net.Conn, error) {
 }
 
 // DialContext 建立 TCP 连接，ctx 取消时放弃等待。
+func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+	return dialContext(ctx, c.dialFn, "tcp", c.dialTarget())
+}
+
+// dialContext 调一次拨号函数，并在 ctx 取消时放弃等待。
 //
 // 底层拨号函数没有 ctx 参数（要兼容代理实现），所以取消后由一个
 // 清理协程等待拨号返回并关闭连接——底层拨号自身有超时，不会永久泄漏。
-func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+func dialContext(ctx context.Context, dialFn DialFunc, network, addr string) (net.Conn, error) {
 	type result struct {
 		conn net.Conn
 		err  error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		conn, err := c.Dial()
+		conn, err := dialFn(network, addr)
 		ch <- result{conn: conn, err: err}
 	}()
 
@@ -228,7 +233,9 @@ func (c *Client) newHTTPClient() *http.Client {
 			if addr == server {
 				addr = dialTarget
 			}
-			return dialFn(network, addr)
+			// 走 ctx 感知的版本：portal 请求卡在拨号上时，stop 与
+			// 退出路径要能立刻放弃，而不是干等 Transport 的超时。
+			return dialContext(ctx, dialFn, network, addr)
 		},
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}

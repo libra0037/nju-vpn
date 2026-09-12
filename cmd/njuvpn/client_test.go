@@ -56,7 +56,7 @@ func TestEnsureProbeIsSafe(t *testing.T) {
 	}
 }
 
-// TestPrecheckListenPort 验证端口预检：占用的端口要报错，0 表示交给系统。
+// TestPrecheckListenPort 验证端口预检：占用的端口要在登录之前报错。
 //
 // 这条检查的价值在于失败得早：真等到承载层启动才报错，登录、短信、
 // query-ip 都已经走完，白烧一次建隧道配额。
@@ -70,9 +70,6 @@ func TestPrecheckListenPort(t *testing.T) {
 
 	if err := precheckListenPort(&config.Config{WireGuard: config.WireGuard{ListenPort: busyPort}}); err == nil {
 		t.Fatal("端口被占用时应当报错")
-	}
-	if err := precheckListenPort(&config.Config{WireGuard: config.WireGuard{ListenPort: 0}}); err != nil {
-		t.Fatalf("端口 0 表示交给系统分配，不该报错: %v", err)
 	}
 	if err := precheckListenPort(&config.Config{WireGuard: config.WireGuard{ListenPort: busyPort + 1}}); err != nil {
 		t.Fatalf("空闲端口不该报错: %v", err)

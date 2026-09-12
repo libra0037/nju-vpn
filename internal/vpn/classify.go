@@ -57,8 +57,8 @@ func classifySMSRequest(body []byte) (state error, err error) {
 		case cooldown > 0:
 			return fmt.Errorf("%w（还需等待 %d 秒）", ErrSMSStillValid, cooldown), nil
 		default:
-			// 拿不到倒计时就无法区分，按"已发送"提示，并让用户知道
-			// 若没收到可以重试。
+			// 拿不到倒计时就无法区分，只能按"已发送"提示；
+			// 具体文案由上层（AuthRequiredError.UserText）决定。
 			return ErrSMSSent, nil
 		}
 	}

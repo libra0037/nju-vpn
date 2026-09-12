@@ -189,8 +189,16 @@ func (c *Config) validate() error {
 	if c.MTU < MinMTU || c.MTU > MaxMTU {
 		return fmt.Errorf("mtu 超出范围: %d（应在 %d-%d 之间，1320 适合默认隧道）", c.MTU, MinMTU, MaxMTU)
 	}
-	if p := c.WireGuard.ListenPort; p < 0 || p > 65535 {
+	// 0 在 applyDefaults 里已经被换成默认端口，这里不会见到。
+	if p := c.WireGuard.ListenPort; p < 1 || p > 65535 {
 		return fmt.Errorf("wireguard.listen_port 超出范围: %d", p)
+	}
+	// 取值不校验的话，写错（例如 warn）会静默按 info 跑，
+	// 而用户以为拿到了更详细的日志。
+	switch c.Log.Level {
+	case "info", "debug":
+	default:
+		return fmt.Errorf("log.level 只能是 info 或 debug，收到 %q", c.Log.Level)
 	}
 	if err := validateListenHost(c.WireGuard.ListenHost); err != nil {
 		return err
