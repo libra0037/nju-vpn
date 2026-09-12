@@ -19,6 +19,7 @@
  - **同机可跑多个实例**：每份配置各自一个实例，端点按配置文件的路径派生，互不打扰。
 - **出站可经代理**：连服务端时可走 HTTP / SOCKS5 代理。仅在校外直连不通、
   或需要指定出口时使用；服务端把隧道会话绑定到源 IP，代理的出口必须稳定。
+  代理地址经本地套接字交给服务进程，不写进命令行，同机其他用户看不到。
 - **会话回收**：进程退出时无条件登出，避免残留会话占住同一账号的名额。
 
 ## 安装
@@ -46,6 +47,7 @@ go build -o njuvpn ./cmd/njuvpn
 njuvpn status           查看状态
 njuvpn stop             断开隧道
 njuvpn restart          重启服务进程（改完配置后用它）
+njuvpn ping             查看服务进程是否在运行，并报出它的身份
 njuvpn wg-peer <公钥>    更新 WireGuard 接入公钥（不重建隧道）
 njuvpn wg-stats         查看 WireGuard 收发统计
 njuvpn probe            直接连服务端做协议探测（不经过服务进程）
@@ -74,8 +76,9 @@ printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start -config ~/.config/njuvpn/co
 
 每人一份配置文件、一个实例时不需要额外设置：IPC 端点按配置文件的路径派生
 （同一份配置永远是同一个端点，不同配置互不相干），每人写一个不同的
-`wireguard.listen_port` 即可，日志在各配置目录下，名字是 `njuvpn-<配置名>.log`。
-`njuvpn status` 与 `ping` 都会报出实例身份（PID、账号、配置文件路径与端点），
+`wireguard.listen_port` 即可，日志在各配置目录下，名字是
+`njuvpn-<实例标识>-<配置名>.log`（只按配置名区分不开 a b.yaml 与 a_b.yaml 这类同名文件）。
+`njuvpn status` 与 `njuvpn ping` 都会报出实例身份（PID、账号、配置文件路径与端点），
 同机多实例时用它确认命令打在了哪个实例上。
 
 ### 客户端接入（以 Clash 为例）

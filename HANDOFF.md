@@ -107,8 +107,8 @@ IPv4 地址**，不存在轮换。
     # 注：start 会自己把口令（配置里没写时）与验证码问完，不再有 auth 子命令。
     # 管道也可以：printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start
 
-    # 注：系统服务安装（service install/start）已决定移除，
-    # 改为 CLI 按需拉起 + njuvpn restart，见第 10 节。
+    # 注：早期版本有过安装系统服务的子命令（service install/start），
+    # 已移除，改为 CLI 按需拉起 + njuvpn restart，见第 10 节。
 
 ### 2.2 构建
 
@@ -117,7 +117,7 @@ IPv4 地址**，不存在轮换。
 
 ## 3. 架构
 
-一个二进制，两个角色：服务进程、命令行客户端（现状另有 `service` 子命令用于安装系统服务，已决定移除，见第 10 节）。
+一个二进制，两个角色：服务进程、命令行客户端（早期版本有过一个安装系统服务的子命令，已移除，见第 10 节）。
 承载层用 WireGuard（wireguard-go）：服务进程不需要 root、不建 TUN 网卡，
 客户端（sing-box / Clash.Meta 等）用自带用户态网络栈接入。
 
@@ -128,10 +128,10 @@ IPv4 地址**，不存在轮换。
     internal/config/          配置读取与校验
     internal/ipc/             本地通信（unix socket / 命名管道）+ 行协议
     internal/wireguard/       tun.Device 实现与地址映射（SNAT/DNAT + 校验和增量修正）
-    internal/service/         状态机、隧道生命周期、IPC 服务端（系统服务安装已决定删除，见第 10 节）
+    internal/service/         状态机、隧道生命周期、IPC 服务端
     internal/vpntest/         测试替身（脚本化 portal + 内存隧道服务端）
 
-代码约 6300 行（2026-09-10 实测 6274 行），另有约 3600 行测试；`go build` / `go vet` / `go test` 全通过，Linux 与 Windows 交叉编译通过。
+代码约 7700 行（2026-09-12 实测 7687 行），另有约 5900 行测试；`go build` / `go vet` / `go test` 全通过，Linux 与 Windows 交叉编译通过。
 
 ## 4. 协议要点
 
@@ -440,7 +440,7 @@ Windows 与 Linux 都要能用 —— Linux 侧不是「只用来跑测试」，
 ### 进程模型：CLI 按需拉起，没有系统服务
 
 - `njuvpn start` 先探活，连不上就以脱离终端的方式拉起 `njuvpn run`（记日志到配置同目录），
-  再轮询到就绪。**只影响 start / restart**：stop / status / auth / wg-* 不会拉起服务。
+  再轮询到就绪。**只影响 start / restart**：stop / status / wg-* 不会拉起服务。
 - `njuvpn restart` = 请服务进程收尾退出（含登出）→ 等端点不再响应 → 重新拉起。
   改完配置用它，不要手工杀进程（手工杀会跳过登出，服务端名额要等超时才释放）。
 - 服务进程的退出有两条路径：系统信号（Ctrl-C / systemd / 任务计划程序）与 IPC 的 `shutdown`。
@@ -459,8 +459,8 @@ Windows 与 Linux 都要能用 —— Linux 侧不是「只用来跑测试」，
   `$XDG_RUNTIME_DIR/njuvpn-<实例标识>.sock`（取不到时回落到该用户的私有临时目录），
   Windows 是 `\\.\pipe\njuvpn-<实例标识>`。同一份配置永远得到同一个端点，
  不同配置互不相干，多实例因此不会误伤彼此。
-- 服务日志：配置文件同目录的 `njuvpn-<配置名>.log`（被拉起的服务进程没有控制台）；
-  名字里带配置名，同目录的多份配置不共用一份日志。
+- 服务日志：配置文件同目录的 `njuvpn-<实例标识>-<配置名>.log`（被拉起的服务进程没有控制台）；
+  名字里同时带实例标识与配置名，同目录的多份配置不共用一份日志。
 
 ### 安全取舍
 
@@ -483,6 +483,9 @@ njuvpn.exe restart
   服务进程已重启          142ms（含探活 + 拉起 + 轮询就绪）
 njuvpn.exe status   →   idle
 ```
+
+（这一段的日志名与端点还是当时的命名：日志直接叫 njuvpn.log，端点里没有实例
+标识。现在两者都按配置文件路径派生，见第 10 节。）
 
 然后走完整链路（用户操作，22:19–22:20）：
 
