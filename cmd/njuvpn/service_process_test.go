@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -54,6 +57,77 @@ func fakeService(t *testing.T) (endpoint string, gotShutdown chan struct{}) {
 		}
 	}()
 	return endpoint, gotShutdown
+}
+
+// TestWaitServiceReadyReturnsOnExit 验证子进程提前退出时立刻报错。
+//
+// 以前这里只轮询端点：子进程因为配置写错之类立刻退出时，用户要干等满
+// 超时，再被指去翻日志——而原因其实已经写在那里了（REVIEW R5 / M3）。
+func TestWaitServiceReadyReturnsOnExit(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "njuvpn-test.log")
+	body := "配置有问题\n服务进程崩溃前的最后一句\n"
+	if err := os.WriteFile(logPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	exited <- errors.New("exit status 1")
+
+	start := time.Now()
+	err := waitServiceReady(filepath.Join(t.TempDir(), "nobody.sock"), logPath, exited, 5*time.Second)
+	if err == nil {
+		t.Fatal("子进程退出后应当立刻报错")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("应当立刻返回，实际等了 %s", elapsed)
+	}
+	if !strings.Contains(err.Error(), "服务进程崩溃前的最后一句") {
+		t.Fatalf("错误里应带上日志尾部，实际 %v", err)
+	}
+}
+
+// TestWaitServiceReadySucceeds 验证端点开始应答时返回成功。
+func TestWaitServiceReadySucceeds(t *testing.T) {
+	endpoint, _ := fakeService(t)
+	// 永不写入的 channel：子进程一直在跑。
+	exited := make(chan error, 1)
+	if err := waitServiceReady(endpoint, filepath.Join(t.TempDir(), "x.log"), exited, 5*time.Second); err != nil {
+		t.Fatalf("端点在应答时应当成功: %v", err)
+	}
+}
+
+// TestWaitServiceReadyTimesOut 验证超时后报错，并附上日志尾部。
+func TestWaitServiceReadyTimesOut(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "njuvpn-test.log")
+	if err := os.WriteFile(logPath, []byte("还在初始化\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := waitServiceReady(filepath.Join(t.TempDir(), "nobody.sock"), logPath, make(chan error), 200*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "没有就绪") {
+		t.Fatalf("超时应当报错，实际 %v", err)
+	}
+	if !strings.Contains(err.Error(), "还在初始化") {
+		t.Fatalf("错误里应带上日志尾部，实际 %v", err)
+	}
+}
+
+// TestLogTail 验证只取最后几行。
+func TestLogTail(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "njuvpn-test.log")
+	var b strings.Builder
+	b.WriteString("第一行不该出现\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&b, "第 %d 行\n", i)
+	}
+	if err := os.WriteFile(logPath, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tail := logTail(logPath)
+	if !strings.Contains(tail, "第 39 行") {
+		t.Fatalf("尾部应包含最后一行: %q", tail)
+	}
+	if strings.Contains(tail, "第一行不该出现") {
+		t.Fatalf("尾部不该包含开头的行: %q", tail)
+	}
 }
 
 // 探活成功是"服务进程在运行"的唯一判据，ensureService 靠它决定要不要拉起。

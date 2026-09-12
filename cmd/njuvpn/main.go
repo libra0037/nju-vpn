@@ -56,7 +56,7 @@ func usage() {
 
 全局参数:
   -config <path>                  配置文件路径（默认见下）
-  -proxy <url>                    覆盖配置文件里的出站代理（run / probe 可用）
+  -proxy <url>                    覆盖配置文件里的出站代理（run / start / restart / probe 可用）
 
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
@@ -228,6 +228,7 @@ func logWireGuardPublicKey(cfg *config.Config) {
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
+	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理（只在拉起服务进程时生效）")
 	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
@@ -243,7 +244,7 @@ func cmdStart(args []string) error {
 	}
 
 	// 服务进程没在跑就先拉起来：这是"按需拉起"的入口。
-	if err := ensureService(*configPath); err != nil {
+	if err := ensureService(*configPath, *proxy); err != nil {
 		return err
 	}
 
@@ -309,6 +310,7 @@ func cmdStop(args []string) error {
 func cmdRestart(args []string) error {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
+	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
 	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
@@ -322,7 +324,7 @@ func cmdRestart(args []string) error {
 	} else if err := waitServiceGone(endpoint, serviceStopTimeout); err != nil {
 		return err
 	}
-	if err := ensureService(*configPath); err != nil {
+	if err := ensureService(*configPath, *proxy); err != nil {
 		return err
 	}
 	fmt.Println("服务进程已重启")
