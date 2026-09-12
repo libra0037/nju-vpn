@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -159,6 +160,20 @@ type deviceConfig struct {
 	peers      []PeerStats
 }
 
+// base64Key 把 UAPI 里的十六进制公钥换成 base64。
+//
+// 只有 UAPI 用十六进制：配置文件、启动日志与 wg-peer 的参数都是 base64。
+// 照搬十六进制会让 wg-stats 打出一把跟用户手里长得不一样的钥匙，想核对
+// 「接进来的到底是不是我这个客户端」就得自己再转一遍。
+// 认不出来的值原样回报：显示得难看也比丢掉一条统计强。
+func base64Key(hexKey string) string {
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil || len(raw) != 32 {
+		return hexKey
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
 // parseUAPI 解析 UAPI 的 key=value 文本。
 func parseUAPI(out string) deviceConfig {
 	var cfg deviceConfig
@@ -171,7 +186,7 @@ func parseUAPI(out string) deviceConfig {
 		case "listen_port":
 			cfg.listenPort, _ = strconv.Atoi(strings.TrimSpace(value))
 		case "public_key":
-			cfg.peers = append(cfg.peers, PeerStats{PublicKey: value})
+			cfg.peers = append(cfg.peers, PeerStats{PublicKey: base64Key(value)})
 		case "rx_bytes":
 			if i := len(cfg.peers) - 1; i >= 0 {
 				cfg.peers[i].RxBytes, _ = strconv.ParseInt(value, 10, 64)

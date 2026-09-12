@@ -162,3 +162,40 @@ func TestUAPIConfigRejectsIPv6Peer(t *testing.T) {
 		t.Error("IPv6 的 peer 地址应被拒绝")
 	}
 }
+
+// 回归：wg-stats 报出的 peer 公钥必须是 base64。
+//
+// UAPI 里是十六进制，而配置文件、启动日志与 wg-peer 的参数都是 base64。
+// 照搬十六进制的话，用户拿手里的公钥核对「接进来的到底是不是我这个客户端」
+// 会发现长得完全不一样，还得自己转一遍。
+func TestParseUAPIReportsBase64Key(t *testing.T) {
+	priv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := priv.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// UAPI 的文本形态：公钥是十六进制。
+	out := "private_key=" + hex.EncodeToString(priv[:]) + "\n" +
+		"public_key=" + hex.EncodeToString(pub[:]) + "\n" +
+		"rx_bytes=1024\ntx_bytes=2048\n"
+
+	cfg := parseUAPI(out)
+	if len(cfg.peers) != 1 {
+		t.Fatalf("peer 数量 = %d，期望 1", len(cfg.peers))
+	}
+	got := cfg.peers[0]
+	if want := pub.String(); got.PublicKey != want {
+		t.Errorf("报出的公钥 = %q，期望 base64 的 %q", got.PublicKey, want)
+	}
+	// 报出来的东西要能直接当参数用（wg-peer 收的就是这个写法）。
+	if _, err := ParseKey(got.PublicKey); err != nil {
+		t.Errorf("报出的公钥不是可用的密钥写法: %v", err)
+	}
+	if got.RxBytes != 1024 || got.TxBytes != 2048 {
+		t.Errorf("流量统计 = %d/%d，期望 1024/2048", got.RxBytes, got.TxBytes)
+	}
+}
