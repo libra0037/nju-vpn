@@ -90,6 +90,13 @@ type Service struct {
 	// cred 只在 actor 协程里读写，不需要加锁。
 	cred credentials
 
+	// dev 在进程存活期间一直存在；会话是它上面的一次挂载。
+	dev *wireguard.Device
+	// peerKey / peerAddr 是接入方配置，启动时解析一次；
+	// wg-peer 命令可以换掉 peerKey。
+	peerKey  wireguard.Key
+	peerAddr net.IP
+
 	cmds      chan *command
 	closed    chan struct{}
 	actorDone chan struct{}
@@ -119,10 +126,52 @@ type Service struct {
 }
 
 // New 构造服务对象并启动命令循环。
-func New(cfg *config.Config) *Service {
+//
+// 承载设备在这里就建起来，而不是等到隧道握手成功：端口被占、私钥写错、
+// peer 地址非法这类问题全部在进程启动时暴露。服务进程是 njuvpn start
+// 拉起的，启动失败会立刻报给用户——不会白烧一条短信和一次建隧道配额。
+func New(cfg *config.Config) (*Service, error) {
+	privateKey, err := wireguard.ParseKey(cfg.WireGuard.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("wireguard.private_key: %w", err)
+	}
+	var peerKey wireguard.Key
+	if cfg.WireGuard.PeerPublicKey != "" {
+		if peerKey, err = wireguard.ParseKey(cfg.WireGuard.PeerPublicKey); err != nil {
+			return nil, fmt.Errorf("wireguard.peer_public_key: %w", err)
+		}
+		// 全零公钥能通过 base64 解析，却不是合法的 x25519 公钥点。
+		// 不拦住的话它会一路走到 SetPeer，客户端表现为永远握手失败。
+		if peerKey.IsZero() {
+			return nil, fmt.Errorf("wireguard.peer_public_key 是全零公钥，不是合法的 WireGuard 公钥")
+		}
+	}
+	peerAddr := net.ParseIP(cfg.WireGuard.PeerAddress)
+	// 只承载 IPv4：Mapper 与 allowed_ip 都按 /32 写。配置校验里也是这条规则，
+	// 这里重复一次是因为 Config 也可能由调用方直接构造（测试、将来的嵌入场景）。
+	if peerAddr == nil || peerAddr.To4() == nil {
+		return nil, fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址: %q", cfg.WireGuard.PeerAddress)
+	}
+
+	dev, err := wireguard.NewDevice(wireguard.DeviceOptions{
+		MTU:        cfg.MTU,
+		PrivateKey: privateKey,
+		ListenPort: cfg.WireGuard.ListenPort,
+		ListenHost: listenHost(cfg.WireGuard.ListenHost),
+		Verbose:    cfg.Log.Level == "debug",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("启动 WireGuard 承载: %w", err)
+	}
+
 	s := &Service{
 		cfg:    cfg,
 		status: newStatusStore(identityOf(cfg)),
+		dev:    dev,
+		// 接入方公钥在启动时解析一次：写错了当场报错，而不是等用户
+		// 输完验证码、占掉配额之后才告诉他。
+		peerKey:  peerKey,
+		peerAddr: peerAddr,
 		cred: credentials{
 			username: cfg.Username,
 			password: cfg.Password,
@@ -132,8 +181,9 @@ func New(cfg *config.Config) *Service {
 		closed:    make(chan struct{}),
 		actorDone: make(chan struct{}),
 	}
+	s.setDevice(dev)
 	go s.loop()
-	return s
+	return s, nil
 }
 
 // identityOf 组装实例身份，只在启动时算一次。
@@ -239,6 +289,13 @@ func (s *Service) Close() {
 		case <-s.actorDone:
 		case <-time.After(closeGrace):
 			log.Printf("服务进程收尾超过 %s，放弃等待", closeGrace)
+		}
+
+		// 设备是进程级资源，收尾完成后才关：上面那一步会登出，
+		// 而 tunnelDown 之类的路径还在用它。
+		if dev := s.currentDevice(); dev != nil {
+			s.setDevice(nil)
+			dev.Close()
 		}
 	})
 }
@@ -525,10 +582,13 @@ func (s *Service) setPeer(publicKey string) error {
 			return fmt.Errorf("写回配置文件失败: %w", err)
 		}
 	}
+	s.peerKey = key
 
 	applied := false
-	if dev := s.currentDevice(); dev != nil {
-		if err := dev.SetPeer(key, net.ParseIP(s.cfg.WireGuard.PeerAddress)); err != nil {
+	// 只有隧道在跑时才装到设备上：空闲时设备仍然监听，装了 peer 会让
+	// 客户端握手成功却发不出任何包，比连不上更难查。
+	if s.status.Get().State == StateUp {
+		if err := s.applyPeer(); err != nil {
 			return err
 		}
 		applied = true
@@ -582,41 +642,13 @@ func (s *Service) attach(sess *vpn.Session) {
 func (s *Service) finishConnect(sess *vpn.Session) error {
 	s.status.set(StateConnecting, "正在建立承载")
 
+	// 只有 Mapper 依赖这次登录：校园网地址是服务端刚分配的。
 	mapper, err := wireguard.NewMapper(net.ParseIP(s.cfg.WireGuard.PeerAddress), net.ParseIP(sess.ClientIP()))
 	if err != nil {
 		return s.fail(fmt.Errorf("地址映射: %w", err))
 	}
 
-	privateKey, err := wireguard.ParseKey(s.cfg.WireGuard.PrivateKey)
-	if err != nil {
-		return s.fail(fmt.Errorf("wireguard.private_key: %w", err))
-	}
-	var peerKey wireguard.Key
-	if s.cfg.WireGuard.PeerPublicKey != "" {
-		peerKey, err = wireguard.ParseKey(s.cfg.WireGuard.PeerPublicKey)
-		if err != nil {
-			return s.fail(fmt.Errorf("wireguard.peer_public_key: %w", err))
-		}
-	}
-
-	dev, err := wireguard.NewDevice(wireguard.DeviceOptions{
-		MTU:           s.cfg.MTU,
-		Endpoint:      sess.Endpoint(),
-		Mapper:        mapper,
-		PrivateKey:    privateKey,
-		ListenPort:    s.cfg.WireGuard.ListenPort,
-		ListenHost:    listenHost(s.cfg.WireGuard.ListenHost),
-		PeerPublicKey: peerKey,
-		PeerAddress:   net.ParseIP(s.cfg.WireGuard.PeerAddress),
-		Verbose:       s.cfg.Log.Level == "debug",
-	})
-	if err != nil {
-		return s.fail(fmt.Errorf("启动 WireGuard 承载: %w", err))
-	}
-	s.setDevice(dev)
-
-	log.Printf("WireGuard 承载已启动: %s", s.bearerSummary(dev, peerKey))
-
+	s.dev.SetSession(sess.Endpoint(), mapper)
 	s.status.setAddresses(sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
 	// 先进入 up 再启动隧道协程：如果协程立刻就失败，
 	// tunnelDown 必须能看到 up 才能正确收敛，否则这次失败会被忽略掉。
@@ -645,7 +677,26 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 		s.reportTunnelDown(gen, err)
 	}()
 
+	// 放行客户端接入放在最后：上行通道由隧道协程注册，晚一步放行，
+	// 客户端第一次握手就更可能落在"已经能收包"的时刻。
+	if err := s.applyPeer(); err != nil {
+		return s.fail(err)
+	}
+
 	log.Printf("隧道已建立：校园网地址 %s，peer 地址 %s", sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
+	return nil
+}
+
+// applyPeer 把接入方公钥装到承载设备上。
+//
+// 没配置 peer 公钥时什么都不做：设备照常监听，只是没人能接入。
+func (s *Service) applyPeer() error {
+	if s.peerKey.IsZero() {
+		return nil
+	}
+	if err := s.dev.SetPeer(s.peerKey, s.peerAddr); err != nil {
+		return fmt.Errorf("配置接入公钥: %w", err)
+	}
 	return nil
 }
 
@@ -727,12 +778,12 @@ func listenHost(s string) wireguard.ListenHost {
 	return host
 }
 
-// bearerSummary 描述承载层的监听状态。
+// BearerSummary 描述承载层的监听状态，供服务进程启动时打一行日志。
 //
 // 日志里给的是设备实际监听的端口：配置走默认值，但以设备为准更可靠。
-func (s *Service) bearerSummary(dev *wireguard.Device, peerKey wireguard.Key) string {
+func (s *Service) BearerSummary() string {
 	port := s.cfg.WireGuard.ListenPort
-	if actual, err := dev.ListenPort(); err == nil && actual > 0 {
+	if actual, err := s.dev.ListenPort(); err == nil && actual > 0 {
 		port = actual
 	}
 	listen := fmt.Sprintf("UDP %d", port)
@@ -740,10 +791,10 @@ func (s *Service) bearerSummary(dev *wireguard.Device, peerKey wireguard.Key) st
 	if listenHost(s.cfg.WireGuard.ListenHost) == wireguard.ListenAll {
 		scope = "全部网卡"
 	}
-	if peerKey.IsZero() {
-		return fmt.Sprintf("%s（%s）在监听，但没有配置 peer_public_key，任何客户端都无法接入", listen, scope)
+	if s.peerKey.IsZero() {
+		return fmt.Sprintf("%s（%s）已就绪；未配置 wireguard.peer_public_key，任何客户端都无法接入", listen, scope)
 	}
-	return fmt.Sprintf("%s（%s），peer %s", listen, scope, s.cfg.WireGuard.PeerAddress)
+	return fmt.Sprintf("%s（%s）已就绪，peer 地址 %s", listen, scope, s.cfg.WireGuard.PeerAddress)
 }
 
 // logTrace 把各阶段耗时与结果写进日志，供失败后定位。
@@ -838,15 +889,19 @@ func (s *Service) fail(err error) error {
 }
 
 // teardown 释放本次连接的全部资源并回到 idle。只能在 actor 协程内调用。
+//
+// 承载设备不在释放之列：它活到进程结束，这里只把这次会话从它上面摘掉。
 func (s *Service) teardown(detail string) {
 	if s.runCancel != nil {
 		s.runCancel()
 		s.runCancel = nil
 	}
-	if dev := s.currentDevice(); dev != nil {
-		dev.Close()
-		s.setDevice(nil)
+	// 先摘 peer 再摘会话：设备还在监听，留着 peer 会让客户端握手成功，
+	// 而它的包其实已经没有隧道可走。
+	if err := s.dev.ClearPeer(); err != nil {
+		log.Printf("摘除 WireGuard peer 时出错: %v", err)
 	}
+	s.dev.ClearSession()
 	if s.session != nil {
 		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，
 		// 而登出本身必须发出去。

@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
-
-	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // 这两个用例用"能不能在同一个端口的另一个地址上再绑一次"来判定监听范围，
@@ -250,18 +248,18 @@ func TestDeviceBindsOnlyLoopbackByDefault(t *testing.T) {
 
 	port := freeUDPPort(t)
 	dev, err := NewDevice(DeviceOptions{
-		MTU:           1420,
-		Endpoint:      vpn.NewEndpoint(),
-		PrivateKey:    priv,
-		ListenPort:    port,
-		PeerPublicKey: peerPub,
-		PeerAddress:   net.ParseIP("10.66.66.2"),
+		MTU:        1420,
+		PrivateKey: priv,
+		ListenPort: port,
 		// ListenHost 留零值，即默认的 loopback。
 	})
 	if err != nil {
 		t.Fatalf("创建设备失败: %v", err)
 	}
 	defer dev.Close()
+	if err := dev.SetPeer(peerPub, net.ParseIP("10.66.66.2")); err != nil {
+		t.Fatalf("配置 peer 失败: %v", err)
+	}
 
 	// 设备已经绑住了回环端口。
 	if _, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}); err == nil {

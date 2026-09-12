@@ -61,7 +61,10 @@ func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
 		mutate(cfg)
 	}
 
-	svc := New(cfg)
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatalf("构造服务对象失败: %v", err)
+	}
 	h := &harness{svc: svc, portal: portal, tunnel: tunnel}
 	// 只补协议层内部的注入点；Server / DialAddr / Dial 由生产代码算，
 	// 顺便记下来供 TestClientOptionsUseProductionWiring 断言。

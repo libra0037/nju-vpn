@@ -9,35 +9,27 @@ import (
 	"sync"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 
 	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 // DeviceOptions 是创建 WireGuard 承载设备的参数。
+//
+// 这里只有"进程活着就不变"的东西：私钥、监听端口、MTU。会话相关的
+// （隧道端点、地址改写）与接入方公钥都通过 SetSession / SetPeer 在运行
+// 期挂上去，因为设备比任何一次校园网会话都活得久。
 type DeviceOptions struct {
 	// MTU 会通过 Relay 报告给 WireGuard。
 	MTU int
-	// Endpoint 是校园网隧道端点。
-	Endpoint *vpn.TunnelEndpoint
-	// Mapper 在 peer 地址与校园网分配地址之间改写 IP 包。
-	Mapper *Mapper
 	// PrivateKey 是本端的 WireGuard 私钥。
 	PrivateKey Key
 	// ListenPort 是监听的 UDP 端口。
 	ListenPort int
 	// ListenHost 决定绑定在回环还是全部网卡。零值是回环。
 	ListenHost ListenHost
-	// PeerPublicKey 是唯一允许接入的客户端公钥；为零值时设备照常监听，
-	// 但没有任何客户端能接入。
-	PeerPublicKey Key
-	// PeerAddress 是分配给客户端的地址。
-	PeerAddress net.IP
 	// Verbose 打开 wireguard-go 的详细日志。
 	Verbose bool
-	// Bind 覆盖默认的 UDP 绑定，供测试注入。
-	Bind conn.Bind
 }
 
 // Device 是 WireGuard 承载层。
@@ -45,8 +37,14 @@ type DeviceOptions struct {
 // 客户端通过 UDP 接入，本进程把解出来的 IP 包交给校园网隧道，
 // 反向则把隧道收到的包加密送回客户端。这里不创建 TUN 网卡：
 // 承载端是内存里的 Relay，客户端自带用户态网络栈。
+//
+// 设备与校园网会话是两条独立的生命周期：设备在服务进程启动时就建好
+// （端口冲突、私钥写错这类问题当场暴露），会话则随 njuvpn start / stop
+// 反复挂上与摘掉。
 type Device struct {
 	dev *device.Device
+	// relay 是同一个对象的另一种视角：会话换绑要经过它。
+	relay *Relay
 
 	closeOnce sync.Once
 }
@@ -56,36 +54,21 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 	if opts.PrivateKey.IsZero() {
 		return nil, fmt.Errorf("缺少 WireGuard 私钥")
 	}
-	if opts.Endpoint == nil {
-		return nil, fmt.Errorf("缺少隧道端点")
-	}
 	// 端口 0 表示交给系统分配，测试与临时部署用得到。
 	if opts.ListenPort < 0 || opts.ListenPort > 65535 {
 		return nil, fmt.Errorf("监听端口超出范围: %d", opts.ListenPort)
 	}
 
-	relay := NewRelay(RelayOptions{
-		MTU:      opts.MTU,
-		Endpoint: opts.Endpoint,
-		Mapper:   opts.Mapper,
-	})
+	relay := NewRelay(RelayOptions{MTU: opts.MTU})
 
-	bind := opts.Bind
-	if bind == nil {
-		bind = newBind(opts.ListenHost)
-	}
+	bind := newBind(opts.ListenHost)
 	level := device.LogLevelError
 	if opts.Verbose {
 		level = device.LogLevelVerbose
 	}
 	dev := device.NewDevice(relay, bind, device.NewLogger(level, "wireguard: "))
 
-	conf, err := uapiConfig(opts)
-	if err != nil {
-		dev.Close()
-		return nil, err
-	}
-	if err := dev.IpcSet(conf); err != nil {
+	if err := dev.IpcSet(uapiConfig(opts.PrivateKey, opts.ListenPort)); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("应用 WireGuard 配置: %w", err)
 	}
@@ -94,35 +77,41 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		return nil, fmt.Errorf("启动 WireGuard 设备: %w", err)
 	}
 
-	return &Device{dev: dev}, nil
+	return &Device{dev: dev, relay: relay}, nil
 }
 
-// uapiConfig 组装 wireguard-go 的 UAPI 配置文本。
+// uapiConfig 组装设备级配置：私钥与监听端口。
 //
 // 密钥在 UAPI 里是十六进制，不是配置文件里的 base64——写错了
 // 设备会直接报 invalid key。
-func uapiConfig(opts DeviceOptions) (string, error) {
+func uapiConfig(privateKey Key, listenPort int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "private_key=%s\n", hex.EncodeToString(opts.PrivateKey[:]))
-	fmt.Fprintf(&b, "listen_port=%d\n", opts.ListenPort)
+	fmt.Fprintf(&b, "private_key=%s\n", hex.EncodeToString(privateKey[:]))
+	fmt.Fprintf(&b, "listen_port=%d\n", listenPort)
+	return b.String()
+}
 
-	if opts.PeerPublicKey.IsZero() {
-		return b.String(), nil
+// peerConfig 组装接入方的配置文本。
+//
+// replace_peers 先清空，保证配置是幂等的：设备上只会存在这一个 peer；
+// allowed_ip 决定哪些目的地址的包会被送进这条隧道。
+func peerConfig(pub Key, addr net.IP) (string, error) {
+	if addr == nil || addr.To4() == nil {
+		return "", fmt.Errorf("peer 地址必须是 IPv4: %v", addr)
 	}
+	return "replace_peers=true\n" +
+		"public_key=" + hex.EncodeToString(pub[:]) + "\n" +
+		"allowed_ip=" + addr.To4().String() + "/32\n", nil
+}
 
-	v4 := opts.PeerAddress.To4()
-	if opts.PeerAddress != nil && v4 == nil {
-		return "", fmt.Errorf("peer 地址必须是 IPv4: %v", opts.PeerAddress)
-	}
+// SetSession 把承载层接到一次校园网会话上。
+func (d *Device) SetSession(ep *vpn.TunnelEndpoint, mapper *Mapper) {
+	d.relay.InstallSession(ep, mapper)
+}
 
-	// replace_peers 先清空，保证配置是幂等的：设备上只会存在这一个 peer。
-	b.WriteString("replace_peers=true\n")
-	fmt.Fprintf(&b, "public_key=%s\n", hex.EncodeToString(opts.PeerPublicKey[:]))
-	if v4 != nil {
-		// allowed_ip 决定哪些目的地址的包会被送进这条隧道。
-		fmt.Fprintf(&b, "allowed_ip=%s/32\n", v4.String())
-	}
-	return b.String(), nil
+// ClearSession 摘掉当前会话：设备继续监听，但不再有任何包进出隧道。
+func (d *Device) ClearSession() {
+	d.relay.ClearSession()
 }
 
 // SetPeer 在不重启设备的前提下替换 peer。
@@ -133,14 +122,24 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	if pub.IsZero() {
 		return fmt.Errorf("peer 公钥为空")
 	}
-	if addr == nil || addr.To4() == nil {
-		return fmt.Errorf("peer 地址必须是 IPv4: %v", addr)
+	conf, err := peerConfig(pub, addr)
+	if err != nil {
+		return err
 	}
-	conf := "replace_peers=true\n" +
-		"public_key=" + hex.EncodeToString(pub[:]) + "\n" +
-		"allowed_ip=" + addr.To4().String() + "/32\n"
 	if err := d.dev.IpcSet(conf); err != nil {
 		return fmt.Errorf("更新 peer: %w", err)
+	}
+	return nil
+}
+
+// ClearPeer 摘掉接入方。
+//
+// 隧道断开后必须做这件事：设备还在监听，若 peer 留着，客户端会握手成功，
+// 然后每个包都撞上"没有会话"被丢掉——从客户端看是"连上了但什么都打不开"，
+// 比干脆连不上难查得多。
+func (d *Device) ClearPeer() error {
+	if err := d.dev.IpcSet("replace_peers=true\n"); err != nil {
+		return fmt.Errorf("摘除 peer: %w", err)
 	}
 	return nil
 }

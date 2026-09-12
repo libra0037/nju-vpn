@@ -39,18 +39,25 @@ const (
 type RelayOptions struct {
 	// MTU 是暴露给 WireGuard 的 MTU。
 	MTU int
-	// Endpoint 是隧道端点。
-	Endpoint *vpn.TunnelEndpoint
-	// Mapper 在 peer 地址与校园网分配地址之间改写 IP 包，可为 nil。
-	Mapper *Mapper
+}
+
+// relaySession 是一次校园网会话在承载层里的接线。
+//
+// 设备活到进程结束，而会话每次 start 都是新的：服务端分配的校园网地址
+// 不同，Mapper 就得跟着换一份。整个结构体原子替换，两个方向都不会看到
+// "上行已换新、下行还指着旧会话"这种中间状态。
+type relaySession struct {
+	ep     *vpn.TunnelEndpoint
+	mapper *Mapper
 }
 
 // Relay 实现 tun.Device，把 WireGuard 和校园网隧道对接起来。
 type Relay struct {
-	mtu    int
-	ep     *vpn.TunnelEndpoint
-	mapper *Mapper
-	queue  chan []byte
+	mtu   int
+	queue chan []byte
+
+	// session 为 nil 表示当前没有校园网会话：客户端发来的包直接丢弃。
+	session atomic.Pointer[relaySession]
 
 	events    chan tun.Event
 	closed    chan struct{}
@@ -65,7 +72,11 @@ type Relay struct {
 	drops [dropReasonCount]dropCounter
 }
 
-// NewRelay 创建 relay，并把两个方向接到 endpoint 上。
+// NewRelay 创建 relay。
+//
+// 建的时候没有会话：设备可以先起来监听，等隧道通了再用 InstallSession
+// 接上。这样"端口被占""私钥写错"这类问题在进程启动时就暴露，不必等到
+// 登录、短信、建隧道全部走完。
 func NewRelay(opts RelayOptions) *Relay {
 	mtu := opts.MTU
 	if mtu <= 0 {
@@ -73,19 +84,31 @@ func NewRelay(opts RelayOptions) *Relay {
 	}
 	r := &Relay{
 		mtu:    mtu,
-		ep:     opts.Endpoint,
-		mapper: opts.Mapper,
 		queue:  make(chan []byte, queueSize),
 		events: make(chan tun.Event, 8),
 		closed: make(chan struct{}),
 	}
 
-	opts.Endpoint.SetDownlink(r.deliver)
-
 	// 设备已经就绪，直接报告 Up。这里没有真正的网卡需要等待系统拉起。
 	r.events <- tun.EventUp
 
 	return r
+}
+
+// InstallSession 把承载层接到一次校园网会话上。
+//
+// 可以反复调用。换绑之后旧会话的回调立刻失效；旧会话残留的下行包即使
+// 挤进来，也会因为目的地址不等于新会话分配到的地址而被 Mapper 丢掉。
+func (r *Relay) InstallSession(ep *vpn.TunnelEndpoint, mapper *Mapper) {
+	r.session.Store(&relaySession{ep: ep, mapper: mapper})
+	ep.SetDownlink(r.deliver)
+}
+
+// ClearSession 摘掉当前会话。设备继续监听，但不再有任何包进出隧道。
+func (r *Relay) ClearSession() {
+	if old := r.session.Swap(nil); old != nil {
+		old.ep.ClearDownlink()
+	}
 }
 
 // deliver 接收隧道下行的字节流，按 IP 总长度切包后放进队列。
@@ -101,6 +124,11 @@ func (r *Relay) deliver(chunk []byte) {
 		return
 	default:
 	}
+	sess := r.session.Load()
+	if sess == nil {
+		// 会话刚被摘掉，这是最后一瞬间漂进来的包。
+		return
+	}
 
 	r.frameMu.Lock()
 	r.frameBuf = append(r.frameBuf, chunk...)
@@ -109,7 +137,9 @@ func (r *Relay) deliver(chunk []byte) {
 		pkt, rest, err := splitPacket(r.frameBuf)
 		if err != nil {
 			// 对端给了不符合 IPv4 的字节，丢掉整段缓冲等下一个包同步。
-			log.Printf("wireguard: 下行数据无法解析为 IPv4 包: %v", err)
+			// 走统一的计数与限速：以前这里是裸日志，下行一旦失步就按
+			// chunk 刷屏，而 DropStats 里一条记录都没有。
+			r.countDrop(dropDownlinkInvalid)
 			r.frameBuf = nil
 			break
 		}
@@ -122,8 +152,8 @@ func (r *Relay) deliver(chunk []byte) {
 	r.frameMu.Unlock()
 
 	for _, pkt := range packets {
-		if r.mapper != nil {
-			rewritten, err := r.mapper.Downlink(pkt)
+		if sess.mapper != nil {
+			rewritten, err := sess.mapper.Downlink(pkt)
 			if err != nil {
 				r.countDrop(dropDownlinkAddr)
 				continue
@@ -178,6 +208,11 @@ const (
 	dropUplinkAddr
 	// dropNoBuffer：读缓冲装不下这个包（见 Read 的注释）。
 	dropNoBuffer
+	// dropNoSession：客户端发来的包到达时还没有校园网会话（隧道没建、
+	// 或正在断开），整批丢弃。
+	dropNoSession
+	// dropNoUplink：有会话但上行通道还没接上（Run 正在建流，或刚被摘掉）。
+	dropNoUplink
 
 	dropReasonCount
 )
@@ -189,6 +224,8 @@ var dropReasonText = [dropReasonCount]string{
 	dropUplinkNotIPv4:   "上行解出来的不是 IPv4 包",
 	dropUplinkAddr:      "上行包的源地址不是 peer_address（客户端 ip 配置不一致？）",
 	dropNoBuffer:        "读缓冲装不下这个包",
+	dropNoSession:       "隧道尚未建立，客户端发来的包被丢弃",
+	dropNoUplink:        "隧道上行通道未就绪，包被丢弃",
 }
 
 // dropCounter 是一种原因的计数与限速状态。
@@ -271,8 +308,14 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 		return 0, ErrClosed
 	default:
 	}
-	if !r.ep.HasUplink() {
-		return 0, vpn.ErrNoUplink
+	sess := r.session.Load()
+	if sess == nil {
+		// 没有会话时静默丢弃，而不是回一个错误：wireguard-go 的接收协程
+		// 见到 Write 报错会按包打一行 Error 级日志（receive.go 的
+		// "Failed to write packets to TUN device"），断线窗口里客户端
+		// 每个包都能刷出一行。丢包本身由上层重传兜住，日志由计数限速接管。
+		r.countDrop(dropNoSession)
+		return len(bufs), nil
 	}
 
 	n := 0
@@ -286,16 +329,19 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 			r.countDrop(dropUplinkNotIPv4)
 			continue
 		}
-		if r.mapper != nil {
-			rewritten, err := r.mapper.Uplink(pkt)
+		if sess.mapper != nil {
+			rewritten, err := sess.mapper.Uplink(pkt)
 			if err != nil {
 				r.countDrop(dropUplinkAddr)
 				continue
 			}
 			pkt = rewritten
 		}
-		if err := r.ep.Send(pkt); err != nil {
-			return n, err
+		if err := sess.ep.Send(pkt); err != nil {
+			// 上行还没注册（Run 正在建流）或刚被摘掉：同样静默丢弃，
+			// 理由同上——回错误只会换来一行按包的 Error 日志。
+			r.countDrop(dropNoUplink)
+			continue
 		}
 		n++
 	}
@@ -317,9 +363,8 @@ func (r *Relay) BatchSize() int { return 1 }
 // Close 停止设备并关闭事件通道。可安全重复调用。
 func (r *Relay) Close() error {
 	r.closeOnce.Do(func() {
-		if r.ep != nil {
-			r.ep.SetDownlink(nil)
-		}
+		// 先摘会话：之后隧道侧不会再往这个设备里投包。
+		r.ClearSession()
 		close(r.closed)
 		r.events <- tun.EventDown
 		close(r.events)

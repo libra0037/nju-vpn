@@ -167,18 +167,18 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 
 	port := freeUDPPort(t)
 	server, err := NewDevice(DeviceOptions{
-		MTU:           1420,
-		Endpoint:      ep,
-		Mapper:        mapper,
-		PrivateKey:    serverPriv,
-		ListenPort:    port,
-		PeerPublicKey: clientPub,
-		PeerAddress:   net.ParseIP(peerIP),
+		MTU:        1420,
+		PrivateKey: serverPriv,
+		ListenPort: port,
 	})
 	if err != nil {
 		t.Fatalf("创建承载设备失败: %v", err)
 	}
 	defer server.Close()
+	server.SetSession(ep, mapper)
+	if err := server.SetPeer(clientPub, net.ParseIP(peerIP)); err != nil {
+		t.Fatalf("配置 peer 失败: %v", err)
+	}
 
 	if stats, err := server.Stats(); err != nil || len(stats) != 1 {
 		t.Fatalf("peer 数量 = %d, err = %v，期望 1", len(stats), err)
@@ -278,18 +278,18 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 
 	port := freeUDPPort(t)
 	server, err := NewDevice(DeviceOptions{
-		MTU:           1420,
-		Endpoint:      ep,
-		Mapper:        mapper,
-		PrivateKey:    serverPriv,
-		ListenPort:    port,
-		PeerPublicKey: allowedPub,
-		PeerAddress:   net.ParseIP("10.66.66.2"),
+		MTU:        1420,
+		PrivateKey: serverPriv,
+		ListenPort: port,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	server.SetSession(ep, mapper)
+	if err := server.SetPeer(allowedPub, net.ParseIP("10.66.66.2")); err != nil {
+		t.Fatalf("配置 peer 失败: %v", err)
+	}
 
 	clientTun := newMemoryTun()
 	clientDev := device.NewDevice(clientTun, conn.NewDefaultBind(),
@@ -340,12 +340,14 @@ func TestDeviceCloseStopsForwarding(t *testing.T) {
 	peerPub, _ := peerPriv.PublicKey()
 
 	dev, err := NewDevice(DeviceOptions{
-		MTU: 1420, Endpoint: ep, Mapper: mapper,
-		PrivateKey: priv, ListenPort: freeUDPPort(t),
-		PeerPublicKey: peerPub, PeerAddress: net.ParseIP("10.66.66.2"),
+		MTU: 1420, PrivateKey: priv, ListenPort: freeUDPPort(t),
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	dev.SetSession(ep, mapper)
+	if err := dev.SetPeer(peerPub, net.ParseIP("10.66.66.2")); err != nil {
+		t.Fatalf("配置 peer 失败: %v", err)
 	}
 
 	// 关闭前：直接往端点注包是能送出去的（这条不依赖 WireGuard）。

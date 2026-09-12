@@ -28,7 +28,8 @@ func ipv4Pkt(src, dst [4]byte, payload int) []byte {
 func newTestRelay(t *testing.T) (*Relay, *vpn.TunnelEndpoint) {
 	t.Helper()
 	ep := vpn.NewEndpoint()
-	r := NewRelay(RelayOptions{MTU: 1320, Endpoint: ep})
+	r := NewRelay(RelayOptions{MTU: 1320})
+	r.InstallSession(ep, nil)
 	t.Cleanup(func() { r.Close() })
 	return r, ep
 }
@@ -147,13 +148,49 @@ func TestRelayClosedBehavior(t *testing.T) {
 	}
 }
 
-// 上行没有通道时必须明确报错，让 WireGuard 知道数据没送出去。
+// 上行没有通道时静默丢弃并计数。
+//
+// 不能回错误：wireguard-go 的接收协程见到 Write 报错会按包打一行 Error 级
+// 日志，断线窗口里客户端每个包都能刷出一行。丢包由上层重传兜住，日志改成
+// 按原因计数 + 限速。
 func TestRelayWriteWithoutUplink(t *testing.T) {
 	r, _ := newTestRelay(t)
 	peer := [4]byte{10, 66, 66, 2}
 	pub := [4]byte{172, 29, 56, 18}
-	if _, err := r.Write([][]byte{ipv4Pkt(peer, pub, 10)}, 0); !errors.Is(err, vpn.ErrNoUplink) {
-		t.Errorf("没有上行通道时应返回 ErrNoUplink，实际 %v", err)
+	if _, err := r.Write([][]byte{ipv4Pkt(peer, pub, 10)}, 0); err != nil {
+		t.Errorf("没有上行通道时不该报错（会变成逐包日志），实际 %v", err)
+	}
+
+	var counted bool
+	for reason := range r.DropStats() {
+		if strings.Contains(reason, "上行通道") {
+			counted = true
+		}
+	}
+	if !counted {
+		t.Errorf("丢包原因应记入统计，实际 %v", r.DropStats())
+	}
+}
+
+// 没有会话时同样静默丢弃：设备比任何一次校园网会话都活得久，
+// 隧道没建时客户端可能已经握手并发包了。
+func TestRelayWriteWithoutSession(t *testing.T) {
+	r := NewRelay(RelayOptions{MTU: 1320})
+	defer r.Close()
+
+	peer := [4]byte{10, 66, 66, 2}
+	pub := [4]byte{172, 29, 56, 18}
+	if _, err := r.Write([][]byte{ipv4Pkt(peer, pub, 10)}, 0); err != nil {
+		t.Errorf("没有会话时不该报错，实际 %v", err)
+	}
+	var counted bool
+	for reason := range r.DropStats() {
+		if strings.Contains(reason, "隧道尚未建立") {
+			counted = true
+		}
+	}
+	if !counted {
+		t.Errorf("丢包原因应记入统计，实际 %v", r.DropStats())
 	}
 }
 
@@ -164,7 +201,8 @@ func TestRelayAppliesMapperOnUplink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRelay(RelayOptions{MTU: 1320, Endpoint: ep, Mapper: mapper})
+	r := NewRelay(RelayOptions{MTU: 1320})
+	r.InstallSession(ep, mapper)
 	defer r.Close()
 
 	var sent []byte
@@ -194,7 +232,8 @@ func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRelay(RelayOptions{MTU: 1320, Endpoint: ep, Mapper: mapper})
+	r := NewRelay(RelayOptions{MTU: 1320})
+	r.InstallSession(ep, mapper)
 	defer r.Close()
 
 	peer := [4]byte{10, 66, 66, 2}
@@ -219,7 +258,8 @@ func TestDropReasonsAreDistinguished(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRelay(RelayOptions{MTU: 1320, Endpoint: ep, Mapper: mapper})
+	r := NewRelay(RelayOptions{MTU: 1320})
+	r.InstallSession(ep, mapper)
 	defer r.Close()
 
 	// 上行：源地址不是 peer 地址，会被 mapper 拒绝。

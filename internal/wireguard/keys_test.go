@@ -111,15 +111,12 @@ func TestUAPIConfigUsesHexKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conf, err := uapiConfig(DeviceOptions{
-		PrivateKey:    priv,
-		ListenPort:    51820,
-		PeerPublicKey: pub,
-		PeerAddress:   net.ParseIP("10.66.66.2"),
-	})
+	conf := uapiConfig(priv, 51820)
+	peer, err := peerConfig(pub, net.ParseIP("10.66.66.2"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	conf += peer
 
 	if !strings.Contains(conf, "private_key="+hex.EncodeToString(priv[:])) {
 		t.Errorf("私钥不是十六进制形式:\n%s", conf)
@@ -141,16 +138,13 @@ func TestUAPIConfigUsesHexKeys(t *testing.T) {
 	}
 }
 
-// 没有 peer 公钥时仍然要能启动，只是没有客户端能接入。
+// 没有 peer 公钥时设备仍然照常启动，只是没有客户端能接入。
 func TestUAPIConfigWithoutPeer(t *testing.T) {
 	priv, err := GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf, err := uapiConfig(DeviceOptions{PrivateKey: priv, ListenPort: 51820})
-	if err != nil {
-		t.Fatal(err)
-	}
+	conf := uapiConfig(priv, 51820)
 	if strings.Contains(conf, "public_key=") {
 		t.Errorf("没有 peer 时不该写 public_key:\n%s", conf)
 	}
@@ -163,12 +157,7 @@ func TestUAPIConfigRejectsIPv6Peer(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub, _ := priv.PublicKey()
-	_, err = uapiConfig(DeviceOptions{
-		PrivateKey:    priv,
-		ListenPort:    1,
-		PeerPublicKey: pub,
-		PeerAddress:   net.ParseIP("2001:db8::2"),
-	})
+	_, err = peerConfig(pub, net.ParseIP("2001:db8::2"))
 	if err == nil {
 		t.Error("IPv6 的 peer 地址应被拒绝")
 	}

@@ -133,24 +133,27 @@ func (s *Session) Run(ctx context.Context) error {
 	}
 	s.track(rx)
 
-	// 返回时必须把这两条流关掉：本函数的注释承诺"不留任何连接"，
-	// 而 RunWithRetry 每一轮都会调用它——漏一次就是一组连接堆到会话结束。
-	defer func() {
-		tx.Close()
-		rx.Close()
-		s.untrack(tx, rx)
-	}()
-
 	sink := newUplinkSink(tx)
 	s.ep.SetUplink(sink.Write)
-	defer s.ep.ClearUplink()
-
 	// ctx 取消时主动关闭两条连接，让下面阻塞的读写立刻返回。
 	stop := context.AfterFunc(ctx, func() {
 		rx.Close()
 		tx.Close()
 	})
-	defer stop()
+	// 收尾顺序是有讲究的（LIFO 展开）：先注销 AfterFunc、再摘上行回调，
+	// 最后关流。反过来的话，先关流会让一个正在写（被背压挡住）的 Send
+	// 卡在旧实现那把锁上，ClearUplink 与 dev.Close() 就跟着一起挂住，
+	// 登出永远发不出去（真机出现过：stop 不返回，只能强杀进程）。
+	//
+	// 这个 defer 同时负责注释开头那条承诺：返回时不留任何连接与 goroutine。
+	// RunWithRetry 每一轮都会调用本函数，漏一次就是一组连接堆到会话结束。
+	defer func() {
+		stop()
+		s.ep.ClearUplink()
+		tx.Close()
+		rx.Close()
+		s.untrack(tx, rx)
+	}()
 
 	recvErr := make(chan error, 1)
 	go func() { recvErr <- s.readLoop(rx) }()
