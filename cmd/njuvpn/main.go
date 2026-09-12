@@ -144,7 +144,7 @@ func cmdRun(args []string) error {
 	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
-	return service.RunServer(svc, cfg.IPC.Endpoint)
+	return service.RunServer(svc, endpointOf(cfg))
 }
 
 // generateWireGuardKey 生成私钥并写回配置文件。
@@ -208,7 +208,10 @@ func cmdRestart(args []string) error {
 		return err
 	}
 
-	endpoint := serviceEndpoint(*configPath)
+	endpoint, err := serviceEndpoint(*configPath)
+	if err != nil {
+		return err
+	}
 	if err := shutdownService(endpoint); err != nil {
 		log.Printf("服务进程未在运行（%v），直接拉起", err)
 	} else if err := waitServiceGone(endpoint, serviceStopTimeout); err != nil {
@@ -239,8 +242,11 @@ func cmdSetPeer(args []string) error {
 	if key == "" {
 		return errors.New("用法: njuvpn wg-peer <客户端公钥>")
 	}
-	return runAt(endpointOf(clientConfig(*configPath)),
-		ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
+	endpoint, err := endpointFor(*configPath)
+	if err != nil {
+		return err
+	}
+	return runAt(endpoint, ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
 }
 
 // cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。
@@ -263,8 +269,11 @@ func cmdAuth(args []string) error {
 
 	// 超时给足：服务端最坏路径是 submitCode + portalToken + acquireIP
 	//（3 次尝试 × 30 秒退避），加起来可能超过 3 分钟。
-	return runAt(endpointOf(clientConfig(*configPath)),
-		ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 5*time.Minute)
+	endpoint, err := endpointFor(*configPath)
+	if err != nil {
+		return err
+	}
+	return runAt(endpoint, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 5*time.Minute)
 }
 
 // parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。

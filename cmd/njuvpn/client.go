@@ -14,19 +14,24 @@ import (
 
 // clientConfig 是命令行客户端需要的配置：只有 IPC 端点。
 //
-// CLI 只使用端点字段（配置文件里虽然带着账号口令与 TOTP 密钥，但解析后
-// 不读它们），所以配置文件读不到时不该让 CLI 失效——退回默认端点即可。
-func clientConfig(configPath string) *config.Config {
+// 显式指定的配置文件读不出来时直接失败：端点按配置文件路径派生，此时既
+// 算不出端点，回落默认值又会打到另一个实例上——stop 与 restart 会误伤
+// 别人的服务进程，比"命令用不了"糟得多。
+func clientConfig(configPath string) (*config.Config, error) {
 	cfg, err := config.LoadForClient(configPath)
 	if err == nil {
-		return cfg
+		return cfg, nil
 	}
-	// 用户显式指定的配置读不出来时要说一声，否则会连到默认端点上，
-	// 而用户以为自己在操作另一台服务进程。
 	if configPath != "" {
-		fmt.Fprintf(os.Stderr, "%s: 无法加载配置 %s: %v（改用默认端点）\n", prog, configPath, err)
+		return nil, fmt.Errorf("无法加载配置 %s: %w", configPath, err)
 	}
-	return &config.Config{}
+	// 没显式指定路径时退一步：路径还是默认路径，只是内容读不出来或校验
+	// 不过。端点只依赖路径，仍然算得出来；服务进程若也是这个情形，它同样
+	// 起不来，命令会以"服务是否在运行"收场。
+	fmt.Fprintf(os.Stderr, "%s: 配置 %s 不可用: %v（按默认路径的端点继续）\n", prog, config.DefaultPath(), err)
+	fallback := &config.Config{}
+	fallback.SetSourcePath(config.DefaultPath())
+	return fallback, nil
 }
 
 // call 向服务进程发一条请求并返回响应。
@@ -55,11 +60,27 @@ func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response
 }
 
 // endpointOf 解析出 IPC 端点。
+//
+// 显式配置了 ipc.endpoint 就用它；否则按配置文件的路径派生。后者是
+// 多实例互不打架的关键：同一台机器上的每个实例各有一份配置文件，
+// 端点自然互不相同（见 ipc.EndpointFor）。
 func endpointOf(cfg *config.Config) string {
-	if cfg != nil && cfg.IPC.Endpoint != "" {
+	if cfg == nil {
+		return ""
+	}
+	if cfg.IPC.Endpoint != "" {
 		return cfg.IPC.Endpoint
 	}
-	return ipc.DefaultEndpoint()
+	return ipc.EndpointFor(cfg.SourcePath())
+}
+
+// endpointFor 是 clientConfig 加 endpointOf 的组合，供各命令使用。
+func endpointFor(configPath string) (string, error) {
+	cfg, err := clientConfig(configPath)
+	if err != nil {
+		return "", err
+	}
+	return endpointOf(cfg), nil
 }
 
 // runCommand 是 start/stop/status/auth 的公共实现。
@@ -72,7 +93,11 @@ func runCommand(name string, args []string, req ipc.Request, timeout time.Durati
 	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
-	return runAt(endpointOf(clientConfig(*configPath)), req, timeout)
+	endpoint, err := endpointFor(*configPath)
+	if err != nil {
+		return err
+	}
+	return runAt(endpoint, req, timeout)
 }
 
 // runAt 向指定端点发一条请求，并按响应状态码决定退出码。

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -197,8 +198,37 @@ func (c *Config) validate() error {
 	if ip := net.ParseIP(c.WireGuard.PeerAddress); ip == nil || ip.To4() == nil {
 		return fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址: %q", c.WireGuard.PeerAddress)
 	}
+	if c.IPC.Endpoint != "" {
+		if err := validateEndpoint(c.IPC.Endpoint); err != nil {
+			return err
+		}
+	}
 	return nil
 }
+
+// validateEndpoint 检查显式配置的 IPC 端点。
+//
+// 相对路径会随工作目录漂移：同一个实例从不同目录发起命令会被算成另一个
+// 端点，进而把一个跑着的实例当成"没在运行"，再拉起一个——两个进程抢同
+// 一个账号。留空表示按配置文件的路径派生，不需要写。
+func validateEndpoint(endpoint string) error {
+	if runtime.GOOS == "windows" {
+		if !strings.HasPrefix(endpoint, pipePrefixForConfig) {
+			return fmt.Errorf("ipc.endpoint 在 Windows 下必须是命名管道（以 %s 开头）: %q", pipePrefixForConfig, endpoint)
+		}
+		return nil
+	}
+	if !filepath.IsAbs(endpoint) {
+		return fmt.Errorf("ipc.endpoint 必须是绝对路径: %q", endpoint)
+	}
+	return nil
+}
+
+// pipePrefixForConfig 与 ipc 包里的管道前缀保持一致。
+//
+// 这里不引用 ipc 包：config 是叶子，被 ipc 之外的许多包依赖，反过来依赖
+// 会把依赖图绕成一团。取值只有这一个，重复一份的代价小于绕圈。
+const pipePrefixForConfig = `\\.\pipe\`
 
 // Warnings 返回不影响启动、但用户应该知道的问题。
 func (c *Config) Warnings() []string {

@@ -24,8 +24,8 @@ const (
 )
 
 // serviceEndpoint 解析服务进程的 IPC 端点。
-func serviceEndpoint(configPath string) string {
-	return endpointOf(clientConfig(configPath))
+func serviceEndpoint(configPath string) (string, error) {
+	return endpointFor(configPath)
 }
 
 // serviceLogPath 让服务进程的日志落在配置文件旁边。
@@ -73,7 +73,10 @@ func pingService(endpoint string) error {
 // 服务进程由 CLI 按需拉起，而不是装成系统服务——它不需要任何特权，
 // 也只在你要用的时候才有存在意义。
 func ensureService(configPath string) error {
-	endpoint := serviceEndpoint(configPath)
+	endpoint, err := serviceEndpoint(configPath)
+	if err != nil {
+		return err
+	}
 	if err := pingService(endpoint); err == nil {
 		return nil
 	}

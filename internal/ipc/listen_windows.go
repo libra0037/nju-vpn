@@ -3,6 +3,7 @@
 package ipc
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os/user"
@@ -15,22 +16,36 @@ import (
 // pipePrefix 是命名管道的命名空间前缀。
 const pipePrefix = `\\.\pipe\`
 
-// DefaultEndpoint 返回当前平台的默认端点。Windows 下固定用命名管道。
-func DefaultEndpoint() string { return pipePrefix + "njuvpn" }
+// ErrEmptyEndpoint 表示调用方没有解析出 IPC 端点。
+var ErrEmptyEndpoint = errors.New("IPC 端点为空")
+
+// endpointPath 把实例标识拼成命名管道名。
+//
+// 管道名是全局命名空间、所有用户共用，所以必须带实例标识：否则同一台机器上
+// 第二个实例既起不来（名字被占），CLI 也会把命令发给第一个实例。
+func endpointPath(id string) string { return pipePrefix + "njuvpn-" + id }
 
 // Listen 在命名管道上监听。
 //
 // 管道必须显式指定访问控制：不传 SecurityDescriptor 时 DACL 由运行账户的
-// 令牌推导，并不等于"只有创建者能访问"，而这条通道能提交验证码、启动隧道。
+// 令牌推导，并不等于只有创建者能访问，而这条通道能提交验证码、启动隧道。
 func Listen(endpoint string) (net.Listener, error) {
 	if endpoint == "" {
-		endpoint = DefaultEndpoint()
+		return nil, ErrEmptyEndpoint
 	}
 	if !strings.HasPrefix(endpoint, pipePrefix) {
 		return nil, fmt.Errorf("Windows 下的 IPC 端点必须是命名管道（以 %s 开头），收到 %q", pipePrefix, endpoint)
 	}
 
-	cfg := &winio.PipeConfig{SecurityDescriptor: currentUserSDDL()}
+	sddl, err := currentUserSDDL()
+	if err != nil {
+		// 拿不到 SID 时不能退化成仅 SYSTEM 与管理员继续启动：那样服务进程
+		// 自己都连不上自己的管道，却仍然占着这个名字，第二个实例也起不来，
+		// 用户只能手工去杀进程。
+		return nil, err
+	}
+
+	cfg := &winio.PipeConfig{SecurityDescriptor: sddl}
 	ln, err := winio.ListenPipe(endpoint, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("监听命名管道 %s: %w", endpoint, err)
@@ -39,24 +54,22 @@ func Listen(endpoint string) (net.Listener, error) {
 }
 
 // currentUserSDDL 显式指定管道的访问控制。
-//
-// 不是为了防"同机的其他用户"——个人机器上没有第二个用户；只是不想让
-// DACL 由运行账户的令牌隐式推导出意外结果。
-func currentUserSDDL() string {
+func currentUserSDDL() (string, error) {
 	const base = "D:(A;;GA;;;SY)(A;;GA;;;BA)"
 	u, err := user.Current()
-	if err != nil || u.Uid == "" {
-		// 拿不到 SID 时退化成"仅 SYSTEM 与管理员"：宁可自己连不上，
-		// 也不要把能提交验证码的通道对外开放。
-		return base
+	if err != nil {
+		return "", fmt.Errorf("取不到当前用户的 SID，无法为命名管道设置访问控制: %w", err)
 	}
-	return base + "(A;;GA;;;" + u.Uid + ")"
+	if u.Uid == "" {
+		return "", errors.New("取不到当前用户的 SID，无法为命名管道设置访问控制")
+	}
+	return base + "(A;;GA;;;" + u.Uid + ")", nil
 }
 
 // Dial 连接服务进程。
 func Dial(endpoint string) (net.Conn, error) {
 	if endpoint == "" {
-		endpoint = DefaultEndpoint()
+		return nil, ErrEmptyEndpoint
 	}
 	timeout := 5 * time.Second
 	conn, err := winio.DialPipe(endpoint, &timeout)
