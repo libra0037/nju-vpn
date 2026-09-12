@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -120,6 +121,11 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	// 端口冲突要在登录之前发现：等到承载层启动时才失败，已经白烧了一条
+	// 短信与一次建隧道配额。
+	if err := precheckListenPort(cfg); err != nil {
+		return err
+	}
 	if *proxy != "" {
 		cfg.Proxy = *proxy
 	}
@@ -151,6 +157,32 @@ func cmdRun(args []string) error {
 }
 
 // generateWireGuardKey 生成私钥并写回配置文件。
+// precheckListenPort 试绑一次承载层的 UDP 端口。
+//
+// 绑上就立刻关掉，只为尽早给出"端口被占"这个结论，并点名是哪个配置项。
+// 同一台机器上跑多个实例时，这是最常见的启动失败原因。
+func precheckListenPort(cfg *config.Config) error {
+	port := cfg.WireGuard.ListenPort
+	if port == 0 {
+		return nil // 交给系统分配，不会冲突
+	}
+	host, err := wireguard.ParseListenHost(cfg.WireGuard.ListenHost)
+	if err != nil {
+		return err
+	}
+	addr := "127.0.0.1"
+	if host == wireguard.ListenAll {
+		addr = "0.0.0.0"
+	}
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(addr), Port: port})
+	if err != nil {
+		return fmt.Errorf("承载层端口 %s:%d 不可用（同一台机器上跑了另一个实例？"+
+			"改 wireguard.listen_port 后重启）: %w", addr, port, err)
+	}
+	conn.Close()
+	return nil
+}
+
 func generateWireGuardKey(cfg *config.Config) error {
 	key, err := wireguard.GenerateKey()
 	if err != nil {
@@ -293,7 +325,21 @@ func cmdRestart(args []string) error {
 }
 
 func cmdStatus(args []string) error {
-	return runCommand("status", args, ipc.Request{Command: ipc.CmdStatus}, 30*time.Second)
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	check := fs.Bool("check", false, "隧道不在 up 状态时以非 0 退出（给巡检脚本用）")
+	if _, err := parseInterleaved(fs, args); err != nil {
+		return err
+	}
+	endpoint, err := endpointFor(*configPath)
+	if err != nil {
+		return err
+	}
+	req := ipc.Request{Command: ipc.CmdStatus}
+	if *check {
+		req.Args = []string{"check"}
+	}
+	return runAt(endpoint, req, 30*time.Second)
 }
 
 // cmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。

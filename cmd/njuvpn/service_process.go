@@ -18,7 +18,10 @@ const (
 	// 与私钥生成（首次运行时），通常远快于这个值。
 	serviceStartTimeout = 10 * time.Second
 	// serviceStopTimeout 是等待服务进程退出的上限（含一次登出请求）。
-	serviceStopTimeout = 15 * time.Second
+	//
+	// 服务进程是先登出、再关监听（这样"端点不再响应"就等于"会话已释放"），
+	// 所以这个上限要能覆盖一次登出：登出自身有 10 秒超时，加上收尾的等待。
+	serviceStopTimeout = 30 * time.Second
 	// pingTimeout 是单次探活的超时。
 	pingTimeout = 500 * time.Millisecond
 )

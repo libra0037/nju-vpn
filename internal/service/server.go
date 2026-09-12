@@ -158,9 +158,20 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		return ipc.Response{Code: ipc.CodeOK, Message: "服务进程正在退出"}
 
 	case ipc.CmdStatus:
-		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(s.svc.Status())}
+		st := s.svc.Status()
+		// `status -check` 给巡检脚本用：隧道不在 up 时以非 0 退出，
+		// 而不是把"进程活着"当成"链路正常"。
+		if len(req.Args) > 0 && req.Args[0] == "check" && st.State != StateUp {
+			return ipc.Response{Code: ipc.CodeRejected, Message: statusLine(st)}
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(st)}
 
 	case ipc.CmdStart:
+		// 已经建好时再敲一次 start 是常见操作（脚本巡检也会这么写），
+		// 按成功处理，别报成 409 让看门狗一直以为出事了。
+		if s.svc.Status().State == StateUp {
+			return ipc.Response{Code: ipc.CodeOK, Message: "隧道已在运行"}
+		}
 		password, err := passwordArg(req.Args)
 		if err != nil {
 			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
@@ -301,7 +312,13 @@ func RunServer(svc *Service, endpoint string) error {
 			log.Printf("收到信号 %v，准备退出", sig)
 		case <-srv.Done():
 			log.Printf("收到 shutdown 命令，准备退出")
+		case <-svc.Done():
+			log.Printf("服务对象已收尾，准备退出")
 		}
+		// 先收尾（含登出）再关监听：CLI 的 restart 用"端点不再响应"判断旧
+		// 进程已经退干净。端点若先消失，新进程会和还没发完的登出抢同一个
+		// 账号的名额（服务端只允许一条会话）。
+		svc.Close()
 		srv.Shutdown()
 	}()
 	// 故意不 signal.Stop：收尾（登出）由调用方在 Serve 返回之后做，
@@ -309,6 +326,9 @@ func RunServer(svc *Service, endpoint string) error {
 	// 会把登出请求打断，服务端名额要等它自己超时才释放。
 
 	err = srv.Serve()
+	// Serve 返回说明监听已经关闭；这里再收一次尾（Close 幂等），然后等
+	// 在处理的请求写完响应。
+	svc.Close()
 	srv.Shutdown()
 	// 等在处理的请求写完响应再返回：调用方随后就会登出并退出。
 	srv.Wait(shutdownWaitTimeout)

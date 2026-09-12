@@ -125,6 +125,12 @@ func New(cfg *config.Config) *Service {
 // Status 返回当前状态快照。它不经过 actor，永远立即可用。
 func (s *Service) Status() Status { return s.status.Get() }
 
+// Done 在服务对象开始收尾（Close 被调用）时关闭。
+//
+// 服务进程的主循环靠它解阻塞：Close 可能来自任何一处（信号、shutdown
+// 命令、调用方的 defer），监听套接字必须跟着一起收掉。
+func (s *Service) Done() <-chan struct{} { return s.closed }
+
 // SetDialer 替换出站拨号函数（测试用）。
 //
 // 必须在第一次调用 Start 之前设置：真正读取它的只有 actor 协程，
@@ -648,6 +654,9 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 		detail += ": " + err.Error()
 	}
 	s.status.set(StateError, detail)
+	// 重连窗口已经用尽：进程还活着，但不会自己再登录一次（短信模式下重登
+	// 要人输验证码）。把恢复命令写进日志，别让用户对着 error 猜。
+	log.Printf("隧道已停止，等待人工恢复：njuvpn start（会重新登录一次）")
 	return nil
 }
 
@@ -677,16 +686,13 @@ func listenHost(s string) wireguard.ListenHost {
 
 // bearerSummary 描述承载层的监听状态。
 //
-// 配置里端口写 0 时由系统分配，日志要给出真实端口而不是一个 0。
+// 日志里给的是设备实际监听的端口：配置走默认值，但以设备为准更可靠。
 func (s *Service) bearerSummary(dev *wireguard.Device, peerKey wireguard.Key) string {
 	port := s.cfg.WireGuard.ListenPort
 	if actual, err := dev.ListenPort(); err == nil && actual > 0 {
 		port = actual
 	}
 	listen := fmt.Sprintf("UDP %d", port)
-	if port == 0 {
-		listen = "UDP 端口由系统分配"
-	}
 	scope := "仅本机（127.0.0.1）"
 	if listenHost(s.cfg.WireGuard.ListenHost) == wireguard.ListenAll {
 		scope = "全部网卡"
