@@ -1,13 +1,60 @@
 package main
 
 import (
+	"bufio"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/ipc"
 )
+
+// TestEnsureProbeIsSafe 验证本机隧道在跑时会拦住 probe。
+//
+// probe 会完整登录一次，占掉该账号唯一的会话名额：正在跑的隧道会被踢下线，
+// 短信模式下还要再花一条验证码。
+func TestEnsureProbeIsSafe(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := &config.Config{}
+	cfg.SetSourcePath(configPath)
+	cfg.IPC.Endpoint = ipc.EndpointFor(configPath)
+
+	// 服务进程没在跑时不该拦。
+	if err := ensureProbeIsSafe(cfg); err != nil {
+		t.Fatalf("服务进程没在跑时不该拦: %v", err)
+	}
+
+	ln, err := ipc.Listen(cfg.IPC.Endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if _, err := ipc.ReadRequest(bufio.NewReader(c)); err != nil {
+					return
+				}
+				_ = ipc.WriteResponse(c, ipc.Response{Code: ipc.CodeOK, Message: "up | 校园网地址 172.29.56.18"})
+			}(conn)
+		}
+	}()
+
+	err = ensureProbeIsSafe(cfg)
+	if err == nil {
+		t.Fatal("隧道在跑时应当拦住 probe")
+	}
+	if !strings.Contains(err.Error(), "-force") {
+		t.Fatalf("提示里要给出路（-force），实际 %v", err)
+	}
+}
 
 // TestPrecheckListenPort 验证端口预检：占用的端口要报错，0 表示交给系统。
 //

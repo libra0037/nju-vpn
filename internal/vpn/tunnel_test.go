@@ -200,9 +200,33 @@ func TestRunWithRetryStopsOnTerminalControlCode(t *testing.T) {
 }
 
 // 可重试的错误在 ctx 取消后要立刻停下，不能睡满退避。
+
+// ServerReset 不进重试循环：实测它是"建得太密"或"上条会话没释放"，
+// 继续重试只会把账号推得更远（还会撞上退避，看起来像卡住）。
+func TestRunWithRetryDoesNotRetryServerReset(t *testing.T) {
+	s := newScript(t)
+	s.tunnel.RejectStream(0x06, ControlServerReset)
+	sess := connectedSession(t, s)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := sess.RunWithRetry(ctx, RetryPolicy{Attempts: 10, Base: time.Hour, Max: time.Hour})
+	if err == nil {
+		t.Fatal("应当返回错误")
+	}
+	var ctrl *ControlError
+	if !errors.As(err, &ctrl) || ctrl.Code != ControlServerReset {
+		t.Fatalf("应当直接把控制码报出来，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("不该进重试退避，实际耗时 %s", elapsed)
+	}
+}
 func TestRunWithRetryAbortsOnContextCancel(t *testing.T) {
 	s := newScript(t)
-	s.tunnel.RejectStream(0x06, ControlServerReset) // 可重试
+	s.tunnel.RejectStream(0x06, ControlIPBusy) // 可重试：会进重试循环，再被 ctx 打断
 	sess := connectedSession(t, s)
 
 	ctx, cancel := context.WithCancel(context.Background())

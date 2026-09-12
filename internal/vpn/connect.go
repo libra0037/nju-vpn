@@ -136,16 +136,19 @@ func (c *Client) Connect(ctx context.Context, opt ConnectOptions) (*Session, err
 		start := time.Now()
 		newTwfID, err := c.webLogin(ctx, opt.Username, opt.Password)
 		authErr, isAuthErr := AsAuthRequired(err)
+		// 会话标识先记到 Session 上：即使接下来就返回错误（例如短信接口
+		// 出错），调用方也得能用它把服务端会话登出——同一账号只允许一条
+		// 会话，登不掉的会一直占着名额。
+		if newTwfID != "" {
+			twfID = newTwfID
+			sess.twfID = twfID
+		}
 		if err != nil && !isAuthErr {
 			opt.Trace.add("web-login", time.Since(start), err)
 			return sess, err
 		}
 		// 登录本身成功，只是停在二次验证上。
 		opt.Trace.add("web-login", time.Since(start), nil)
-		twfID = newTwfID
-		// 会话标识必须立刻记到 Session 上：即使接下来就返回错误，
-		// 调用方也得能用它把服务端的会话登出。
-		sess.twfID = twfID
 		if isAuthErr {
 			kind = authErr.Kind
 			needAuth = true

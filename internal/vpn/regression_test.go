@@ -42,6 +42,34 @@ func newScript(t *testing.T) *script {
 }
 
 // newBareConn 返回一条"握手不完整"的连接：它不实现 ServerHelloSessionID。
+
+// 回归：短信接口失败时，会话标识不能丢。
+//
+// 口令已经通过校验，服务端可能已经给这个会话留了名额；TwfID 交不出去就
+// 登不掉，那个名额会一直占着（同一账号只允许一条会话）。
+func TestSMSRequestFailureKeepsTwfID(t *testing.T) {
+	s := newScript(t)
+	s.portal.Set("/por/login_psw.csp", vpntest.Response{
+		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
+	})
+	// 短信接口坏了：服务端 500。
+	s.portal.Set("/por/login_sms.csp", vpntest.Response{Status: 500, Body: "boom"})
+	client := newTestClient(t, s)
+
+	sess, err := client.Connect(context.Background(), ConnectOptions{Username: "u", Password: "p"})
+	if err == nil {
+		t.Fatal("短信接口失败时应当报错")
+	}
+	if sess == nil || sess.TwfID() == "" {
+		t.Fatal("失败路径也必须交出会话标识，否则这个会话永远登不掉")
+	}
+	if err := sess.Close(context.Background()); err != nil {
+		t.Fatalf("登出失败: %v", err)
+	}
+	if s.portal.Count("/por/logout.csp") == 0 {
+		t.Fatal("没有向服务端发出登出请求")
+	}
+}
 func newBareConn() net.Conn {
 	client, server := net.Pipe()
 	go func() { _, _ = io.Copy(io.Discard, server) }()
@@ -161,8 +189,13 @@ func TestRetryableTreatsProtocolErrorAsTerminal(t *testing.T) {
 		t.Error("协议不符不该被当成可重试")
 	}
 	// 控制码仍然按自己的规则走：可重试的照样可重试。
-	if !retryable(&ControlError{Code: ControlServerReset}) {
-		t.Error("ServerReset 应当可重试")
+	if !retryable(&ControlError{Code: ControlIPBusy}) {
+		t.Error("IpBusy 应当可重试")
+	}
+	// ServerReset 不算可重试：实测它是"建得太密"或"上条会话没释放"，
+	// 继续重试会把账号推得更远，正确做法是等几分钟。
+	if retryable(&ControlError{Code: ControlServerReset}) {
+		t.Error("ServerReset 不该被当成可重试")
 	}
 }
 

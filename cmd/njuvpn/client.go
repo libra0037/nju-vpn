@@ -10,6 +10,7 @@ import (
 
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/service"
 	"golang.org/x/term"
 )
 
@@ -82,6 +83,26 @@ func endpointFor(configPath string) (string, error) {
 		return "", err
 	}
 	return endpointOf(cfg), nil
+}
+
+// ensureProbeIsSafe 在本机隧道正在运行时拦一下 probe。
+//
+// probe 会完整登录一次，占掉该账号唯一的会话名额：正在跑的隧道会被服务端
+// 踢下线（同一账号只允许一条会话），短信模式下还要再花一条验证码。
+// 只是想把某个会话登掉的话，用 probe -logout -twf-id 就够。
+func ensureProbeIsSafe(cfg *config.Config) error {
+	resp, err := call(endpointOf(cfg), ipc.Request{Command: ipc.CmdStatus}, 5*time.Second)
+	if err != nil {
+		return nil // 服务进程没在跑，随便探
+	}
+	state := strings.SplitN(resp.Message, " | ", 2)[0]
+	switch state {
+	case string(service.StateUp), string(service.StateAuthPending):
+		return fmt.Errorf("本机隧道正处于 %s：probe 会另开一个会话把它踢下线"+
+			"（同一账号只允许一条会话，短信模式下还会多花一条验证码）；"+
+			"先 njuvpn stop，或加 -force 继续", state)
+	}
+	return nil
 }
 
 // runCommand 是 start/stop/status/auth 的公共实现。

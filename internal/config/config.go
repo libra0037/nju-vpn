@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -230,6 +231,21 @@ func validateEndpoint(endpoint string) error {
 const pipePrefixForConfig = `\\.\pipe\`
 
 // Warnings 返回不影响启动、但用户应该知道的问题。
+// RedactProxy 把代理地址里的口令抹掉，供日志与状态输出使用。
+//
+// 代理地址支持 user:pass@host 写法，原文不该落到任何日志里（排查时经常
+// 整份贴出去）。解析不出来时也不回显原文：它可能就是一段带凭据的地址。
+func RedactProxy(proxy string) string {
+	if proxy == "" {
+		return ""
+	}
+	u, err := url.Parse(proxy)
+	if err != nil {
+		return "（无法解析的代理地址）"
+	}
+	return u.Redacted()
+}
+
 func (c *Config) Warnings() []string {
 	var out []string
 	if c.WireGuard.PeerPublicKey == "" {
@@ -278,19 +294,27 @@ func validateHost(field, host string) error {
 }
 
 // PersistPrivateKey 把自动生成的 WireGuard 私钥写回配置文件。
+//
+// 已经有了就不覆盖：两个进程同时首启同一份配置时，后写的那个会让盘上的
+// 私钥与正在跑的那个进程内存里的不一致——之后所有客户端配置都会失效。
 func PersistPrivateKey(path, key string) error {
-	return persistWireGuardField(path, "private_key", key)
+	return persistWireGuardField(path, "private_key", key, false)
 }
 
 // PersistPeerPublicKey 把客户端公钥写回配置文件。
+//
+// 这一条是用户显式发起的操作，要覆盖旧值。
 func PersistPeerPublicKey(path, key string) error {
-	return persistWireGuardField(path, "peer_public_key", key)
+	return persistWireGuardField(path, "peer_public_key", key, true)
 }
 
 // persistWireGuardField 就地替换 wireguard 段里的某个字段，保留原有注释——
 // 用 YAML 序列化整份配置会把注释全部丢掉，而那份文件是给人看的。
 // 找不到对应行时按情况插入或追加一段。
-func persistWireGuardField(path, field, value string) error {
+//
+// overwrite 为 false 时，字段已经有非空值就原样保留（私钥自举用得上：
+// 两个进程同时首启同一份配置时，先写的那把才算数）。
+func persistWireGuardField(path, field, value string, overwrite bool) error {
 	if path == "" {
 		return fmt.Errorf("没有配置文件路径")
 	}
@@ -330,6 +354,9 @@ func persistWireGuardField(path, field, value string) error {
 		}
 		sectionEnd = i
 		if strings.HasPrefix(trimmed, field+":") {
+			if !overwrite && existingValue(line) != "" {
+				return nil
+			}
 			// 保留行尾注释：样例文件里 private_key 那行就带着说明，
 			// 写回私钥时丢掉它等于破坏用户手写的配置。
 			lines[i] = line[:indent] + field + ": " + value + commentOf(line)
@@ -350,7 +377,19 @@ func persistWireGuardField(path, field, value string) error {
 }
 
 // commentOf 取出行尾注释（连前面的分隔空格），没有注释就返回空串。
-//
+// existingValue 取出某一行里字段的当前值（去掉行尾注释与引号）。
+func existingValue(line string) string {
+	i := strings.Index(line, ":")
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+1:]
+	if j := strings.Index(rest, "#"); j >= 0 {
+		rest = rest[:j]
+	}
+	return strings.Trim(strings.TrimSpace(rest), "\"'")
+}
+
 // 只用于我们自己改写的那一行：值里不可能出现 #（是 base64 或十六进制）。
 func commentOf(line string) string {
 	i := strings.Index(line, "#")
@@ -363,7 +402,8 @@ func commentOf(line string) string {
 // writePreservingMode 写回文件并保持原有权限。
 func writePreservingMode(path string, fi os.FileInfo, lines []string) error {
 	content := strings.Join(lines, "\n")
-	tmp := path + ".tmp"
+	// 临时名带 pid：两个进程同时写回时不会互相截断成半截 YAML。
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
 	if err := os.WriteFile(tmp, []byte(content), fi.Mode().Perm()); err != nil {
 		return fmt.Errorf("写入 %s: %w", tmp, err)
 	}

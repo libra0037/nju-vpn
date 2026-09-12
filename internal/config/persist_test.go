@@ -6,6 +6,25 @@ import (
 	"testing"
 )
 
+// TestPersistPrivateKeyKeepsExistingValue 验证已有私钥不会被覆盖。
+//
+// 两个进程同时首启同一份配置时，两边都会生成私钥并写回；后写的那个
+// 会让盘上的私钥与正在运行的进程内存里的不一致，客户端配置随之全部失效。
+func TestPersistPrivateKeyKeepsExistingValue(t *testing.T) {
+	path := writeConfig(t, "server: vpn.example.edu\nusername: u\nwireguard:\n  private_key: keepme\n", 0o600)
+
+	if err := PersistPrivateKey(path, "newkey"); err != nil {
+		t.Fatalf("写回失败: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "keepme") {
+		t.Fatalf("已有的私钥被覆盖了:\n%s", body)
+	}
+}
+
 // 回归：私钥要写回配置文件，而且不能把文件里的注释冲掉——
 // 那份文件是给人看的，用 YAML 序列化会全部丢注释。
 func TestPersistPrivateKeyReplacesExistingLine(t *testing.T) {

@@ -132,7 +132,9 @@ func (c *Client) webLogin(ctx context.Context, username, password string) (strin
 		log.Print("服务端要求短信验证码")
 		state, err := c.requestSMS(ctx, twfID)
 		if err != nil {
-			return "", err
+			// 会话标识要和错误一起交出去：口令已经通过校验，服务端可能已经
+			// 为这个会话留了名额，交不出去就登不掉，那名额会一直占着。
+			return twfID, err
 		}
 		return twfID, &AuthRequiredError{Kind: ErrAuthSMS, TwfID: twfID, State: state}
 

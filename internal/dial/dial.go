@@ -41,24 +41,26 @@ func New(proxy string) (DialFunc, error) {
 
 	u, err := url.Parse(proxy)
 	if err != nil {
-		return nil, fmt.Errorf("解析代理地址 %q: %w", proxy, err)
+		// 错误串会一路走到日志与 status 里，代理地址可能带着口令：
+		// 解析失败时给不出 Redacted，就干脆不回显原文。
+		return nil, fmt.Errorf("解析代理地址失败（写法示例：http://127.0.0.1:7897）: %w", err)
 	}
 
 	switch u.Scheme {
 	case "http", "https":
 		if u.Hostname() == "" {
-			return nil, fmt.Errorf("代理地址 %q 缺少主机名", proxy)
+			return nil, fmt.Errorf("代理地址 %q 缺少主机名", u.Redacted())
 		}
 		warnCleartextCredentials(u)
 		return httpProxyDialer(u)
 	case "socks5", "socks5h":
 		if u.Hostname() == "" {
-			return nil, fmt.Errorf("代理地址 %q 缺少主机名", proxy)
+			return nil, fmt.Errorf("代理地址 %q 缺少主机名", u.Redacted())
 		}
 		warnCleartextCredentials(u)
 		return socks5ProxyDialer(u)
 	case "":
-		return nil, fmt.Errorf("代理地址 %q 缺少协议前缀，例如 http://127.0.0.1:7897", proxy)
+		return nil, fmt.Errorf("代理地址缺少协议前缀（例如 http://127.0.0.1:7897）")
 	default:
 		return nil, fmt.Errorf("不支持的代理协议 %q", u.Scheme)
 	}

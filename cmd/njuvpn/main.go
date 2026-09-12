@@ -136,7 +136,7 @@ func cmdRun(args []string) error {
 		log.Printf("警告: %s", w)
 	}
 	if cfg.Proxy != "" {
-		log.Printf("出站路径: %s", cfg.Proxy)
+		log.Printf("出站路径: %s", config.RedactProxy(cfg.Proxy))
 	}
 
 	// WireGuard 私钥缺失时生成一个并写回配置：服务端公钥要填到客户端配置里，
@@ -395,6 +395,7 @@ func cmdProbe(args []string) error {
 	twfID := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
 	logout := fs.Bool("logout", false, "只调用服务端登出接口然后退出，不建立隧道")
 	keep := fs.Bool("keep", false, "探测结束后不登出，保留服务端会话以便复用")
+	force := fs.Bool("force", false, "本机隧道正在运行时也强行探测（会把当前隧道踢下线）")
 	debug := fs.Bool("debug", false, "打印每一步的报文")
 	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
@@ -408,6 +409,12 @@ func cmdProbe(args []string) error {
 		cfg.Proxy = *proxy
 	}
 
+	if !*force {
+		if err := ensureProbeIsSafe(cfg); err != nil {
+			return err
+		}
+	}
+
 	dialFn, err := dial.New(cfg.Proxy)
 	if err != nil {
 		return err
@@ -415,7 +422,7 @@ func cmdProbe(args []string) error {
 	if cfg.Proxy == "" {
 		log.Printf("出站路径: 直连")
 	} else {
-		log.Printf("出站路径: %s", cfg.Proxy)
+		log.Printf("出站路径: %s", config.RedactProxy(cfg.Proxy))
 	}
 
 	client := vpn.New(vpn.Options{

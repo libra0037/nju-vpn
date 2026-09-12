@@ -10,8 +10,8 @@ import (
 func TestControlErrorRetryable(t *testing.T) {
 	// 只有暂时性的控制码值得重试。终止性重试会加重服务端的拒绝状态。
 	cases := map[byte]bool{
-		ControlServerReset: true,  // 3：会话被重置，可恢复
 		ControlIPBusy:      true,  // 5：地址被占用，可恢复
+		ControlServerReset: false, // 3：多是"建得太密"或"上条会话没释放"，等几分钟再试
 		ControlShutdown:    false, // 8：会话不存在，重试无意义
 		ControlIPConflict:  false, // 9
 		ControlIPKick:      false, // 14
