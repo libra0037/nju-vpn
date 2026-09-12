@@ -23,6 +23,9 @@
 从 [Releases](../../releases) 下载对应平台的二进制，改名为 `njuvpn`（Windows 下是
 `njuvpn.exe`）后直接运行，没有别的依赖。
 
+Linux 与 Windows 的产物都做过端到端实测；macOS 的产物只保证能编译，
+本地没有机器验证过。
+
 ```
 njuvpn version     确认版本
 ```

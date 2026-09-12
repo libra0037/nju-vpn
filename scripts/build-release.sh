@@ -30,6 +30,7 @@ build linux   amd64
 build linux   arm64
 build windows amd64 .exe
 build windows arm64 .exe
+# macOS 只保证能编译：本地没有机器实测过，遇到问题请开 issue。
 build darwin  amd64
 build darwin  arm64
 
