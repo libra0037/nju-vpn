@@ -240,10 +240,13 @@ type Tunnel struct {
 	streamFrame map[byte][]byte
 
 	recvConn net.Conn
-	// recvReady 在下行流建立时被关闭（只关一次），供 WaitRecvStream 等待，
-	// 避免测试靠轮询赌时序。
-	recvReady chan struct{}
-	recvOnce  sync.Once
+	// ready 记录某个方向的流握手是否已经被收到（通道只关一次），供 WaitStream /
+	// WaitRecvStream 等待，避免测试靠轮询赌时序。
+	ready     map[byte]chan struct{}
+	readyOnce map[byte]*sync.Once
+	// uplinkReady 在第一份上行数据被收到时关闭，供 WaitUplink 等待。
+	uplinkReady chan struct{}
+	uplinkOnce  sync.Once
 }
 
 // NewTunnel 构造假隧道服务端。
@@ -252,8 +255,16 @@ func NewTunnel() *Tunnel {
 		sessionID:    []byte("0123456789abcdef0123456789abcdef"),
 		ip:           [4]byte{172, 29, 56, 18},
 		rejectStream: make(map[byte]byte),
-		recvReady:    make(chan struct{}),
-		streamFrame:  make(map[byte][]byte),
+		ready: map[byte]chan struct{}{
+			streamKindSend: make(chan struct{}),
+			streamKindRecv: make(chan struct{}),
+		},
+		readyOnce: map[byte]*sync.Once{
+			streamKindSend: new(sync.Once),
+			streamKindRecv: new(sync.Once),
+		},
+		uplinkReady: make(chan struct{}),
+		streamFrame: make(map[byte][]byte),
 	}
 }
 
@@ -300,11 +311,32 @@ func (t *Tunnel) Stats() TunnelStats {
 
 // WaitRecvStream 等待下行流建立，超时返回错误。
 func (t *Tunnel) WaitRecvStream(timeout time.Duration) error {
+	return t.WaitStream(streamKindRecv, timeout)
+}
+
+// WaitStream 等待某个方向的流握手被收到（即流已建立），超时返回错误。
+func (t *Tunnel) WaitStream(kind byte, timeout time.Duration) error {
+	t.mu.Lock()
+	ready := t.ready[kind]
+	t.mu.Unlock()
+	if ready == nil {
+		return fmt.Errorf("未知的流方向: %#x", kind)
+	}
 	select {
-	case <-t.recvReady:
+	case <-ready:
 		return nil
 	case <-time.After(timeout):
-		return fmt.Errorf("等待下行流建立超时")
+		return fmt.Errorf("等待流 %#x 建立超时", kind)
+	}
+}
+
+// WaitUplink 等待第一份上行数据被收到，超时返回错误。
+func (t *Tunnel) WaitUplink(timeout time.Duration) error {
+	select {
+	case <-t.uplinkReady:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("等待上行数据超时")
 	}
 }
 
@@ -388,7 +420,7 @@ func (t *Tunnel) serve(server net.Conn) {
 		t.servePortalToken(r, server)
 	case head[0] == 0x00:
 		t.serveQueryIP(r, server, head)
-	case head[0] == 0x05 || head[0] == 0x06:
+	case head[0] == streamKindSend || head[0] == streamKindRecv:
 		t.serveStream(r, server, head[0], head)
 	}
 }
@@ -407,7 +439,7 @@ func (t *Tunnel) servePortalToken(r *bufio.Reader, server net.Conn) {
 // serveQueryIP 应答 query-ip，然后保持连接打开。
 func (t *Tunnel) serveQueryIP(r *bufio.Reader, server net.Conn, head []byte) {
 	frame := append([]byte(nil), head...)
-	rest := make([]byte, queryFrameLen-4)
+	rest := make([]byte, QueryFrameLen-4)
 	if _, err := io.ReadFull(r, rest); err != nil {
 		return
 	}
@@ -435,7 +467,7 @@ func (t *Tunnel) serveQueryIP(r *bufio.Reader, server net.Conn, head []byte) {
 // serveStream 应答流握手，然后把收到的数据交给回调。
 func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head []byte) {
 	frame := append([]byte(nil), head...)
-	rest := make([]byte, streamFrameLen-4)
+	rest := make([]byte, StreamFrameLen-4)
 	if _, err := io.ReadFull(r, rest); err != nil {
 		return
 	}
@@ -444,23 +476,24 @@ func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head [
 	t.mu.Lock()
 	reject := t.rejectStream[kind]
 	t.streamFrame[kind] = frame
-	if kind == 0x06 {
+	if kind == streamKindRecv {
 		t.recvConn = server
 	}
+	ready, readyOnce := t.ready[kind], t.readyOnce[kind]
 	t.mu.Unlock()
 
-	if kind == 0x06 {
-		t.recvOnce.Do(func() { close(t.recvReady) })
+	if readyOnce != nil {
+		readyOnce.Do(func() { close(ready) })
 	}
 
 	if reject != 0 {
 		server.Write([]byte{reject})
 		return
 	}
-	// 回执是"流类型"而不是请求里的操作码：0x06 请求下行流，回执 0x01；
-	// 0x05 请求上行流，回执 0x02。
+	// 回执是"流类型"而不是请求里的操作码：下行流请求回执 0x01，
+	// 上行流请求回执 0x02。
 	ack := byte(0x01)
-	if kind == 0x05 {
+	if kind == streamKindSend {
 		ack = 0x02
 	}
 	if _, err := server.Write([]byte{ack}); err != nil {
@@ -470,11 +503,12 @@ func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head [
 	buf := make([]byte, 65535)
 	for {
 		n, err := r.Read(buf)
-		if n > 0 && kind == 0x05 {
+		if n > 0 && kind == streamKindSend {
 			pkt := append([]byte(nil), buf[:n]...)
 			t.mu.Lock()
 			t.uplink = append(t.uplink, pkt)
 			t.mu.Unlock()
+			t.uplinkOnce.Do(func() { close(t.uplinkReady) })
 		}
 		if err != nil {
 			return
@@ -482,11 +516,23 @@ func (t *Tunnel) serveStream(r *bufio.Reader, server net.Conn, kind byte, head [
 	}
 }
 
-// 帧长与协议层保持一致：4 字节操作码 + 48 字节 token + 8 字节 + 4 字节尾。
+// 流方向的操作码。
 const (
-	streamTokenLen = 48
-	streamFrameLen = 4 + streamTokenLen + 8 + 4
-	queryFrameLen  = streamFrameLen
+	// streamKindSend 是上行流（客户端 → 校园网）。
+	streamKindSend = 0x05
+	// streamKindRecv 是下行流（校园网 → 客户端）。
+	streamKindRecv = 0x06
+)
+
+// 帧长与协议层保持一致：4 字节操作码 + 48 字节 token + 8 字节 + 4 字节尾。
+//
+// 这里是另一份拷贝（internal/vpn/parse.go 里有一份同样的常量），
+// 靠 internal/vpn 的 TestFakeFrameLengthsMatchProtocol 把两边钉在一起：
+// 改一处不改另一处，那条测试会红。
+const (
+	StreamTokenLen = 48
+	StreamFrameLen = 4 + StreamTokenLen + 8 + 4
+	QueryFrameLen  = StreamFrameLen
 )
 
 // readHTTPRequests 读若干个完整的 HTTP 请求头。

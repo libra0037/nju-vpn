@@ -12,7 +12,7 @@ import (
 // TestAuthPendingTimesOut 验证等验证码超时后自动登出。
 //
 // 用户在提示符前直接关掉终端时，进程会一直停在 auth_pending，学校侧那条
-// "同一账号只允许一个客户端"的名额也跟着被占住（REVIEW R4）。
+// "同一账号只允许一个客户端"的名额也跟着被占住。
 func TestAuthPendingTimesOut(t *testing.T) {
 	old := authWaitTimeout
 	authWaitTimeout = 100 * time.Millisecond

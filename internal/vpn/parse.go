@@ -18,6 +18,10 @@ const (
 	twfIDLen = 16
 	// streamTokenLen 是流协议首包的 token 部分：32 字节 token + 16 字节 TwfID。
 	streamTokenLen = tokenTotalLen + twfIDLen
+	// streamFrameLen 是流握手报文的总长：4 字节操作码 + token + 8 字节保留 + 4 字节地址。
+	streamFrameLen = 4 + streamTokenLen + 8 + 4
+	// queryFrameLen 是 query-ip 报文的总长，与流握手报文相同。
+	queryFrameLen = streamFrameLen
 
 	// maxBodyBytes 限制从服务端读取的响应体大小。
 	maxBodyBytes = 1 << 20

@@ -19,9 +19,9 @@ import (
 // 这些用例默认跳过：跑一次会消耗账号的服务端配额，有的还会发短信，
 // 所以必须显式打开。已有的单元测试用的是注入的假服务端，不需要联网。
 //
-//	export NJUVPON_LIVE_CONFIG=/tmp/njuvpn-lab.yaml
+//	export NJUVPN_LIVE_CONFIG=/tmp/njuvpn-lab.yaml
 //	go test ./internal/vpn/ -run TestLiveLoginPage -v      # 免费：只取登录页
-//	NJUVPON_LIVE_CONNECT=1 go test ./internal/vpn/ -run TestLiveConnect -v   # 花一条短信
+//	NJUVPN_LIVE_CONNECT=1 go test ./internal/vpn/ -run TestLiveConnect -v   # 花一条短信
 //
 // 阶梯的意义在于每一步都能单独定位故障：
 //
@@ -33,9 +33,9 @@ import (
 // liveConfig 读取真实账号配置。没有设置环境变量时跳过。
 func liveConfig(t *testing.T) *config.Config {
 	t.Helper()
-	path := os.Getenv("NJUVPON_LIVE_CONFIG")
+	path := os.Getenv("NJUVPN_LIVE_CONFIG")
 	if path == "" {
-		t.Skip("未设置 NJUVPON_LIVE_CONFIG，跳过真实服务端实验")
+		t.Skip("未设置 NJUVPN_LIVE_CONFIG，跳过真实服务端实验")
 	}
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -119,12 +119,12 @@ func TestLiveLoginPage(t *testing.T) {
 //
 // 会触发一条短信，所以需要显式打开：
 //
-//	NJUVPON_LIVE_CONNECT=1 NJUVPON_LIVE_CONFIG=... go test -run TestLiveConnect -v
+//	NJUVPN_LIVE_CONNECT=1 NJUVPN_LIVE_CONFIG=... go test -run TestLiveConnect -v
 //
-// 验证码从标准输入读；也可以先设 NJUVPON_LIVE_CODE 直接给。
+// 验证码从标准输入读；也可以先设 NJUVPN_LIVE_CODE 直接给。
 func TestLiveConnect(t *testing.T) {
-	if os.Getenv("NJUVPON_LIVE_CONNECT") != "1" {
-		t.Skip("未设置 NJUVPON_LIVE_CONNECT=1（这一步会发短信），跳过")
+	if os.Getenv("NJUVPN_LIVE_CONNECT") != "1" {
+		t.Skip("未设置 NJUVPN_LIVE_CONNECT=1（这一步会发短信），跳过")
 	}
 	cfg := liveConfig(t)
 	client := liveClient(t, cfg)
@@ -147,7 +147,7 @@ func TestLiveConnect(t *testing.T) {
 	if authErr, ok := AsAuthRequired(err); ok {
 		t.Logf("服务端要求二次验证: %v", authErr.Kind)
 
-		code := strings.TrimSpace(os.Getenv("NJUVPON_LIVE_CODE"))
+		code := strings.TrimSpace(os.Getenv("NJUVPN_LIVE_CODE"))
 		if code == "" {
 			fmt.Fprint(os.Stderr, "请输入验证码: ")
 			line, readErr := bufio.NewReader(os.Stdin).ReadString('\n')

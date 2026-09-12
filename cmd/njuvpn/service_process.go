@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -28,11 +27,6 @@ const (
 	// pingTimeout 是单次探活的超时。
 	pingTimeout = 500 * time.Millisecond
 )
-
-// serviceEndpoint 解析服务进程的 IPC 端点。
-func serviceEndpoint(configPath string) (string, error) {
-	return endpointFor(configPath)
-}
 
 // serviceLogPath 让服务进程的日志落在配置文件旁边。
 //
@@ -79,20 +73,10 @@ func logFileName(configPath string) string {
 }
 
 // pingService 探活：连得上并得到 pong 才算服务进程在运行。
+//
+// 超时单独给一个很小的值：探活失败是常态（进程没起），不该让调用方等太久。
 func pingService(endpoint string) error {
-	conn, err := ipc.Dial(endpoint)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(time.Now().Add(pingTimeout)); err != nil {
-		return err
-	}
-	if err := ipc.WriteRequest(conn, ipc.Request{Command: ipc.CmdPing}); err != nil {
-		return err
-	}
-	resp, err := ipc.ReadResponse(bufio.NewReader(conn))
+	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdPing}, pingTimeout)
 	if err != nil {
 		return err
 	}
@@ -109,7 +93,7 @@ func pingService(endpoint string) error {
 //
 // proxy 只在本次拉起新进程时生效：服务进程启动时读配置，换代理要重启它。
 func ensureService(configPath, proxy string) error {
-	endpoint, err := serviceEndpoint(configPath)
+	endpoint, err := endpointFor(configPath)
 	if err != nil {
 		return err
 	}
@@ -267,19 +251,7 @@ func logTail(path string) string {
 
 // shutdownService 请服务进程收尾退出（它会先登出再退出）。
 func shutdownService(endpoint string) error {
-	conn, err := ipc.Dial(endpoint)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(time.Now().Add(serviceStopTimeout)); err != nil {
-		return err
-	}
-	if err := ipc.WriteRequest(conn, ipc.Request{Command: ipc.CmdShutdown}); err != nil {
-		return err
-	}
-	resp, err := ipc.ReadResponse(bufio.NewReader(conn))
+	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdShutdown}, serviceStopTimeout)
 	if err != nil {
 		return err
 	}

@@ -309,7 +309,7 @@ func cmdRestart(args []string) error {
 		return err
 	}
 
-	endpoint, err := serviceEndpoint(*configPath)
+	endpoint, err := endpointFor(*configPath)
 	if err != nil {
 		return err
 	}

@@ -41,15 +41,8 @@ func TestSessionRunMovesPacketsBothWays(t *testing.T) {
 		t.Fatalf("上行发送失败: %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if len(s.tunnel.Stats().Uplink) > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("隧道服务端没有收到上行数据")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if err := s.tunnel.WaitUplink(2 * time.Second); err != nil {
+		t.Fatal(err)
 	}
 
 	// 下行：假装隧道里数据已经就绪，然后第一次 Read 会触发投递。
@@ -177,6 +170,26 @@ func TestSessionRunReleasesStreamsOnReturn(t *testing.T) {
 	sess.mu.Unlock()
 	if left != 0 {
 		t.Errorf("Run 返回后登记表里还剩 %d 条流", left)
+	}
+}
+
+// 回归：下行流建立失败时，已经登记的上行流必须摘掉。
+//
+// 这条路径不走 Run 末尾那个 defer（它要两条流都建好才装上），漏摘的话
+// 登记表会留着这条已经关掉的连接，直到会话结束；重连反复失败时会累积。
+func TestSessionRunUntracksUplinkWhenRecvStreamFails(t *testing.T) {
+	s := newScript(t)
+	s.tunnel.RejectStream(0x06, ControlShutdown)
+	sess := connectedSession(t, s)
+
+	if err := sess.Run(context.Background()); err == nil {
+		t.Fatal("下行流被拒时 Run 应当返回错误")
+	}
+	sess.mu.Lock()
+	left := len(sess.streams)
+	sess.mu.Unlock()
+	if left != 0 {
+		t.Errorf("下行流建立失败后登记表里还剩 %d 条流", left)
 	}
 }
 

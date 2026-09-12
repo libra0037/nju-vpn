@@ -142,6 +142,9 @@ func (s *Session) Run(ctx context.Context) error {
 	rx, err := s.client.openStream(ctx, s.token, s.ipRev, streamRecv, s.debug)
 	if err != nil {
 		tx.Close()
+		// 这条路径不走下面的 defer（defer 要两条流都建好才装上），
+		// 漏摘的话登记表会一直留着这条已关闭的上行流，直到会话结束。
+		s.untrack(tx)
 		return &StreamError{Direction: "下行流建立", Err: err}
 	}
 	s.track(rx)

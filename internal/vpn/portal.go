@@ -110,6 +110,7 @@ func (c *Client) webLogin(ctx context.Context, username, password string) (strin
 	}
 	// 密码和它的密文都不能进日志：明文是凭据本身，密文配合公开的
 	// RSA 公钥和 CSRF 码可以离线爆破。
+	//lint:ignore SA1019 服务端协议只认 PKCS#1 v1.5，换 OAEP 会直接登录失败
 	encrypted, err := rsa.EncryptPKCS1v15(rand.Reader, pubKey, []byte(password))
 	if err != nil {
 		return "", fmt.Errorf("%s: 加密口令: %w", step, err)

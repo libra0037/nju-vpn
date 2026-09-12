@@ -48,7 +48,7 @@ func TestStartWithPasswordLogsIn(t *testing.T) {
 	}
 }
 
-// TestCredentialsNeverLogged 是凭据不入日志的完整回归（REVIEW C3）。
+// TestCredentialsNeverLogged 是凭据不入日志的完整回归。
 //
 // 覆盖范围比 TestPasswordNeverLogged 大：口令由 `njuvpn start` 从 stdin 读入后
 // 会以 base64 的形式经 IPC 报文传进来，报文行同样不能出现在日志里；

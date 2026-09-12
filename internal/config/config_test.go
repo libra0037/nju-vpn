@@ -155,7 +155,7 @@ func TestLoadIgnoresFilePermissions(t *testing.T) {
 	}
 }
 
-// 回归（REVIEW C1）：过宽的权限在加载时被收紧到 0600。
+// 回归：过宽的权限在加载时被收紧到 0600。
 //
 // 配置里有校园网口令、TOTP 密钥与 WireGuard 私钥。按文档"复制一份填写"
 // 出来的文件是 0644；备份、打包给别人排查、镜像快照都会把它们一起带走。

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+
+	"github.com/libra0037/nju-vpn/internal/vpntest"
 )
 
 // 这个文件把与真实服务端的线上格式钉死。
@@ -72,9 +74,8 @@ func TestStreamHandshakeFrameIsStable(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				go func() { _ = sess.Run(ctx) }()
-				deadline := time.Now().Add(2 * time.Second)
-				for time.Now().Before(deadline) && len(s.tunnel.StreamFrame(0x05)) == 0 {
-					time.Sleep(5 * time.Millisecond)
+				if err := s.tunnel.WaitStream(0x05, 2*time.Second); err != nil {
+					t.Fatal(err)
 				}
 			}
 
@@ -86,6 +87,28 @@ func TestStreamHandshakeFrameIsStable(t *testing.T) {
 				t.Errorf("流握手报文变了\n实际: %s\n期望: %s", hex.EncodeToString(got), c.golden)
 			}
 		})
+	}
+}
+
+// 回归：替身里的帧长常量必须与本包一致。
+//
+// vpntest 是另一个包，帧长在那里抄了一份（它不该反向依赖本包）。抄写会漂移：
+// 本包改了常量而替身没跟着改的话，所有用替身的用例会一起变松——它们照样绿，
+// 但校验的已经不是真实格式了。这里把两边钉死。
+func TestFakeFrameLengthsMatchProtocol(t *testing.T) {
+	cases := []struct {
+		name     string
+		fake     int
+		protocol int
+	}{
+		{"token 长度", vpntest.StreamTokenLen, streamTokenLen},
+		{"流握手帧长", vpntest.StreamFrameLen, streamFrameLen},
+		{"query-ip 帧长", vpntest.QueryFrameLen, queryFrameLen},
+	}
+	for _, c := range cases {
+		if c.fake != c.protocol {
+			t.Errorf("%s：替身里是 %d，协议层是 %d", c.name, c.fake, c.protocol)
+		}
 	}
 }
 

@@ -62,7 +62,7 @@ func fakeService(t *testing.T) (endpoint string, gotShutdown chan struct{}) {
 // TestWaitServiceReadyReturnsOnExit 验证子进程提前退出时立刻报错。
 //
 // 以前这里只轮询端点：子进程因为配置写错之类立刻退出时，用户要干等满
-// 超时，再被指去翻日志——而原因其实已经写在那里了（REVIEW R5 / M3）。
+// 超时，再被指去翻日志——而原因其实已经写在那里了。
 func TestWaitServiceReadyReturnsOnExit(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "njuvpn-test.log")
 	body := "配置有问题\n服务进程崩溃前的最后一句\n"

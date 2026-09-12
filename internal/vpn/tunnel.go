@@ -60,7 +60,7 @@ func (c *Client) openStream(ctx context.Context, token [streamTokenLen]byte, ipR
 		opcode = 0x05
 	}
 
-	message := make([]byte, 0, 4+streamTokenLen+8+4)
+	message := make([]byte, 0, streamFrameLen)
 	message = append(message, opcode, 0x00, 0x00, 0x00)
 	message = append(message, token[:]...)
 	message = append(message, make([]byte, 8)...)
@@ -262,8 +262,5 @@ func retryable(err error) bool {
 	// 协议不符不会自愈：服务端回了预期之外的字节，重试只是白烧配额
 	//（密集重试会把账号打进被拒状态）。
 	var proto *ProtocolError
-	if errors.As(err, &proto) {
-		return false
-	}
-	return true
+	return !errors.As(err, &proto)
 }

@@ -42,7 +42,7 @@ func TestLiveSMSDiagnostic(t *testing.T) {
 	}
 
 	dump("第一次请求")
-	wait := os.Getenv("NJUVPON_LIVE_WAIT")
+	wait := os.Getenv("NJUVPN_LIVE_WAIT")
 	if wait == "" {
 		return
 	}
