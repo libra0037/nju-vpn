@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +56,7 @@ func TestStartWithPasswordLogsIn(t *testing.T) {
 func TestPasswordNeverLogged(t *testing.T) {
 	const password = "S3cr3t-Pa55w0rd"
 
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	old := log.Writer()
 	log.SetOutput(&buf)
 	defer log.SetOutput(old)
@@ -124,7 +125,7 @@ func TestCredentialsNeverLogged(t *testing.T) {
 		cfg.TOTPSecret = totpSecret
 	})
 
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	old := log.Writer()
 	log.SetOutput(&buf)
 	defer log.SetOutput(old)
@@ -155,4 +156,25 @@ func TestCredentialsNeverLogged(t *testing.T) {
 			t.Errorf("日志里出现了%s（%q）", secret.name, secret.value)
 		}
 	}
+}
+
+// lockedBuffer 是带锁的日志缓冲。
+//
+// 隧道协程等后台 goroutine 会在测试读日志的同时继续写，bytes.Buffer 本身
+// 不是并发安全的（-race 下会直接失败）。
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
