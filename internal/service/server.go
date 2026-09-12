@@ -149,7 +149,9 @@ func (s *Server) handle(conn net.Conn) {
 func (s *Server) dispatch(req ipc.Request) ipc.Response {
 	switch req.Command {
 	case ipc.CmdPing:
-		return ipc.Response{Code: ipc.CodeOK, Message: "pong"}
+		// 探活顺带报出身份：同机多实例时，"这台机器上跑着谁"是排查的
+		// 第一个问题，而 ping 是唯一永远可用的命令。
+		return ipc.Response{Code: ipc.CodeOK, Message: "pong " + identityText(s.svc.Identity())}
 
 	case ipc.CmdShutdown:
 		// 先安排退出再回包（回包由 handle 写到这条连接上）：
@@ -282,7 +284,28 @@ func statusLine(st Status) string {
 	if !st.Since.IsZero() {
 		msg += fmt.Sprintf(" | %s 起", st.Since.Format("15:04:05"))
 	}
+	if id := identityText(st.Identity); id != "" {
+		msg += " | " + id
+	}
 	return msg
+}
+
+// identityText 把实例身份拼成一段文本，供 ping 与 status 共用。
+//
+// 只包含 PID、账号、配置路径与端点——都不算秘密，能连上本地端点的人
+// 本来就看得到这些文件。
+func identityText(id Identity) string {
+	parts := []string{fmt.Sprintf("pid=%d", id.PID)}
+	if id.Username != "" {
+		parts = append(parts, "账号="+id.Username)
+	}
+	if id.ConfigPath != "" {
+		parts = append(parts, "配置="+id.ConfigPath)
+	}
+	if id.Endpoint != "" {
+		parts = append(parts, "端点="+id.Endpoint)
+	}
+	return strings.Join(parts, " ")
 }
 
 // RunServer 是服务进程的入口：监听本地端点并处理请求。

@@ -439,9 +439,12 @@ Windows 与 Linux 都要能用 —— Linux 侧不是「只用来跑测试」，
 
 - 配置文件：Windows 用 `%LOCALAPPDATA%` 下的 njuvpn 目录，Linux 用 `~/.config/njuvpn/config.yaml`
   —— 原来的 `/etc/njuvpn/config.yaml` 与 ProgramData 都以特权运行为前提，随之作废。
-- IPC 端点：Linux 用 `$XDG_RUNTIME_DIR/njuvpn.sock`（取不到时回落到该用户的私有临时目录），
-  Windows 命名管道不变。
-- 服务日志：配置文件同目录的 `njuvpn.log`（被拉起的服务进程没有控制台）。
+- IPC 端点：按配置文件的路径派生（`ipc.EndpointFor`）。Linux 是
+  `$XDG_RUNTIME_DIR/njuvpn-<实例标识>.sock`（取不到时回落到该用户的私有临时目录），
+  Windows 是 `\\.\pipe\njuvpn-<实例标识>`。同一份配置永远得到同一个端点，
+ 不同配置互不相干，多实例因此不会误伤彼此。
+- 服务日志：配置文件同目录的 `njuvpn-<配置名>.log`（被拉起的服务进程没有控制台）；
+  名字里带配置名，同目录的多份配置不共用一份日志。
 
 ### 安全取舍
 

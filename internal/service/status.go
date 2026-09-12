@@ -31,6 +31,19 @@ type Status struct {
 	PeerIP   string `json:"peer_ip,omitempty"`   // 客户端 peer 的地址
 	// Since 是进入当前状态的时间，便于判断"卡了多久"。
 	Since time.Time `json:"since"`
+	// Identity 是实例身份，用来区分同机上的多个实例。
+	Identity Identity `json:"identity"`
+}
+
+// Identity 描述"在跟哪个实例说话"。
+//
+// 同机多实例同时连同一台学校服务器时，日志与状态几乎逐字相同，排查时
+// 容易张冠李戴；这四个字段足以对上号，且不含任何凭据。
+type Identity struct {
+	PID        int    `json:"pid"`
+	ConfigPath string `json:"config,omitempty"`
+	Endpoint   string `json:"endpoint,omitempty"`
+	Username   string `json:"username,omitempty"`
 }
 
 // transitions 是状态迁移表。key 是当前状态，value 是允许进入的下一状态。
@@ -54,8 +67,8 @@ type statusStore struct {
 	status Status
 }
 
-func newStatusStore() *statusStore {
-	return &statusStore{status: Status{State: StateIdle, Since: time.Now()}}
+func newStatusStore(id Identity) *statusStore {
+	return &statusStore{status: Status{State: StateIdle, Since: time.Now(), Identity: id}}
 }
 
 // Get 返回当前状态的快照。

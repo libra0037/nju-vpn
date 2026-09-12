@@ -65,7 +65,9 @@ printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start -config ~/.config/njuvpn/co
 
 每人一份配置文件、一个实例时不需要额外设置：IPC 端点按配置文件的路径派生
 （同一份配置永远是同一个端点，不同配置互不相干），每人写一个不同的
-`wireguard.listen_port` 即可，日志在各配置目录下的 `njuvpn.log`。
+`wireguard.listen_port` 即可，日志在各配置目录下，名字是 `njuvpn-<配置名>.log`。
+`njuvpn status` 与 `ping` 都会报出实例身份（PID、账号、配置文件路径与端点），
+同机多实例时用它确认命令打在了哪个实例上。
 
 ### 客户端接入（以 Clash 为例）
 

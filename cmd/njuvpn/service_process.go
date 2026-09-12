@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/config"
@@ -34,7 +35,8 @@ func serviceEndpoint(configPath string) (string, error) {
 // serviceLogPath 让服务进程的日志落在配置文件旁边。
 //
 // 被 CLI 拉起的服务进程没有控制台，日志必须有地方去；放在配置旁边的好处是
-// "启动失败"时用户知道该看哪个文件。
+// "启动失败"时用户知道该看哪个文件。文件名带配置名：同一目录下放多份配置时
+// 不该共用一份日志，多实例的行交错在一起，排查时容易张冠李戴。
 func serviceLogPath(configPath string) string {
 	path := configPath
 	if path == "" {
@@ -44,7 +46,28 @@ func serviceLogPath(configPath string) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "njuvpn.log"
 	}
-	return filepath.Join(dir, "njuvpn.log")
+	return filepath.Join(dir, logFileName(path))
+}
+
+// logFileName 给日志文件取名：njuvpn-<配置名>.log。
+//
+// 配置名里只保留可移植的字符，剩下的换成下划线：这个值来自命令行给的
+// 路径，不该把路径分隔符之类的东西带进文件名。
+func logFileName(configPath string) string {
+	base := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
+	if base == "" || base == "." {
+		base = "default"
+	}
+	var b strings.Builder
+	for _, r := range base {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return "njuvpn-" + b.String() + ".log"
 }
 
 // pingService 探活：连得上并得到 pong 才算服务进程在运行。

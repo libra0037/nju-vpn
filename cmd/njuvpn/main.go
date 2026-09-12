@@ -108,7 +108,7 @@ func main() {
 	}
 }
 
-// cmdRun 是服务进程入口，由 systemd / SCM 拉起。
+// cmdRun 是服务进程入口：由 `njuvpn start` 按需拉起，也可以直接在终端里跑。
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
@@ -130,8 +130,13 @@ func cmdRun(args []string) error {
 		cfg.Proxy = *proxy
 	}
 
+	// 第一行就报出身份：同机多实例时日志几乎逐字相同，没有这一行就分不清
+	// 眼前这份日志属于哪个实例。
+	endpoint := endpointOf(cfg)
 	log.SetFlags(log.LstdFlags)
-	log.Printf("%s 服务进程启动，目标 %s", prog, cfg.ServerAddr())
+	log.Printf("%s 服务进程启动 pid=%d 账号=%s 配置=%s 端点=%s",
+		prog, os.Getpid(), cfg.Username, cfg.SourcePath(), endpoint)
+	log.Printf("目标 %s", cfg.ServerAddr())
 	for _, w := range cfg.Warnings() {
 		log.Printf("警告: %s", w)
 	}
@@ -153,7 +158,7 @@ func cmdRun(args []string) error {
 	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
-	return service.RunServer(svc, endpointOf(cfg))
+	return service.RunServer(svc, endpoint)
 }
 
 // generateWireGuardKey 生成私钥并写回配置文件。

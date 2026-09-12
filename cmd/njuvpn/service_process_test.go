@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,7 +95,26 @@ func TestPingServiceFailsWhenNothingListens(t *testing.T) {
 func TestServiceLogPathNextToConfig(t *testing.T) {
 	dir := t.TempDir()
 	got := serviceLogPath(filepath.Join(dir, "config.yaml"))
-	if want := filepath.Join(dir, "njuvpn.log"); got != want {
+	if want := filepath.Join(dir, "njuvpn-config.log"); got != want {
 		t.Errorf("serviceLogPath = %q，想要 %q", got, want)
+	}
+}
+
+// TestLogFileNameDistinguishesInstances 验证同目录的多份配置不共用日志。
+//
+// 多实例的日志交错在一份文件里，排查时最先要回答的"这一行是谁写的"
+// 就没法回答了。
+func TestLogFileNameDistinguishesInstances(t *testing.T) {
+	alice := logFileName(filepath.Join("etc", "njuvpn", "alice.yaml"))
+	bob := logFileName(filepath.Join("etc", "njuvpn", "bob.yaml"))
+	if alice == bob {
+		t.Fatalf("两份配置得到同一个日志名: %q", alice)
+	}
+	if want := "njuvpn-alice.log"; alice != want {
+		t.Errorf("logFileName = %q，想要 %q", alice, want)
+	}
+	// 路径分隔符之类的东西不该进文件名。
+	if got := logFileName("weird/../x:y.yaml"); strings.ContainsAny(got, "/:\\") {
+		t.Errorf("日志名里带上了路径分隔符: %q", got)
 	}
 }

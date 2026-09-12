@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 	"github.com/libra0037/nju-vpn/internal/vpn"
 	"github.com/libra0037/nju-vpn/internal/wireguard"
 )
@@ -108,7 +110,7 @@ type Service struct {
 func New(cfg *config.Config) *Service {
 	s := &Service{
 		cfg:    cfg,
-		status: newStatusStore(),
+		status: newStatusStore(identityOf(cfg)),
 		cred: credentials{
 			username: cfg.Username,
 			password: cfg.Password,
@@ -122,8 +124,28 @@ func New(cfg *config.Config) *Service {
 	return s
 }
 
+// identityOf 组装实例身份，只在启动时算一次。
+//
+// 端点规则与 cmd 层的 endpointOf 相同：显式配置优先，否则按配置文件的
+// 路径派生；两处都委托给 ipc 包，规则只有一份。
+func identityOf(cfg *config.Config) Identity {
+	endpoint := cfg.IPC.Endpoint
+	if endpoint == "" {
+		endpoint = ipc.EndpointFor(cfg.SourcePath())
+	}
+	return Identity{
+		PID:        os.Getpid(),
+		ConfigPath: cfg.SourcePath(),
+		Endpoint:   endpoint,
+		Username:   cfg.Username,
+	}
+}
+
 // Status 返回当前状态快照。它不经过 actor，永远立即可用。
 func (s *Service) Status() Status { return s.status.Get() }
+
+// Identity 返回实例身份。
+func (s *Service) Identity() Identity { return s.status.Get().Identity }
 
 // Done 在服务对象开始收尾（Close 被调用）时关闭。
 //

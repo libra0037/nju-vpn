@@ -20,15 +20,18 @@ import (
 // configPath 为空时返回固定标识 default：只有手工构造的配置才会走到，
 // 正常路径上 config.Load 一定会填好来源路径。
 func EndpointFor(configPath string) string {
-	return endpointPath(instanceID(configPath))
+	return endpointPath(InstanceTag(configPath))
 }
 
-// instanceID 返回配置文件的短标识，8 个十六进制字符。
+// InstanceTag 返回配置文件的短标识，8 个十六进制字符。
+//
+// 实例的本地痕迹都从这一个标识派生（IPC 端点、日志文件名、状态输出），
+// 多实例时对得上号。它由路径决定，与配置内容无关。
 //
 // 规范化是为了让同一份配置总得到同一个标识：相对路径按当前工作目录
 // 确定下来，符号链接归一到真实路径。EvalSymlinks 失败时回落到 Abs 的结果
 // ——配置文件还不存在时也要能算出端点。
-func instanceID(configPath string) string {
+func InstanceTag(configPath string) string {
 	if configPath == "" {
 		return "default"
 	}
