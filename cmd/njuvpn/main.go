@@ -29,6 +29,12 @@ import (
 
 const prog = "njuvpn"
 
+// startTimeout 是 start 与 auth 两次请求的超时。
+//
+// 给足：服务端最坏路径是 submitCode + portalToken + acquireIP（3 次尝试 ×
+// 30 秒退避），加起来可能超过 3 分钟。
+const startTimeout = 5 * time.Minute
+
 // version 是发行版本号，由构建脚本用 -ldflags 注入；
 // 源码直接构建时是 dev，便于区分「自己编的」与「下载的」。
 var version = "dev"
@@ -38,10 +44,9 @@ func usage() {
 
 用法:
   %s run                          以服务进程身份运行（一般由 start 自动拉起）
-  %s start                        建立隧道（必要时自动拉起服务进程，可能要 %s auth <code>）
+  %s start                        建立隧道（必要时自动拉起服务进程，需要时提示输入口令与验证码）
   %s stop                         断开隧道，服务进程继续运行
   %s status                       查看服务与隧道状态
-  %s auth <code>                  提交短信或 TOTP 验证码
   %s restart                      重启服务进程（改完配置后用它，不必手工杀进程）
   %s probe                        探测协议可用性（直接连服务端，不经过服务进程）
   %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
@@ -55,7 +60,7 @@ func usage() {
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
   Windows  %%LOCALAPPDATA%%\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -78,8 +83,6 @@ func main() {
 		err = cmdRestart(args)
 	case "status":
 		err = cmdStatus(args)
-	case "auth":
-		err = cmdAuth(args)
 	case "wg-peer":
 		err = cmdSetPeer(args)
 	case "wg-stats":
@@ -180,17 +183,82 @@ func logWireGuardPublicKey(cfg *config.Config) {
 	log.Printf("WireGuard 服务端公钥: %s", pub.String())
 }
 
+// cmdStart 用一条命令走完整个建立流程。
+//
+// 配置里没写口令时先问口令（不回显），服务端要求二次验证时再问验证码：
+// 用户不再需要先 start 再 auth。口令只经本地套接字传给服务进程，留在
+// 它的内存里；验证码是一次性的，也随之用完即弃。
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	if _, err := parseInterleaved(fs, args); err != nil {
 		return err
 	}
+
+	cfg, err := clientConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	endpoint := endpointOf(cfg)
+	password, err := passwordFor(cfg)
+	if err != nil {
+		return err
+	}
+
 	// 服务进程没在跑就先拉起来：这是"按需拉起"的入口。
 	if err := ensureService(*configPath); err != nil {
 		return err
 	}
-	return runCommand("start", args, ipc.Request{Command: ipc.CmdStart}, 5*time.Minute)
+
+	req := ipc.Request{Command: ipc.CmdStart}
+	if password != "" {
+		req.Args = []string{ipc.EncodeSecret(password)}
+	}
+	resp, err := call(endpoint, req, startTimeout)
+	if err != nil {
+		return err
+	}
+	fmt.Println(resp.Message)
+	switch resp.Code {
+	case ipc.CodeOK:
+		return nil
+	case ipc.CodeAuthRequired:
+		// 需要二次验证：提示输入验证码，然后接着把隧道建起来。
+	default:
+		return fmt.Errorf("服务进程返回 %d", resp.Code)
+	}
+
+	code, err := promptCode()
+	if err != nil {
+		return err
+	}
+	if code == "" {
+		return errors.New("验证码为空")
+	}
+	resp, err = call(endpoint, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, startTimeout)
+	if err != nil {
+		return err
+	}
+	fmt.Println(resp.Message)
+	if resp.Code == ipc.CodeOK {
+		return nil
+	}
+	return fmt.Errorf("服务进程返回 %d", resp.Code)
+}
+
+// passwordFor 决定本次 start 要不要现问口令。
+//
+// 配置里写了口令就用配置里的（服务进程自己会读）；没写就现问一遍，只经
+// 本地套接字传过去。stdin 是管道时也照读，便于脚本一次喂口令和验证码。
+func passwordFor(cfg *config.Config) (string, error) {
+	if cfg == nil || cfg.Password != "" {
+		return "", nil
+	}
+	password, err := promptSecret("请输入校园网口令: ")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(password), nil
 }
 
 func cmdStop(args []string) error {
@@ -247,33 +315,6 @@ func cmdSetPeer(args []string) error {
 		return err
 	}
 	return runAt(endpoint, ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
-}
-
-// cmdAuth 提交验证码。不带参数时从终端读，方便交互使用。
-func cmdAuth(args []string) error {
-	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	// 验证码通常写成 auth 123456，后面还可能跟 -config：
-	// 两种写法都能解析出正确的位置参数。
-	positional, err := parseInterleaved(fs, args)
-	if err != nil {
-		return err
-	}
-
-	code := strings.TrimSpace(strings.Join(positional, ""))
-	if code == "" {
-		if code, err = promptCode(); err != nil {
-			return err
-		}
-	}
-
-	// 超时给足：服务端最坏路径是 submitCode + portalToken + acquireIP
-	//（3 次尝试 × 30 秒退避），加起来可能超过 3 分钟。
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	return runAt(endpoint, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, 5*time.Minute)
 }
 
 // parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。
@@ -363,9 +404,17 @@ func cmdProbe(args []string) error {
 	}
 
 	trace := &vpn.Trace{}
+	// 复用已有会话时不需要口令；否则配置里没写就现问一遍（不回显）。
+	password := cfg.Password
+	if password == "" && *twfID == "" {
+		if password, err = promptSecret("请输入校园网口令: "); err != nil {
+			return err
+		}
+		password = strings.TrimSpace(password)
+	}
 	opt := vpn.ConnectOptions{
 		Username: cfg.Username,
-		Password: cfg.Password,
+		Password: password,
 		TwfID:    *twfID,
 		Code:     code,
 		Debug:    *debug,

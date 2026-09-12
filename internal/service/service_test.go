@@ -27,6 +27,11 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWith(t, nil)
+}
+
+// newHarnessWith 与 newHarness 相同，但允许在构造服务对象之前改配置。
+func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Helper()
 	portal := vpntest.NewPortal()
 	tunnel := vpntest.NewTunnel()
@@ -51,6 +56,9 @@ func newHarness(t *testing.T) *harness {
 			PrivateKey: testPrivateKey(t),
 			ListenPort: 0,
 		},
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 
 	svc := New(cfg)

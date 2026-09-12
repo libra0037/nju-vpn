@@ -46,6 +46,19 @@ func TestLoadValidConfig(t *testing.T) {
 // 回归：校验只查了几个字段，MTU、端口、peer 地址写错时要等到运行时才炸，
 // 而且错误信息指向完全无关的地方。
 func TestLoadRejectsInvalidValues(t *testing.T) {
+	// 口令不是必填项：留空表示让 `njuvpn start` 现问，经本地套接字交给
+	// 服务进程，只留在内存里。这里单独钉住这个行为，避免以后又加回校验。
+	t.Run("口令可以留空", func(t *testing.T) {
+		path := writeConfig(t, "server: vpn.example.edu\nusername: u\n", 0o600)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("口令留空应当合法: %v", err)
+		}
+		if cfg.Password != "" {
+			t.Fatalf("口令应当为空，得到 %q", cfg.Password)
+		}
+	})
+
 	cases := []struct {
 		name string
 		body string
@@ -80,11 +93,6 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 			"peer 地址不是 IPv4",
 			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  peer_address: 2001:db8::2\n",
 			"peer_address",
-		},
-		{
-			"缺少口令",
-			"server: vpn.example.edu\nusername: u\n",
-			"password",
 		},
 	}
 	for _, c := range cases {

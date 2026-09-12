@@ -183,9 +183,8 @@ func (c *Config) validate() error {
 	if c.Username == "" {
 		return fmt.Errorf("缺少 username")
 	}
-	if c.Password == "" {
-		return fmt.Errorf("缺少 password")
-	}
+	// password 允许留空：此时由 `njuvpn start` 在终端现问，经本地套接字
+	// 交给服务进程，只留在内存里（不落盘、不进 argv、不进日志）。
 	if c.MTU < MinMTU || c.MTU > MaxMTU {
 		return fmt.Errorf("mtu 超出范围: %d（应在 %d-%d 之间，1320 适合默认隧道）", c.MTU, MinMTU, MaxMTU)
 	}
@@ -237,7 +236,10 @@ func (c *Config) Warnings() []string {
 		out = append(out, "未配置 wireguard.peer_public_key，任何客户端都无法接入")
 	}
 	if c.TOTPSecret == "" {
-		out = append(out, "未配置 totp_secret，需要手工执行 njuvpn auth <code> 完成二次验证")
+		out = append(out, "未配置 totp_secret，二次验证时需要人工输入验证码")
+	}
+	if c.Password == "" {
+		out = append(out, "未配置 password，njuvpn start 会提示输入（只留在服务进程内存里）")
 	}
 	return out
 }

@@ -55,6 +55,17 @@ type command struct {
 	reply chan error
 }
 
+// credentials 是一次登录要用的三样东西。
+//
+// 配置文件里的口令只是初始值：`start` 可以带上本次输入的口令，服务进程把
+// 它留在这里，供后续的重新登录（error 后重新 start、重连后重登）复用。
+// 全程不落盘、不进 argv、不进日志。
+type credentials struct {
+	username string
+	password string
+	totp     string
+}
+
 // Service 持有一次隧道连接的全部资源。
 //
 // 所有会改状态的操作都在 loop 这一个协程里执行：调用方把命令放进 cmds，
@@ -63,6 +74,9 @@ type command struct {
 type Service struct {
 	cfg    *config.Config
 	status *statusStore
+
+	// cred 只在 actor 协程里读写，不需要加锁。
+	cred credentials
 
 	cmds      chan *command
 	closed    chan struct{}
@@ -93,8 +107,13 @@ type Service struct {
 // New 构造服务对象并启动命令循环。
 func New(cfg *config.Config) *Service {
 	s := &Service{
-		cfg:       cfg,
-		status:    newStatusStore(),
+		cfg:    cfg,
+		status: newStatusStore(),
+		cred: credentials{
+			username: cfg.Username,
+			password: cfg.Password,
+			totp:     cfg.TOTPSecret,
+		},
 		cmds:      make(chan *command),
 		closed:    make(chan struct{}),
 		actorDone: make(chan struct{}),
@@ -122,6 +141,13 @@ func (s *Service) SetClientOptions(f func(*vpn.Options)) { s.clientOptions = f }
 // 由调用方通过 Auth 提交验证码后继续。
 func (s *Service) Start() error {
 	return s.call(&command{kind: cmdStart})
+}
+
+// StartWithPassword 建立隧道，并使用本次提供的口令。
+//
+// 口令只留在内存里：配置文件里不写口令时，CLI 在终端现问一遍再这样传进来。
+func (s *Service) StartWithPassword(password string) error {
+	return s.call(&command{kind: cmdStart, arg: password})
 }
 
 // Auth 提交二次验证码。仅在 auth_pending 状态下有效。
@@ -278,7 +304,7 @@ func (s *Service) dispatch(cmd *command) {
 	var err error
 	switch cmd.kind {
 	case cmdStart:
-		err = s.start(ctx)
+		err = s.start(ctx, cmd.arg)
 	case cmdAuth:
 		err = s.auth(ctx, cmd.arg)
 	case cmdStop:
@@ -296,7 +322,9 @@ func (s *Service) dispatch(cmd *command) {
 }
 
 // start 建立隧道。
-func (s *Service) start(ctx context.Context) error {
+//
+// password 非空时替换内存里的口令：配置里不写口令的部署靠它把口令带进来。
+func (s *Service) start(ctx context.Context, password string) error {
 	cur := s.status.Get().State
 	switch cur {
 	case StateAuthPending:
@@ -307,6 +335,19 @@ func (s *Service) start(ctx context.Context) error {
 		s.teardown("")
 	default:
 		return fmt.Errorf("%w: 当前状态是 %s", ErrBadState, cur)
+	}
+
+	if password != "" {
+		s.cred.password = password
+	}
+	// 口令可能从终端带进来换行，去掉首尾空白再用于登录。
+	s.cred.password = strings.TrimSpace(s.cred.password)
+	if s.cred.password == "" {
+		return s.fail(errors.New("没有可用的口令：配置文件里的 password 为空，且本次请求没有带上；" +
+			"请在 `njuvpn start` 的提示下输入"))
+	}
+	if s.cred.username == "" {
+		return s.fail(errors.New("配置文件里缺少 username"))
 	}
 
 	s.status.set(StateLoggingIn, "正在登录")
@@ -337,9 +378,9 @@ func (s *Service) start(ctx context.Context) error {
 
 	trace := &vpn.Trace{}
 	sess, err := client.Connect(ctx, vpn.ConnectOptions{
-		Username:   s.cfg.Username,
-		Password:   s.cfg.Password,
-		TOTPSecret: s.cfg.TOTPSecret,
+		Username:   s.cred.username,
+		Password:   s.cred.password,
+		TOTPSecret: s.cred.totp,
 		Trace:      trace,
 	})
 	// 失败时把各阶段打出来：否则远程排查只能看到最后一行错误，
@@ -383,8 +424,8 @@ func (s *Service) auth(ctx context.Context, code string) error {
 
 	trace := &vpn.Trace{}
 	sess, err := s.client.Connect(ctx, vpn.ConnectOptions{
-		Username: s.cfg.Username,
-		Password: s.cfg.Password,
+		Username: s.cred.username,
+		Password: s.cred.password,
 		TwfID:    s.pendingAuth.TwfID,
 		Code:     code,
 		AuthKind: s.pendingAuth.Kind,

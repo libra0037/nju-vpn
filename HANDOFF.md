@@ -101,9 +101,11 @@ IPv4 地址**，不存在轮换。
     # 服务进程 + 命令行客户端
     go run ./cmd/njuvpn run -config config.yaml &
     go run ./cmd/njuvpn start -config config.yaml
-    go run ./cmd/njuvpn auth <code> -config config.yaml
     go run ./cmd/njuvpn status -config config.yaml
     go run ./cmd/njuvpn stop -config config.yaml
+
+    # 注：start 会自己把口令（配置里没写时）与验证码问完，不再有 auth 子命令。
+    # 管道也可以：printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start
 
     # 注：系统服务安装（service install/start）已决定移除，
     # 改为 CLI 按需拉起 + njuvpn restart，见第 10 节。
@@ -227,7 +229,7 @@ query-ip、两条流都在）。WireGuard 承载层已经在监听（见 6.7 节
 
 ### 二次验证续用会话时的一个坑（已修）
 
-`start` 停在 `auth_pending` 后，`auth` 会新建一个 Session 对象，
+`start` 停在 `auth_pending` 后，提交验证码会新建一个 Session 对象，
 而它与 `start` 留下的那个**共用同一个 TwfID**（`login_sms1.csp` 不返回新
 TwfID 时沿用原值）。如果按"释放上一个会话"处理，登出会把正在续用的会话
 一起杀掉：日志里表现为 `logout user success` 紧跟着上行流被服务端以

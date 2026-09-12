@@ -130,3 +130,37 @@ func tail(s string, n int) string {
 	}
 	return s[len(s)-n:]
 }
+
+// TestSecretRoundTrip 验证口令这类字段能安全地放进文本行协议。
+//
+// 协议按空白切分参数，口令里可能有空格；编码同时让口令原文不出现在
+// 任何报文转储里。
+func TestSecretRoundTrip(t *testing.T) {
+	cases := []string{
+		"",
+		"simple",
+		"with space",
+		"tab\tand\nnewline",
+		"中文口令",
+	}
+	for _, want := range cases {
+		encoded := EncodeSecret(want)
+		if strings.ContainsAny(encoded, " \t\n") {
+			t.Fatalf("编码后不该含空白字符: %q", encoded)
+		}
+		got, err := DecodeSecret(encoded)
+		if err != nil {
+			t.Fatalf("解码 %q 失败: %v", encoded, err)
+		}
+		if got != want {
+			t.Fatalf("往返不一致: %q -> %q", want, got)
+		}
+	}
+}
+
+// TestDecodeSecretRejectsGarbage 验证乱码给出错误而不是静默的空口令。
+func TestDecodeSecretRejectsGarbage(t *testing.T) {
+	if _, err := DecodeSecret("not base64!!"); err == nil {
+		t.Fatal("非法编码必须报错")
+	}
+}

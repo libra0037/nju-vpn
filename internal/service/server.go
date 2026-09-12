@@ -161,7 +161,11 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(s.svc.Status())}
 
 	case ipc.CmdStart:
-		err := s.svc.Start()
+		password, err := passwordArg(req.Args)
+		if err != nil {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
+		}
+		err = s.svc.StartWithPassword(password)
 		switch {
 		case err == nil:
 			return ipc.Response{Code: ipc.CodeOK, Message: "隧道已建立"}
@@ -242,6 +246,17 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 }
 
 // statusLine 把状态拼成一行文本。
+
+// passwordArg 解出请求里携带的口令。
+//
+// 参数缺省表示沿用服务进程内存里已有的口令（配置文件里的那份，或上一次
+// start 带来的那份）；带了就是 base64 编码的本次输入。
+func passwordArg(args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	return ipc.DecodeSecret(args[0])
+}
 func statusLine(st Status) string {
 	msg := string(st.State)
 	if st.Detail != "" {
@@ -262,10 +277,11 @@ func statusLine(st Status) string {
 // RunServer 是服务进程的入口：监听本地端点并处理请求。
 // 返回时说明服务已经停止。
 func RunServer(svc *Service, endpoint string) error {
-	// 端点留空表示用平台默认值；解析出来再记日志，
-	// 否则日志里"监听 "后面是空的，排查时看不出到底听在哪。
+	// 端点由调用方按配置文件的身份解析好（见 ipc.EndpointFor）：
+	// 这里不再有"默认端点"这个退路，否则配置读不出来时会静默地
+	// 和另一个实例抢同一个端点。
 	if endpoint == "" {
-		endpoint = ipc.DefaultEndpoint()
+		return ipc.ErrEmptyEndpoint
 	}
 	ln, err := ipc.Listen(endpoint)
 	if err != nil {

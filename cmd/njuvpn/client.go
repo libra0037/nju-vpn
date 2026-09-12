@@ -10,6 +10,7 @@ import (
 
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/ipc"
+	"golang.org/x/term"
 )
 
 // clientConfig 是命令行客户端需要的配置：只有 IPC 端点。
@@ -119,12 +120,49 @@ func runAt(endpoint string, req ipc.Request, timeout time.Duration) error {
 	}
 }
 
+// stdinReader 是复用的标准输入读取器。
+//
+// 管道里可能一次喂了多行（先口令后验证码），每次新建 bufio.Reader 会把
+// 多读到的那些字节一起丢掉。
+var stdinReader *bufio.Reader
+
+// readStdinLine 读一行标准输入并去掉行尾。
+func readStdinLine() (string, error) {
+	if stdinReader == nil {
+		stdinReader = bufio.NewReader(os.Stdin)
+	}
+	line, err := stdinReader.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
 // promptCode 从终端读验证码。
+//
+// 验证码保持回显：它是一次性的，而且用户需要看到自己敲了几位。
 func promptCode() (string, error) {
 	fmt.Fprint(os.Stderr, "请输入验证码: ")
-	var code string
-	if _, err := fmt.Scanln(&code); err != nil {
+	code, err := readStdinLine()
+	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(code), nil
+}
+
+// promptSecret 从终端读一行不回显的输入（口令）。
+//
+// 终端上用 x/term 关掉回显；stdin 不是终端时（管道、脚本）按普通行读——
+// 那种场景本来就没有回显可关，而 ReadPassword 在非终端上会直接报错。
+func promptSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return readStdinLine()
+	}
+	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }

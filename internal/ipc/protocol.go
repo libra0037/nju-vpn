@@ -12,6 +12,7 @@ package ipc
 
 import (
 	"bufio"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +58,23 @@ var ErrLineTooLong = errors.New("报文行超过长度上限")
 type Request struct {
 	Command string
 	Args    []string
+}
+
+// EncodeSecret 把口令之类不能在命令行与日志里露面的字段编成一行文本。
+//
+// 协议按空白切分参数，口令里可能有空格；base64 同时让口令原文不出现在
+// 任何报文转储里。
+func EncodeSecret(s string) string {
+	return base64.StdEncoding.EncodeToString([]byte(s))
+}
+
+// DecodeSecret 还原 EncodeSecret 编出来的字段。
+func DecodeSecret(s string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", fmt.Errorf("字段编码无法解析: %w", err)
+	}
+	return string(raw), nil
 }
 
 // Response 是一条响应。Message 必须是单行文本。
