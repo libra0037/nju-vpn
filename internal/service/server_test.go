@@ -93,6 +93,31 @@ func TestStartIsIdempotent(t *testing.T) {
 	closeServer(t, h, done)
 }
 
+// TestStopIsIdempotent 验证隧道没在跑时 stop 按成功处理。
+//
+// 脚本里一句再普通不过的 njuvpn stop 不该因为"已经停了"失败：它想要的
+// 结果已经成立。命令行客户端的退出码直接由响应状态码决定（见 runAt），
+// 所以状态码就是脚本看到的东西。
+//
+// 注意这里只放弃了"已经停了"这一种失败：参数错、正在退出、内部错误都
+// 仍然是失败（各自对应 400 / 409 / 500）。
+func TestStopIsIdempotent(t *testing.T) {
+	h := newHarness(t)
+	endpoint, done := serve(t, h)
+
+	for i := 1; i <= 2; i++ {
+		resp := request(t, endpoint, ipc.Request{Command: ipc.CmdStop})
+		if resp.Code != ipc.CodeOK {
+			t.Fatalf("第 %d 次 stop 应当报成功，实际 %d %s", i, resp.Code, resp.Message)
+		}
+		if !strings.Contains(resp.Message, "本来就没有运行") {
+			t.Fatalf("没在跑时的文案应与真断开分开，实际 %q", resp.Message)
+		}
+	}
+
+	closeServer(t, h, done)
+}
+
 // TestShutdownLogsOutBeforeEndpointStops 验证 restart 的前置条件。
 //
 // CLI 用“端点不再响应”判断旧进程已经退干净。如果先关监听、再慢慢登出，

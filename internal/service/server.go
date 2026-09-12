@@ -286,7 +286,10 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			}
 			return ipc.Response{Code: ipc.CodeOK, Message: msg}
 		case errors.Is(err, ErrNotRunning):
-			return ipc.Response{Code: ipc.CodeRejected, Message: "隧道本来就没有运行"}
+			// 已经处在"隧道没在跑"这个状态了：stop 想要的结果成立，就报成功，
+			// 否则脚本里一句再普通不过的 `njuvpn stop` 会因为"已经停了"失败。
+			// 文案仍与真断开分开，用户看得出这次什么都没做。
+			return ipc.Response{Code: ipc.CodeOK, Message: "隧道本来就没有运行"}
 		case errors.Is(err, ErrShuttingDown):
 			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
 		default:
