@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -94,7 +95,7 @@ func TestSessionRunClosesBothStreamsOnFailure(t *testing.T) {
 	s.tunnel.RejectStream(0x05, ControlShutdown)
 	sess := connectedSession(t, s)
 
-	before := runtimeGoroutines()
+	before := runtime.NumGoroutine()
 	err := sess.Run(context.Background())
 	if err == nil {
 		t.Fatal("流被拒时 Run 必须返回错误")
@@ -105,7 +106,7 @@ func TestSessionRunClosesBothStreamsOnFailure(t *testing.T) {
 
 	// 等一小会儿，让关闭动作传播到假服务端。
 	time.Sleep(50 * time.Millisecond)
-	after := runtimeGoroutines()
+	after := runtime.NumGoroutine()
 	if after > before+2 {
 		t.Errorf("Run 返回后 goroutine 数从 %d 涨到 %d，疑似泄漏", before, after)
 	}
@@ -186,7 +187,7 @@ func TestRunWithRetryStopsOnTerminalControlCode(t *testing.T) {
 	sess := connectedSession(t, s)
 
 	start := time.Now()
-	err := sess.RunWithRetry(context.Background(), RetryPolicy{Attempts: 4, Base: time.Millisecond, Max: 5 * time.Millisecond})
+	err := sess.RunWithRetryNotify(context.Background(), RetryPolicy{Attempts: 4, Base: time.Millisecond, Max: 5 * time.Millisecond}, nil)
 	if err == nil {
 		t.Fatal("终止性错误必须返回")
 	}
@@ -199,8 +200,6 @@ func TestRunWithRetryStopsOnTerminalControlCode(t *testing.T) {
 	}
 }
 
-// 可重试的错误在 ctx 取消后要立刻停下，不能睡满退避。
-
 // ServerReset 不进重试循环：实测它是"建得太密"或"上条会话没释放"，
 // 继续重试只会把账号推得更远（还会撞上退避，看起来像卡住）。
 func TestRunWithRetryDoesNotRetryServerReset(t *testing.T) {
@@ -212,7 +211,7 @@ func TestRunWithRetryDoesNotRetryServerReset(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := sess.RunWithRetry(ctx, RetryPolicy{Attempts: 10, Base: time.Hour, Max: time.Hour})
+	err := sess.RunWithRetryNotify(ctx, RetryPolicy{Attempts: 10, Base: time.Hour, Max: time.Hour}, nil)
 	if err == nil {
 		t.Fatal("应当返回错误")
 	}
@@ -224,6 +223,8 @@ func TestRunWithRetryDoesNotRetryServerReset(t *testing.T) {
 		t.Fatalf("不该进重试退避，实际耗时 %s", elapsed)
 	}
 }
+
+// 可重试的错误在 ctx 取消后要立刻停下，不能睡满退避。
 func TestRunWithRetryAbortsOnContextCancel(t *testing.T) {
 	s := newScript(t)
 	s.tunnel.RejectStream(0x06, ControlIPBusy) // 可重试：会进重试循环，再被 ctx 打断
@@ -232,7 +233,7 @@ func TestRunWithRetryAbortsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- sess.RunWithRetry(ctx, RetryPolicy{Attempts: 10, Base: time.Hour, Max: time.Hour})
+		done <- sess.RunWithRetryNotify(ctx, RetryPolicy{Attempts: 10, Base: time.Hour, Max: time.Hour}, nil)
 	}()
 
 	time.Sleep(50 * time.Millisecond)

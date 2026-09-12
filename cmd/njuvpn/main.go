@@ -3,7 +3,7 @@
 // 同一个二进制承担两种角色：
 //
 //	njuvpn run                                    服务进程（一般由 start 自动拉起）
-//	njuvpn start|stop|status|auth|restart         命令行客户端，通过本地 IPC 与服务进程通信
+//	njuvpn start|stop|status|restart|ping         命令行客户端，通过本地 IPC 与服务进程通信
 //	njuvpn probe                                  直接连服务端做协议探测，不经过服务进程
 package main
 
@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -48,6 +49,7 @@ func usage() {
   %s stop                         断开隧道，服务进程继续运行
   %s status                       查看服务与隧道状态
   %s restart                      重启服务进程（改完配置后用它，不必手工杀进程）
+  %s ping                         查看服务进程是否在运行，并报出它的身份
   %s probe                        探测协议可用性（直接连服务端，不经过服务进程）
   %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
   %s wg-stats                      查看 WireGuard 收发统计
@@ -60,7 +62,7 @@ func usage() {
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
   Windows  %%LOCALAPPDATA%%\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -83,6 +85,8 @@ func main() {
 		err = cmdRestart(args)
 	case "status":
 		err = cmdStatus(args)
+	case "ping":
+		err = cmdPing(args)
 	case "wg-peer":
 		err = cmdSetPeer(args)
 	case "wg-stats":
@@ -213,7 +217,7 @@ func cmdStart(args []string) error {
 		return err
 	}
 	endpoint := endpointOf(cfg)
-	password, err := passwordFor(cfg)
+	password, err := passwordFor(cfg, endpoint)
 	if err != nil {
 		return err
 	}
@@ -243,6 +247,10 @@ func cmdStart(args []string) error {
 
 	code, err := promptCode()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("读不到验证码，且标准输入已经结束：验证码只能交互输入，" +
+				"无人值守的部署请在配置里写 totp_secret")
+		}
 		return err
 	}
 	if code == "" {
@@ -263,12 +271,23 @@ func cmdStart(args []string) error {
 //
 // 配置里写了口令就用配置里的（服务进程自己会读）；没写就现问一遍，只经
 // 本地套接字传过去。stdin 是管道时也照读，便于脚本一次喂口令和验证码。
-func passwordFor(cfg *config.Config) (string, error) {
+//
+// 隧道已经在跑时不问：这条路径是幂等的（看门狗式脚本每隔几分钟敲一次
+// start），每次都停在口令提示上等于让脚本永远失败——stdin 是 /dev/null
+// 时更是直接以一句裸 EOF 收场。
+func passwordFor(cfg *config.Config, endpoint string) (string, error) {
 	if cfg == nil || cfg.Password != "" {
+		return "", nil
+	}
+	if state, err := serviceState(endpoint); err == nil && state == string(service.StateUp) {
 		return "", nil
 	}
 	password, err := promptSecret("请输入校园网口令: ")
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", errors.New("读不到口令，且标准输入已经结束（非交互运行？）：" +
+				"请在配置文件的 password 里写入口令，或改用交互式终端运行")
+		}
 		return "", err
 	}
 	return strings.TrimSpace(password), nil
@@ -322,6 +341,23 @@ func cmdStatus(args []string) error {
 		req.Args = []string{"check"}
 	}
 	return runAt(endpoint, req, 30*time.Second)
+}
+
+// cmdPing 探活：报出这个端点上有没有服务进程，以及它是哪个实例。
+//
+// 它不改任何状态，是回答"我的命令到底打给了谁"最省事的办法
+// （同机跑多个实例时，各实例的日志几乎逐字相同）。
+func cmdPing(args []string) error {
+	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径")
+	if _, err := parseInterleaved(fs, args); err != nil {
+		return err
+	}
+	endpoint, err := endpointFor(*configPath)
+	if err != nil {
+		return err
+	}
+	return runAt(endpoint, ipc.Request{Command: ipc.CmdPing}, 5*time.Second)
 }
 
 // cmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
@@ -537,8 +573,10 @@ func askCode(kind error) (string, error) {
 	} else {
 		fmt.Print("请输入 TOTP 验证码: ")
 	}
-	var code string
-	if _, err := fmt.Scanln(&code); err != nil {
+	// 与口令共用同一个 bufio.Reader：管道里一次喂两行（先口令后验证码）时，
+	// 各读各的会把多读到的字节丢掉，验证码这一步就 EOF 了。
+	code, err := readStdinLine()
+	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(code), nil

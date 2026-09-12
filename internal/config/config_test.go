@@ -204,19 +204,15 @@ func TestLoadLeavesPrivatePermissionsAlone(t *testing.T) {
 	}
 }
 
-// CLI 只取端点，不该因为读不到凭据文件就失效。
-func TestLoadForClientToleratesUnreadableConfig(t *testing.T) {
+// CLI 只取端点，读不出来时要把错误如实报出来，由调用方决定回退。
+func TestLoadForClientReportsUnreadableConfig(t *testing.T) {
 	cfg, err := LoadForClient(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {
-		t.Fatal("配置文件不存在时应返回错误，由调用方决定回退")
+		t.Fatal("配置文件不存在时应返回错误")
 	}
-	if cfg == nil {
-		t.Fatal("即使失败也要返回可用的空配置")
+	if cfg != nil {
+		t.Fatal("失败时不该回一个看起来能用的空配置")
 	}
-	if cfg.IPC.Endpoint != "" {
-		t.Errorf("空配置里不该有端点: %q", cfg.IPC.Endpoint)
-	}
-
 }
 
 func TestLoadForClientReadsEndpoint(t *testing.T) {

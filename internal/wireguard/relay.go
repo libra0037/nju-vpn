@@ -138,7 +138,7 @@ func (r *Relay) deliver(chunk []byte) {
 		if err != nil {
 			// 对端给了不符合 IPv4 的字节，丢掉整段缓冲等下一个包同步。
 			// 走统一的计数与限速：以前这里是裸日志，下行一旦失步就按
-			// chunk 刷屏，而 DropStats 里一条记录都没有。
+			// chunk 刷屏，而丢包统计里一条记录都没有。
 			r.countDrop(dropDownlinkInvalid)
 			r.frameBuf = nil
 			break
@@ -253,17 +253,6 @@ func (r *Relay) countDrop(reason dropReason) {
 		return
 	}
 	log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
-}
-
-// DropStats 返回每种原因的累计丢包数，供测试与排查使用。
-func (r *Relay) DropStats() map[string]uint64 {
-	out := make(map[string]uint64, dropReasonCount)
-	for reason := dropReason(0); reason < dropReasonCount; reason++ {
-		if n := r.drops[reason].n.Load(); n > 0 {
-			out[dropReasonText[reason]] = n
-		}
-	}
-	return out
 }
 
 // File 返回 nil：这里没有操作系统层面的网卡文件描述符。

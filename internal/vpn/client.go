@@ -108,11 +108,6 @@ func New(opts Options) *Client {
 	return c
 }
 
-// Dial 建立一条到服务端的 TCP 连接。
-func (c *Client) Dial() (net.Conn, error) {
-	return c.dialFn("tcp", c.dialTarget())
-}
-
 // DialContext 建立 TCP 连接，ctx 取消时放弃等待。
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	return dialContext(ctx, c.dialFn, "tcp", c.dialTarget())
@@ -248,6 +243,3 @@ func (c *Client) CloseIdleConnections() {
 		c.http.CloseIdleConnections()
 	}
 }
-
-// HTTPClient 返回 portal 请求使用的 HTTP 客户端。
-func (c *Client) HTTPClient() *http.Client { return c.http }

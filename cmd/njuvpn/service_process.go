@@ -46,15 +46,21 @@ func serviceLogPath(configPath string) string {
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "njuvpn.log"
+		// 建不出目录时落到临时目录的绝对路径：相对路径会跟着 CLI 当时的
+		// 工作目录走，下次就找不到这份日志了（多实例还会互相覆盖）。
+		return filepath.Join(os.TempDir(), logFileName(path))
 	}
 	return filepath.Join(dir, logFileName(path))
 }
 
-// logFileName 给日志文件取名：njuvpn-<配置名>.log。
+// logFileName 给日志文件取名：njuvpn-<实例标识>-<配置名>.log。
 //
 // 配置名里只保留可移植的字符，剩下的换成下划线：这个值来自命令行给的
 // 路径，不该把路径分隔符之类的东西带进文件名。
+//
+// 光靠清洗过的配置名区分不开实例：a b.yaml 与 a_b.yaml 清洗后同名，
+// 而这两个文件名正是要避免交错的那种情况。实例标识由路径的哈希派生，
+// 加到名字里就唯一了。
 func logFileName(configPath string) string {
 	base := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
 	if base == "" || base == "." {
@@ -69,7 +75,7 @@ func logFileName(configPath string) string {
 			b.WriteRune('_')
 		}
 	}
-	return "njuvpn-" + b.String() + ".log"
+	return "njuvpn-" + ipc.InstanceTag(configPath) + "-" + b.String() + ".log"
 }
 
 // pingService 探活：连得上并得到 pong 才算服务进程在运行。
@@ -109,19 +115,46 @@ func ensureService(configPath, proxy string) error {
 	}
 	if err := pingService(endpoint); err == nil {
 		if proxy != "" {
-			log.Printf("服务进程已在运行，-proxy 只在拉起时生效；要换代理请用 njuvpn restart -proxy %s", proxy)
+			log.Printf("服务进程已在运行，-proxy 只在拉起时生效；要换代理请用 njuvpn restart -proxy %s",
+				config.RedactProxy(proxy))
 		}
 		return nil
 	}
 
 	logPath := serviceLogPath(configPath)
-	exited, err := spawnService(configPath, logPath, proxy)
+	exited, err := spawnService(configPath, logPath)
 	if err != nil {
 		return err
 	}
 	log.Printf("已拉起服务进程（日志: %s）", logPath)
 
-	return waitServiceReady(endpoint, logPath, exited, serviceStartTimeout)
+	if err := waitServiceReady(endpoint, logPath, exited, serviceStartTimeout); err != nil {
+		return err
+	}
+	// 代理经 IPC 送进去，而不是写进子进程的命令行：带口令的地址进了 argv
+	// 就等于对同机其他用户公开（/proc/<pid>/cmdline 是人人可读的）。
+	if proxy != "" {
+		if err := setServiceProxy(endpoint, proxy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setServiceProxy 把本次的代理覆盖交给刚拉起的服务进程。
+//
+// 只在拉起时下发：换代理要重启服务进程，语义与 -proxy 的文档一致。
+func setServiceProxy(endpoint, proxy string) error {
+	resp, err := call(endpoint,
+		ipc.Request{Command: ipc.CmdSetProxy, Args: []string{ipc.EncodeSecret(proxy)}},
+		serviceStartTimeout)
+	if err != nil {
+		return err
+	}
+	if resp.Code != ipc.CodeOK {
+		return fmt.Errorf("下发代理失败: 服务进程返回 %d: %s", resp.Code, resp.Message)
+	}
+	return nil
 }
 
 // waitServiceReady 等到服务进程开始应答，或者在它提前退出时立刻报错。
@@ -151,7 +184,7 @@ func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout tim
 //
 // 返回的 channel 在子进程退出时收到它的退出状态：就绪轮询要同时盯着它，
 // 否则子进程立刻退出时用户只能干等超时，再被指去翻日志。
-func spawnService(configPath, logPath, proxy string) (<-chan error, error) {
+func spawnService(configPath, logPath string) (<-chan error, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("定位可执行文件: %w", err)
@@ -160,9 +193,6 @@ func spawnService(configPath, logPath, proxy string) (<-chan error, error) {
 	args := []string{"run"}
 	if configPath != "" {
 		args = append(args, "-config", configPath)
-	}
-	if proxy != "" {
-		args = append(args, "-proxy", proxy)
 	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)

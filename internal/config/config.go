@@ -142,15 +142,14 @@ func restrictPermissions(path string) string {
 
 // LoadForClient 读取命令行客户端需要的部分（只有 IPC 端点）。
 //
-// 它容忍配置文件不可读或权限过宽：CLI 根本不需要账号口令，
-// 不该因为"读不到服务进程的凭据文件"而无法工作——那种情况下
-// 退回默认端点即可。
+// 与 Load 的区别是它不动文件权限：CLI 只是要算 IPC 端点，没必要——
+// 也不该——替服务进程去 chmod 配置文件。
+//
+// 读不出来时返回 nil 加错误，由调用方决定怎么回退（CLI 的回落是"按默认
+// 路径派生端点"，因为端点只依赖路径，不依赖内容）。以前这里回一个空配置，
+// 而调用方自己另造回退值，那个返回值没有任何消费者。
 func LoadForClient(path string) (*Config, error) {
-	cfg, err := load(path)
-	if err != nil {
-		return &Config{}, err
-	}
-	return cfg, nil
+	return load(path)
 }
 
 func load(path string) (*Config, error) {
@@ -269,7 +268,6 @@ func validateEndpoint(endpoint string) error {
 // 会把依赖图绕成一团。取值只有这一个，重复一份的代价小于绕圈。
 const pipePrefixForConfig = `\\.\pipe\`
 
-// Warnings 返回不影响启动、但用户应该知道的问题。
 // RedactProxy 把代理地址里的口令抹掉，供日志与状态输出使用。
 //
 // 代理地址支持 user:pass@host 写法，原文不该落到任何日志里（排查时经常
@@ -285,6 +283,7 @@ func RedactProxy(proxy string) string {
 	return u.Redacted()
 }
 
+// Warnings 返回不影响启动、但用户应该知道的问题。
 func (c *Config) Warnings() []string {
 	var out []string
 	if c.permNote != "" {

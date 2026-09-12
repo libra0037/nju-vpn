@@ -168,8 +168,9 @@ func TestPingServiceFailsWhenNothingListens(t *testing.T) {
 // 日志落在配置文件旁边：（被拉起的）服务进程没有控制台，出问题要看它。
 func TestServiceLogPathNextToConfig(t *testing.T) {
 	dir := t.TempDir()
-	got := serviceLogPath(filepath.Join(dir, "config.yaml"))
-	if want := filepath.Join(dir, "njuvpn-config.log"); got != want {
+	configPath := filepath.Join(dir, "config.yaml")
+	got := serviceLogPath(configPath)
+	if want := filepath.Join(dir, logFileName(configPath)); got != want {
 		t.Errorf("serviceLogPath = %q，想要 %q", got, want)
 	}
 }
@@ -184,8 +185,15 @@ func TestLogFileNameDistinguishesInstances(t *testing.T) {
 	if alice == bob {
 		t.Fatalf("两份配置得到同一个日志名: %q", alice)
 	}
-	if want := "njuvpn-alice.log"; alice != want {
-		t.Errorf("logFileName = %q，想要 %q", alice, want)
+	if !strings.HasPrefix(alice, "njuvpn-") || !strings.HasSuffix(alice, "-alice.log") {
+		t.Errorf("日志名应当带上实例标识与配置名: %q", alice)
+	}
+	// 只清洗非法字符是不够的：这两个名字清洗后一样，而它们正是
+	// "多实例日志交错"要避免的场景。
+	spaced := logFileName(filepath.Join("etc", "njuvpn", "a b.yaml"))
+	underscored := logFileName(filepath.Join("etc", "njuvpn", "a_b.yaml"))
+	if spaced == underscored {
+		t.Fatalf("清洗后同名的两份配置共用了日志名: %q", spaced)
 	}
 	// 路径分隔符之类的东西不该进文件名。
 	if got := logFileName("weird/../x:y.yaml"); strings.ContainsAny(got, "/:\\") {

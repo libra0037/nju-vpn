@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -49,6 +50,9 @@ func (c *Client) openStream(ctx context.Context, token [streamTokenLen]byte, ipR
 		conn.Close()
 		return nil, err
 	}
+	// deadline 只是上限，取消要能立刻生效。
+	unwatch := watchCancel(ctx, conn)
+	defer unwatch()
 
 	// 0x06 请求下行流，0x05 请求上行流。
 	opcode := byte(0x06)
@@ -123,6 +127,8 @@ func (c *Client) queryIP(ctx context.Context, token [streamTokenLen]byte, debug 
 	if err := conn.SetDeadline(deadlineFrom(ctx, c.timeouts.Handshake)); err != nil {
 		return nil, nil, err
 	}
+	unwatch := watchCancel(ctx, conn)
+	defer unwatch()
 
 	message := []byte{0x00, 0x00, 0x00, 0x00}
 	message = append(message, token[:]...)
@@ -135,26 +141,29 @@ func (c *Client) queryIP(ctx context.Context, token [streamTokenLen]byte, debug 
 		DumpHex(message)
 	}
 
-	reply := make([]byte, 0x80)
-	n, err := conn.Read(reply)
-	if err != nil {
+	// 控制码只读 1 字节再看成功与否：被拒绝时服务端可能只回一个控制码就
+	// 关连接，按"读满 4 字节"去读会把控制码一起丢掉，那次可重试的拒绝
+	// 就变成了读失败（退避重试会白烧一轮配额）。
+	head := make([]byte, 1)
+	if _, err := io.ReadFull(conn, head); err != nil {
 		return nil, nil, fmt.Errorf("%s: 读取响应: %w", step, err)
 	}
+	if head[0] != ControlSendIP {
+		return nil, nil, &ControlError{Code: head[0], Context: "query-ip 被拒绝"}
+	}
+	// 成功时把剩下的读满（长度字段余下 3 字节 + 4 字节地址），而不是
+	// "一次 Read 期望拿到整个 36 字节回执"：隧道是字节流，服务端一次写多少
+	// 与我们一次读到多少没有必然关系。旧实现单次 Read 只拿到 4 字节时会把
+	// 这次失败判成不可重试的协议错误，三次退避一次都没走。
+	rest := make([]byte, 7)
+	if _, err := io.ReadFull(conn, rest); err != nil {
+		return nil, nil, fmt.Errorf("%s: 读取分配的地址: %w", step, err)
+	}
+	ip := net.IPv4(rest[3], rest[4], rest[5], rest[6])
 	if debug {
-		log.Printf("query ip: 收到 %d 字节", n)
-		DumpHex(reply[:n])
+		log.Printf("query ip: 控制码 %#x，分配地址 %s", head[0], ip)
+		DumpHex(append(append([]byte(nil), head...), rest...))
 	}
-	if n == 0 {
-		return nil, nil, &ProtocolError{Step: step, Reason: "响应为空"}
-	}
-	if reply[0] != ControlSendIP {
-		return nil, nil, &ControlError{Code: reply[0], Context: "query-ip 被拒绝"}
-	}
-	if n < 8 {
-		return nil, nil, &ProtocolError{Step: step, Reason: fmt.Sprintf("响应只有 %d 字节，读不到分配的地址", n)}
-	}
-
-	ip := net.IPv4(reply[4], reply[5], reply[6], reply[7])
 	// 数据阶段保持长连接，不设 deadline。
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, nil, err
@@ -215,8 +224,8 @@ func (e *StreamError) Unwrap() error { return e.Err }
 
 // RetryPolicy 描述数据流断开后的重连策略。
 //
-// 服务端的控制码区分了能否重试：3(ServerReset) / 5(IpBusy) 值得退避重试；
-// 8(Shutdown) / 9(IpConflict) / 14(IpKick) 是终止性的，重试只会继续被拒，
+// 服务端的控制码区分了能否重试：5(IpBusy) 值得退避重试；其余（3 ServerReset、
+// 8 Shutdown、9 IpConflict、14 IpKick）都是终止性的，重试只会继续被拒，
 // 密集重试还会让账号进入长时间被拒绝的状态。
 type RetryPolicy struct {
 	Attempts int

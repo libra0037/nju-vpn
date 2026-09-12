@@ -133,7 +133,7 @@ func TestAuthSubmitsCodeToServer(t *testing.T) {
 		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
 	})
 
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 	if st := h.svc.Status().State; st != StateAuthPending {
@@ -168,7 +168,7 @@ func TestAuthUpdatesSessionIDUsedForLogout(t *testing.T) {
 		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
 	})
 
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 	if err := h.svc.Auth("123456"); err != nil {
@@ -207,7 +207,7 @@ func TestAuthWrongCodeKeepsPendingState(t *testing.T) {
 		Body: `<Auth>Auth sms failed. invalid code</Auth>`,
 	})
 
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 	err := h.svc.Auth("000000")
@@ -225,7 +225,7 @@ func TestAuthWrongCodeKeepsPendingState(t *testing.T) {
 // 回归：旧隧道协程退出后把刚建立的新会话一起拆掉。
 func TestStaleTunnelExitIsIgnored(t *testing.T) {
 	h := newHarness(t)
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -244,7 +244,7 @@ func TestStaleTunnelExitIsIgnored(t *testing.T) {
 // 当前代次的隧道断开必须收敛到 error 并释放资源。
 func TestCurrentTunnelExitTransitionsToError(t *testing.T) {
 	h := newHarness(t)
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -273,7 +273,7 @@ func TestCloseInterruptsLongOperation(t *testing.T) {
 		opts.TunnelTLS = h.tunnel.Dial
 	})
 
-	go func() { _ = h.svc.Start() }()
+	go func() { _ = h.svc.StartWithPassword("") }()
 	waitState(t, h.svc, StateLoggingIn, 2*time.Second)
 
 	done := make(chan struct{})
@@ -299,7 +299,7 @@ func TestPanicInOperationIsContained(t *testing.T) {
 		opts.TunnelTLS = h.tunnel.Dial
 	})
 
-	err := h.svc.Start()
+	err := h.svc.StartWithPassword("")
 	if err == nil {
 		t.Fatal("内部错误必须返回错误")
 	}
@@ -316,7 +316,7 @@ func TestPanicInOperationIsContained(t *testing.T) {
 // 状态收敛：stop 之后地址信息必须清掉，不能继续对外展示。
 func TestStopClearsAddresses(t *testing.T) {
 	h := newHarness(t)
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -344,7 +344,7 @@ func TestStopWhenIdle(t *testing.T) {
 // 退出路径必须尝试登出，否则服务端会留下占名额的会话。
 func TestCloseLogsOutOnce(t *testing.T) {
 	h := newHarness(t)
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -366,7 +366,7 @@ func TestStatusNeverBlocksDuringLongOperation(t *testing.T) {
 		opts.PortalTLS = h.tunnel.Dial
 		opts.TunnelTLS = h.tunnel.Dial
 	})
-	go func() { _ = h.svc.Start() }()
+	go func() { _ = h.svc.StartWithPassword("") }()
 	waitState(t, h.svc, StateLoggingIn, 2*time.Second)
 
 	done := make(chan Status, 1)
@@ -388,7 +388,7 @@ func TestCallAfterCloseReturnsError(t *testing.T) {
 	h.svc.Close()
 
 	done := make(chan error, 1)
-	go func() { done <- h.svc.Start() }()
+	go func() { done <- h.svc.StartWithPassword("") }()
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrShuttingDown) {
@@ -440,7 +440,7 @@ func TestAuthContinuationDoesNotLogoutSharedSession(t *testing.T) {
 		Body: `<Auth>Auth sms suc</Auth>`,
 	})
 
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 	if n := h.portal.Count("/por/logout.csp"); n != 0 {
@@ -464,7 +464,7 @@ func TestAuthContinuationDoesNotLogoutSharedSession(t *testing.T) {
 // 回归：attach 遇到共用同一 TwfID 的会话时只能释放本地资源。
 func TestAttachSameSessionDoesNotLogout(t *testing.T) {
 	h := newHarness(t)
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -492,7 +492,7 @@ func TestAttachSameSessionDoesNotLogout(t *testing.T) {
 // 服务端说"没有这个会话"时，释放资源不该报成错误。
 func TestTeardownToleratesMissingServerSession(t *testing.T) {
 	h := newHarness(t)
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -547,7 +547,7 @@ func TestSetPeerPersistsAndApplies(t *testing.T) {
 	}
 
 	// 隧道建立后，更新应当立刻作用到设备上，且 peer 数量仍为 1。
-	if err := h.svc.Start(); err != nil {
+	if err := h.svc.StartWithPassword(""); err != nil {
 		t.Fatalf("Start 失败: %v", err)
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
@@ -603,7 +603,7 @@ func TestClientOptionsUseProductionWiring(t *testing.T) {
 	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
 		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
 	})
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 
@@ -633,7 +633,7 @@ func TestTunnelRetryUpdatesDetail(t *testing.T) {
 	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
 		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
 	})
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 	if err := h.svc.Auth("123456"); err != nil {
@@ -693,7 +693,7 @@ func TestStartOnRunningTunnelReportsBadState(t *testing.T) {
 	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
 		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
 	})
-	if err := h.svc.Start(); !errors.Is(err, ErrAuthRequired) {
+	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
 	}
 	if err := h.svc.Auth("123456"); err != nil {
@@ -701,7 +701,7 @@ func TestStartOnRunningTunnelReportsBadState(t *testing.T) {
 	}
 	waitState(t, h.svc, StateUp, 3*time.Second)
 
-	err := h.svc.Start()
+	err := h.svc.StartWithPassword("")
 	if !errors.Is(err, ErrBadState) {
 		t.Fatalf("隧道已在运行时 start 应返回 ErrBadState，实际 %v", err)
 	}

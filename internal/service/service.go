@@ -34,6 +34,12 @@ var ErrAuthRequired = errors.New("需要二次验证")
 // ErrShuttingDown 表示服务进程正在退出，不再接受新命令。
 var ErrShuttingDown = errors.New("服务进程正在退出")
 
+// ErrStopRequested 表示这条命令在排队期间用户已经请求断开，因此没有执行。
+var ErrStopRequested = errors.New("已收到断开请求，这条命令没有执行")
+
+// ErrEmptyCode 表示请求里没有验证码。属于客户端用法问题，IPC 层回 400。
+var ErrEmptyCode = errors.New("验证码为空")
+
 // closeGrace 是 Close 等待 actor 收尾的上限。正常收尾就是一次登出请求，
 // 登出自身有 10 秒超时，所以这里给足余量但不无限等。
 const closeGrace = 20 * time.Second
@@ -57,12 +63,16 @@ const (
 	cmdTunnelDown
 	cmdTunnelRetry
 	cmdSetPeer
+	cmdSetProxy
 )
 
 type command struct {
-	kind  commandKind
-	arg   string
-	gen   uint64
+	kind commandKind
+	arg  string
+	gen  uint64
+	// seq 是发起方自己的轮次。收方用它丢弃过期命令：等待验证码的计时器
+	// 可能已经触发、命令正排在队列里，而那一轮早就收场了。
+	seq   uint64
 	err   error
 	reply chan error
 }
@@ -104,6 +114,11 @@ type Service struct {
 
 	mu       sync.Mutex
 	opCancel context.CancelFunc
+	// stopPending 记录"用户已经请求断开"。它不只打断正在执行的那条命令，
+	// 还要让排队中的 start / auth 别在 stop 之后接着跑完——命令在 actor
+	// 里串行，一次登录最坏三分多钟，等它跑完再断，用户看到的是
+	// "stop 超时退出、隧道随后又被建起来"。
+	stopPending atomic.Bool
 	// device 由 actor 协程写、只读查询（wg-stats）读。它只是指针交换，
 	// 用 atomic.Pointer 比"谁在锁里访问"的约定更省心。
 	device atomic.Pointer[wireguard.Device]
@@ -123,6 +138,9 @@ type Service struct {
 	pendingAuth   *vpn.AuthRequiredError
 	// authTimer 只在 auth_pending 期间有效，到点由 actor 收尾。
 	authTimer *time.Timer
+	// authSeq 是"等待验证码"的轮次，每次起停自增。计时器触发时把当时
+	// 的轮次带进命令里，迟到的命令因此能被认出来并丢掉。
+	authSeq uint64
 }
 
 // New 构造服务对象并启动命令循环。
@@ -188,17 +206,13 @@ func New(cfg *config.Config) (*Service, error) {
 
 // identityOf 组装实例身份，只在启动时算一次。
 //
-// 端点规则与 cmd 层的 endpointOf 相同：显式配置优先，否则按配置文件的
-// 路径派生；两处都委托给 ipc 包，规则只有一份。
+// 端点规则与 cmd 层的 endpointOf 共用 ipc.ResolveEndpoint：两处算错任何
+// 一处，命令就会打到别的实例上去。
 func identityOf(cfg *config.Config) Identity {
-	endpoint := cfg.IPC.Endpoint
-	if endpoint == "" {
-		endpoint = ipc.EndpointFor(cfg.SourcePath())
-	}
 	return Identity{
 		PID:        os.Getpid(),
 		ConfigPath: cfg.SourcePath(),
-		Endpoint:   endpoint,
+		Endpoint:   ipc.ResolveEndpoint(cfg.IPC.Endpoint, cfg.SourcePath()),
 		Username:   cfg.Username,
 	}
 }
@@ -225,17 +239,12 @@ func (s *Service) SetDialer(f vpn.DialFunc) { s.dialer = f }
 // portal HTTP 客户端与隧道拨号）。
 func (s *Service) SetClientOptions(f func(*vpn.Options)) { s.clientOptions = f }
 
-// Start 建立隧道。
-//
-// 若服务端要求二次验证，会切到 auth_pending 并返回 ErrAuthRequired，
-// 由调用方通过 Auth 提交验证码后继续。
-func (s *Service) Start() error {
-	return s.call(&command{kind: cmdStart})
-}
-
-// StartWithPassword 建立隧道，并使用本次提供的口令。
+// StartWithPassword 建立隧道，并使用本次提供的口令（空串表示沿用服务进程
+// 内存里已有的那份，也就是配置文件里的或上一次 start 带来的）。
 //
 // 口令只留在内存里：配置文件里不写口令时，CLI 在终端现问一遍再这样传进来。
+// 若服务端要求二次验证，会切到 auth_pending 并返回 ErrAuthRequired，
+// 由调用方通过 Auth 提交验证码后继续。
 func (s *Service) StartWithPassword(password string) error {
 	return s.call(&command{kind: cmdStart, arg: password})
 }
@@ -251,6 +260,14 @@ func (s *Service) Auth(code string) error {
 // 密钥（例如重新生成 Clash 配置）不必再登录一次、再花一条短信。
 func (s *Service) SetPeer(publicKey string) error {
 	return s.call(&command{kind: cmdSetPeer, arg: publicKey})
+}
+
+// SetProxy 覆盖出站代理，供 CLI 在拉起服务进程之后立刻下发。
+//
+// 走命令通道而不是直接改配置结构：cfg 由 actor 读（start 时构造拨号
+// 函数），从别的协程改就是数据竞争。
+func (s *Service) SetProxy(proxy string) error {
+	return s.call(&command{kind: cmdSetProxy, arg: proxy})
 }
 
 // WireGuardStats 返回承载层的收发统计。
@@ -271,6 +288,7 @@ func (s *Service) WireGuardStats() ([]wireguard.PeerStats, error) {
 // 以取消收场，随后这条 stop 照常执行——用户不必转去手工杀进程，而手工杀
 // 会跳过登出。
 func (s *Service) Stop() error {
+	s.stopPending.Store(true)
 	s.cancelOp()
 	return s.call(&command{kind: cmdStop})
 }
@@ -404,6 +422,18 @@ func (s *Service) dispatch(cmd *command) {
 		}
 	}()
 
+	// 用户已经请求断开时，排队中的登录类命令不再执行：它们会在那条 stop
+	// 之后接着登录、发短信、建隧道，用户看到的是"stop 报超时，可隧道后来
+	// 又自己起来了"。stop 自己当然要放行，它正是来清这个标记的。
+	if s.stopPending.Load() {
+		switch cmd.kind {
+		case cmdStart, cmdAuth:
+			log.Printf("已收到断开请求，丢弃排队中的 %v 命令", cmd.kind)
+			reply(ErrStopRequested)
+			return
+		}
+	}
+
 	var err error
 	switch cmd.kind {
 	case cmdStart:
@@ -411,7 +441,7 @@ func (s *Service) dispatch(cmd *command) {
 	case cmdAuth:
 		err = s.auth(ctx, cmd.arg)
 	case cmdAuthTimeout:
-		err = s.authTimeout()
+		err = s.authTimeout(cmd.seq)
 	case cmdStop:
 		err = s.stop()
 	case cmdTunnelDown:
@@ -420,6 +450,8 @@ func (s *Service) dispatch(cmd *command) {
 		err = s.tunnelRetry(cmd.gen, cmd.arg, cmd.err)
 	case cmdSetPeer:
 		err = s.setPeer(cmd.arg)
+	case cmdSetProxy:
+		err = s.setProxy(cmd.arg)
 	default:
 		err = fmt.Errorf("未知命令 %d", cmd.kind)
 	}
@@ -517,7 +549,7 @@ func (s *Service) auth(ctx context.Context, code string) error {
 		return fmt.Errorf("当前状态是 %s，不需要验证码", cur)
 	}
 	if code == "" {
-		return errors.New("验证码为空")
+		return ErrEmptyCode
 	}
 
 	// 续用同一个服务端会话：先把待验证的会话从 s.session 上摘下来，
@@ -526,6 +558,14 @@ func (s *Service) auth(ctx context.Context, code string) error {
 	// 上行流立刻被服务端以 Shutdown 拒绝）。
 	pending := s.session
 	s.session = nil
+	// 续用期间 Connect 若 panic（协议解析、封装库），会话对象就没人引用了，
+	// TwfID 跟着丢失，服务端那条名额要等它自己超时才释放。正常路径上
+	// attach 会先把新会话装上，这条恢复因此不会生效。
+	defer func() {
+		if s.session == nil && pending != nil {
+			s.session = pending
+		}
+	}()
 
 	trace := &vpn.Trace{}
 	sess, err := s.client.Connect(ctx, vpn.ConnectOptions{
@@ -603,12 +643,27 @@ func (s *Service) setPeer(publicKey string) error {
 	return nil
 }
 
+// setProxy 记录出站代理的覆盖值。
+//
+// 只在内存里改：配置文件仍是"这台机器上跑什么"的真相来源，而 -proxy 是
+// 一次性的命令行覆盖（CLI 拉起服务进程时经 IPC 送进来）。
+func (s *Service) setProxy(proxy string) error {
+	if proxy == "" {
+		return nil
+	}
+	s.cfg.Proxy = proxy
+	log.Printf("出站代理已更新: %s", config.RedactProxy(proxy))
+	return nil
+}
+
 // stop 断开隧道。
 func (s *Service) stop() error {
+	// 标记到这里就完成了使命：这条 stop 之后到达的命令都是新意图。
+	s.stopPending.Store(false)
 	if s.status.Get().State == StateIdle && s.session == nil {
 		return ErrNotRunning
 	}
-	s.teardown("已断开")
+	s.teardown("隧道已断开")
 	return nil
 }
 
@@ -652,6 +707,7 @@ func (s *Service) finishConnect(sess *vpn.Session) error {
 	s.status.setAddresses(sess.ClientIP(), s.cfg.WireGuard.PeerAddress)
 	// 先进入 up 再启动隧道协程：如果协程立刻就失败，
 	// tunnelDown 必须能看到 up 才能正确收敛，否则这次失败会被忽略掉。
+	s.status.setRetrying(false)
 	s.status.set(StateUp, "隧道已建立")
 
 	// 隧道协程的生命周期独立于本次命令：Stop/Close 通过 runCancel 结束它。
@@ -765,6 +821,7 @@ func (s *Service) tunnelRetry(gen uint64, attemptText string, err error) error {
 	if s.status.Get().State != StateUp && s.status.Get().State != StateError {
 		return nil
 	}
+	s.status.setRetrying(true)
 	s.status.setDetail(fmt.Sprintf("隧道断开，正在重连（第 %s 次）: %v", attemptText, err))
 	return nil
 }
@@ -845,11 +902,16 @@ func (s *Service) awaitAuth() error {
 // 计时器打断。
 func (s *Service) startAuthTimer() {
 	s.stopAuthTimer()
-	s.authTimer = time.AfterFunc(authWaitTimeout, s.reportAuthTimeout)
+	seq := s.authSeq
+	s.authTimer = time.AfterFunc(authWaitTimeout, func() { s.reportAuthTimeout(seq) })
 }
 
 // stopAuthTimer 取消等待验证码的上限。
+//
+// 同时推进轮次：计时器可能已经触发、命令正排在队列里，推进之后那条
+// 迟到的命令就能认出自己是过期的。
 func (s *Service) stopAuthTimer() {
+	s.authSeq++
 	if s.authTimer != nil {
 		s.authTimer.Stop()
 		s.authTimer = nil
@@ -859,9 +921,9 @@ func (s *Service) stopAuthTimer() {
 // reportAuthTimeout 把"等验证码超时"交给 actor。
 //
 // 与隧道协程的收尾一样必须经过 actor：直接改状态会与正在执行的命令打架。
-func (s *Service) reportAuthTimeout() {
+func (s *Service) reportAuthTimeout(seq uint64) {
 	select {
-	case s.cmds <- &command{kind: cmdAuthTimeout, reply: make(chan error, 1)}:
+	case s.cmds <- &command{kind: cmdAuthTimeout, seq: seq, reply: make(chan error, 1)}:
 	case <-s.closed:
 	}
 }
@@ -869,7 +931,13 @@ func (s *Service) reportAuthTimeout() {
 // authTimeout 处理"等验证码等到超时"。
 //
 // 只做收尾：用户可能只是走开了，回来后重新 start（会重新登录）即可。
-func (s *Service) authTimeout() error {
+func (s *Service) authTimeout(seq uint64) error {
+	if seq != s.authSeq {
+		// 上一轮的计时器：那一轮早已收场（验证码输对了、或者用户重新
+		// start 了），这条命令什么都不能动——以前它会在这里把新一轮的
+		// auth_pending 直接拆掉。
+		return nil
+	}
 	if s.status.Get().State != StateAuthPending {
 		return nil // 已经不在等验证码，无事可做
 	}
@@ -891,7 +959,14 @@ func (s *Service) fail(err error) error {
 // teardown 释放本次连接的全部资源并回到 idle。只能在 actor 协程内调用。
 //
 // 承载设备不在释放之列：它活到进程结束，这里只把这次会话从它上面摘掉。
-func (s *Service) teardown(detail string) {
+//
+// 返回登出时遇到的错误：会话本身已经释放，但服务端那边可能还占着名额，
+// 调用方据此决定要不要在对外的说明里提一句。以前的实现只写日志，
+// 于是 stop 回了一句"隧道已断开"，而学校侧那条名额其实还挂着。
+func (s *Service) teardown(detail string) error {
+	// 先停表再登出：登出最长 10 秒，而计时器到点会按"等验证码超时"
+	// 收尾——那会把紧接着的一轮登录（用户重新 start）一起拆掉。
+	s.stopAuthTimer()
 	if s.runCancel != nil {
 		s.runCancel()
 		s.runCancel = nil
@@ -902,11 +977,13 @@ func (s *Service) teardown(detail string) {
 		log.Printf("摘除 WireGuard peer 时出错: %v", err)
 	}
 	s.dev.ClearSession()
+	var logoutErr error
 	if s.session != nil {
 		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，
 		// 而登出本身必须发出去。
 		// 服务端已经没有这个会话不算错误——目标已经达成。
 		if err := s.session.Close(context.Background()); err != nil && !errors.Is(err, vpn.ErrLogoutNoSession) {
+			logoutErr = err
 			log.Printf("释放会话时出错: %v", err)
 		}
 		s.session = nil
@@ -915,13 +992,16 @@ func (s *Service) teardown(detail string) {
 		s.client.CloseIdleConnections()
 	}
 	s.pendingAuth = nil
-	s.stopAuthTimer()
 	s.status.clearAddresses()
 
 	if s.status.Get().State != StateIdle {
 		if detail == "" {
 			detail = "已断开"
 		}
+		if logoutErr != nil {
+			detail = fmt.Sprintf("%s（登出未成功: %v，服务端名额可能仍被占用）", detail, logoutErr)
+		}
 		s.status.set(StateIdle, detail)
 	}
+	return logoutErr
 }

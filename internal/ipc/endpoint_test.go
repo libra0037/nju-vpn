@@ -80,8 +80,27 @@ func TestEndpointForSymlink(t *testing.T) {
 func TestEndpointForMissingFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "not-yet.yaml")
 
-	if EndpointFor(missing) != EndpointFor(missing) {
-		t.Fatal("文件不存在时派生结果不稳定")
+	// 与独立算出的期望值比较：以前这里写的是 EndpointFor(missing) 与自身
+	// 比较，恒真，断言永远不会失败。
+	dir := filepath.Dir(missing)
+	if got, want := EndpointFor(missing), EndpointFor(filepath.Join(dir, "not-yet.yaml")); got != want {
+		t.Fatalf("同一路径两次派生不一致: %q != %q", got, want)
+	}
+	other := filepath.Join(dir, "another.yaml")
+	if EndpointFor(missing) == EndpointFor(other) {
+		t.Fatal("不同的文件路径不该得到同一个端点")
+	}
+}
+
+// TestResolveEndpoint 验证"显式端点优先，否则按路径派生"这条规则。
+func TestResolveEndpoint(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), "config.yaml")
+
+	if got, want := ResolveEndpoint("/tmp/custom.sock", path), "/tmp/custom.sock"; got != want {
+		t.Fatalf("显式端点应优先: %q != %q", got, want)
+	}
+	if got, want := ResolveEndpoint("", path), EndpointFor(path); got != want {
+		t.Fatalf("没写显式端点时应按路径派生: %q != %q", got, want)
 	}
 }
 

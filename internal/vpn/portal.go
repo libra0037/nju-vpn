@@ -160,13 +160,6 @@ func (c *Client) webLogin(ctx context.Context, username, password string) (strin
 
 // requestSMS 请求服务端发送一条短信验证码。
 //
-// minRSAModulusBits 是接受服务端加密公钥的下限。
-//
-// 注意这只挡住"明显不对"的公钥：整条链路仍然没有证书校验，
-// 主动中间人可以换成自己的 2048 位公钥。口令的保密性等价于
-// "没有主动中间人"。
-const minRSAModulusBits = 1024
-
 // 返回的 state 非 nil 表示请求被受理（ErrSMSSent / ErrSMSTooMany 等），
 // 由上层决定怎么提示用户。
 func (c *Client) requestSMS(ctx context.Context, twfID string) (error, error) {
@@ -282,6 +275,13 @@ func (c *Client) Logout(ctx context.Context, twfID string) error {
 	}
 	return classifyLogout(body)
 }
+
+// minRSAModulusBits 是接受服务端加密公钥的下限。
+//
+// 注意这只挡住"明显不对"的公钥：整条链路仍然没有证书校验，
+// 主动中间人可以换成自己的 2048 位公钥。口令的保密性等价于
+// "没有主动中间人"。
+const minRSAModulusBits = 1024
 
 // parsePublicKey 解析服务端返回的 RSA 公钥。
 //

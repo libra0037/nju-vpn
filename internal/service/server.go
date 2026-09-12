@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/vpn"
 )
 
 const (
@@ -163,10 +164,31 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		st := s.svc.Status()
 		// `status -check` 给巡检脚本用：隧道不在 up 时以非 0 退出，
 		// 而不是把"进程活着"当成"链路正常"。
-		if len(req.Args) > 0 && req.Args[0] == "check" && st.State != StateUp {
+		//
+		// 正在退避重连时也算不正常：状态还是 up（隧道对象还在），
+		// 但链路是断的。
+		if len(req.Args) > 0 && req.Args[0] == "check" && (st.State != StateUp || st.Retrying) {
 			return ipc.Response{Code: ipc.CodeRejected, Message: statusLine(st)}
 		}
 		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(st)}
+
+	case ipc.CmdState:
+		// 只回报状态名，不做任何修饰：调用方拿它做判断，
+		// 不必去解析给人看的那行文本。
+		return ipc.Response{Code: ipc.CodeOK, Message: string(s.svc.Status().State)}
+
+	case ipc.CmdSetProxy:
+		if len(req.Args) == 0 {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: "用法: set-proxy <地址>"}
+		}
+		proxy, err := ipc.DecodeSecret(req.Args[0])
+		if err != nil {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
+		}
+		if err := s.svc.SetProxy(proxy); err != nil {
+			return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: "出站代理已更新"}
 
 	case ipc.CmdStart:
 		// 已经建好时再敲一次 start 是常见操作（脚本巡检也会这么写），
@@ -186,6 +208,9 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			return ipc.Response{Code: ipc.CodeAuthRequired, Message: s.svc.Status().Detail}
 		case errors.Is(err, ErrBadState):
 			// 已经在跑时又敲一次 start 是常见操作，不该报成服务端故障。
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
+		case errors.Is(err, ErrStopRequested):
+			// 排队期间用户已经敲了 stop，这条 start 没有执行。
 			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
 		case errors.Is(err, ErrShuttingDown):
 			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
@@ -207,9 +232,16 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			return ipc.Response{Code: ipc.CodeAuthRequired, Message: s.svc.Status().Detail}
 		case errors.Is(err, ErrShuttingDown):
 			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
-		default:
-			// 验证码错误属于客户端输入问题，不该报成服务端故障。
+		case errors.Is(err, ErrBadState):
+			// 当前状态不需要验证码：用法问题，不是服务端故障。
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
+		case errors.Is(err, ErrEmptyCode), vpn.IsAuthCodeError(err):
+			// 验证码错误属于客户端输入问题，缺验证码同理。
 			return ipc.Response{Code: ipc.CodeBadRequest, Message: err.Error()}
+		default:
+			// 其余（网络错误、承载启动失败、内部错误）是服务端这一侧的问题：
+			// 以前一律回 400，脚本会把"服务端故障"当成"我验证码敲错了"。
+			return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
 		}
 
 	case ipc.CmdSetPeer:
@@ -246,9 +278,17 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		err := s.svc.Stop()
 		switch {
 		case err == nil:
-			return ipc.Response{Code: ipc.CodeOK, Message: "隧道已断开"}
+			// 说明文字取自状态：登出没成功时会在这里带出来，
+			// 用户才知道服务端名额可能还占着、下次 start 可能被拒。
+			msg := "隧道已断开"
+			if d := s.svc.Status().Detail; d != "" {
+				msg = d
+			}
+			return ipc.Response{Code: ipc.CodeOK, Message: msg}
 		case errors.Is(err, ErrNotRunning):
 			return ipc.Response{Code: ipc.CodeRejected, Message: "隧道本来就没有运行"}
+		case errors.Is(err, ErrShuttingDown):
+			return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
 		default:
 			return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
 		}
@@ -257,8 +297,6 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		return ipc.Response{Code: ipc.CodeBadRequest, Message: "未知命令: " + req.Command}
 	}
 }
-
-// statusLine 把状态拼成一行文本。
 
 // passwordArg 解出请求里携带的口令。
 //
@@ -270,8 +308,13 @@ func passwordArg(args []string) (string, error) {
 	}
 	return ipc.DecodeSecret(args[0])
 }
+
+// statusLine 把状态拼成一行文本。
 func statusLine(st Status) string {
 	msg := string(st.State)
+	if st.Retrying {
+		msg += "（链路已断开，正在重连）"
+	}
 	if st.Detail != "" {
 		msg += " | " + st.Detail
 	}

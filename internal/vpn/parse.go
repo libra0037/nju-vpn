@@ -26,7 +26,8 @@ const (
 // tagRegexps 是协议里用到的全部标签正则，启动时编译一次。
 //
 // 标签是固定的小集合，查表比 sync.Map 省一次接口断言——这条路径在
-// 每次解析响应时都会走到。漏了哪个标签会被 init 的断言挡住（见 tagRegexp）。
+// 每次解析响应时都会走到。表里没有的标签仍能用（见 tagRegexp），
+// 只是每次都要现场编译正则并记一条日志，所以用到的标签都要登记进来。
 var tagRegexps = map[string]*regexp.Regexp{
 	"TwfID":              tagPattern("TwfID"),
 	"Result":             tagPattern("Result"),
@@ -34,6 +35,8 @@ var tagRegexps = map[string]*regexp.Regexp{
 	"NextService":        tagPattern("NextService"),
 	"NextServiceSubType": tagPattern("NextServiceSubType"),
 	"ErrorCode":          tagPattern("ErrorCode"),
+	"ErrorMsg":           tagPattern("ErrorMsg"),
+	"Note":               tagPattern("Note"),
 	"Message":            tagPattern("Message"),
 	"CSRF_RAND_CODE":     tagPattern("CSRF_RAND_CODE"),
 	"RSA_ENCRYPT_KEY":    tagPattern("RSA_ENCRYPT_KEY"),

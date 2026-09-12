@@ -3,13 +3,10 @@ package vpn
 import (
 	"context"
 	"encoding/hex"
-	"net"
 	"testing"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-
-	"github.com/libra0037/nju-vpn/internal/vpntest"
 )
 
 // 这个文件把与真实服务端的线上格式钉死。
@@ -153,22 +150,6 @@ func TestStreamTokenLayout(t *testing.T) {
 	}
 }
 
-// 地址反序：隧道用反序地址标识会话，写反了服务端会认成别的会话。
-func TestIPRevIsReversed(t *testing.T) {
-	ip := net.IPv4(goldenIP[0], goldenIP[1], goldenIP[2], goldenIP[3])
-	rev := [4]byte{ip[15], ip[14], ip[13], ip[12]}
-	want := [4]byte{goldenIP[3], goldenIP[2], goldenIP[1], goldenIP[0]}
-	if rev != want {
-		t.Errorf("反序地址 = %v，期望 %v", rev, want)
-	}
-	// golden 帧末尾就是它。
-	tok := goldenStreamToken(t)
-	_ = tok
-	if goldenStreamRecvFrame[len(goldenStreamRecvFrame)-8:] != "12381dac" {
-		t.Error("golden 帧末尾与反序地址不一致")
-	}
-}
-
 // 确保 golden 帧确实是被真实代码路径发出去的，而不是只在测试里自洽。
 func TestGoldenFramesComeFromRealCodePath(t *testing.T) {
 	s := newScript(t)
@@ -183,14 +164,7 @@ func TestGoldenFramesComeFromRealCodePath(t *testing.T) {
 	if len(got) != len(goldenStreamRecvFrame)/2 {
 		t.Fatalf("帧长 = %d，期望 %d", len(got), len(goldenStreamRecvFrame)/2)
 	}
-	if vpntestFramesDiffer(got, goldenStreamRecvFrame) {
+	if hex.EncodeToString(got) != goldenStreamRecvFrame {
 		t.Error("真实代码路径发出的帧与 golden 不一致")
 	}
 }
-
-// vpntestFramesDiffer 比较一帧的十六进制与期望值。
-func vpntestFramesDiffer(frame []byte, wantHex string) bool {
-	return hex.EncodeToString(frame) != wantHex
-}
-
-var _ = vpntest.LoginAuthPage

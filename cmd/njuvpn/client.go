@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -70,10 +71,8 @@ func endpointOf(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
-	if cfg.IPC.Endpoint != "" {
-		return cfg.IPC.Endpoint
-	}
-	return ipc.EndpointFor(cfg.SourcePath())
+	// 规则只有一份，在 ipc 包里：服务进程算实例身份时用的是同一个函数。
+	return ipc.ResolveEndpoint(cfg.IPC.Endpoint, cfg.SourcePath())
 }
 
 // endpointFor 是 clientConfig 加 endpointOf 的组合，供各命令使用。
@@ -85,30 +84,61 @@ func endpointFor(configPath string) (string, error) {
 	return endpointOf(cfg), nil
 }
 
-// ensureProbeIsSafe 在本机隧道正在运行时拦一下 probe。
+// serviceState 问服务进程当前处在什么状态。
+//
+// 用专门的 state 命令而不是从 status 的显示文本里切第一段：那行是给人看的，
+// 格式一改，判断就静默失效（而按文本写的测试还会继续通过）。
+func serviceState(endpoint string) (string, error) {
+	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdState}, 5*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if resp.Code != ipc.CodeOK {
+		return "", fmt.Errorf("%w: %d %s", errStateUnknown, resp.Code, resp.Message)
+	}
+	return strings.TrimSpace(resp.Message), nil
+}
+
+// errStateUnknown 表示服务进程应答了，但答不出状态。
+//
+// 最可能的成因是命令行与服务进程来自不同版本（端点按配置路径派生，旧进程
+// 还占着那个端点）。
+var errStateUnknown = errors.New("服务进程没有回报状态")
+
+// ensureProbeIsSafe 在本机持有会话时拦一下 probe。
 //
 // probe 会完整登录一次，占掉该账号唯一的会话名额：正在跑的隧道会被服务端
 // 踢下线（同一账号只允许一条会话），短信模式下还要再花一条验证码。
 // 只是想把某个会话登掉的话，用 probe -logout -twf-id 就够。
 func ensureProbeIsSafe(cfg *config.Config) error {
-	resp, err := call(endpointOf(cfg), ipc.Request{Command: ipc.CmdStatus}, 5*time.Second)
-	if err != nil {
+	state, err := serviceState(endpointOf(cfg))
+	switch {
+	case err == nil:
+	case errors.Is(err, errStateUnknown):
+		// 问不出"有没有会话"时保守拦住：拦错了只是让用户加 -force，
+		// 放过则会踢掉正在跑的隧道，短信模式下还白花一条验证码。
+		return fmt.Errorf("无法确认本机服务进程的状态（%v）：probe 可能另开一个会话，"+
+			"把正在跑的隧道踢下线；先 njuvpn restart 让两边版本一致，或加 -force 继续", err)
+	default:
 		return nil // 服务进程没在跑，随便探
 	}
-	state := strings.SplitN(resp.Message, " | ", 2)[0]
 	switch state {
-	case string(service.StateUp), string(service.StateAuthPending):
-		return fmt.Errorf("本机隧道正处于 %s：probe 会另开一个会话把它踢下线"+
-			"（同一账号只允许一条会话，短信模式下还会多花一条验证码）；"+
-			"先 njuvpn stop，或加 -force 继续", state)
+	case string(service.StateIdle), string(service.StateError):
+		// 只有这两种状态是"本机没有会话"。
+		return nil
 	}
-	return nil
+	// 反过来列举放行状态，而不是列举要拦的状态：登录中（logging_in）与
+	// 建承载中（connecting）都会完整登录一次，以前它们不在黑名单里，
+	// probe 会把本机正在进行的 start 踢掉，短信模式下还多花一条验证码。
+	return fmt.Errorf("本机服务进程正持有会话（%s）：probe 会另开一个会话把它踢下线"+
+		"（同一账号只允许一条会话，短信模式下还会多花一条验证码）；"+
+		"先 njuvpn stop，或加 -force 继续", state)
 }
 
-// runCommand 是 start/stop/status/auth 的公共实现。
+// runCommand 是 stop 与 wg-stats 的公共实现：只发一条请求，不接受位置参数。
 //
 // 退出码语义直接由响应状态码决定，不依赖提示文案：
-// 200 与 428（需要验证码）算成功，其余算失败。
+// 200 算成功，其余算失败。
 func runCommand(name string, args []string, req ipc.Request, timeout time.Duration) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
@@ -123,6 +153,9 @@ func runCommand(name string, args []string, req ipc.Request, timeout time.Durati
 }
 
 // runAt 向指定端点发一条请求，并按响应状态码决定退出码。
+//
+// 428（需要验证码）只由 start / auth 产生，而它们不走这里，所以这里
+// 没有那条分支。
 func runAt(endpoint string, req ipc.Request, timeout time.Duration) error {
 	resp, err := call(endpoint, req, timeout)
 	if err != nil {
@@ -132,9 +165,6 @@ func runAt(endpoint string, req ipc.Request, timeout time.Duration) error {
 
 	switch resp.Code {
 	case ipc.CodeOK:
-		return nil
-	case ipc.CodeAuthRequired:
-		// 需要提交验证码不是错误：脚本据此决定下一步。
 		return nil
 	default:
 		return fmt.Errorf("服务进程返回 %d", resp.Code)

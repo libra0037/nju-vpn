@@ -25,8 +25,14 @@ const (
 
 // Status 是一次状态查询的完整结果。
 type Status struct {
-	State    State  `json:"state"`
-	Detail   string `json:"detail,omitempty"`
+	State  State  `json:"state"`
+	Detail string `json:"detail,omitempty"`
+	// Retrying 表示链路已经断开、正在退避重连。
+	//
+	// 这时状态仍是 up（隧道对象与承载层都还在，重连成功后不需要重建），
+	// 但链路是断的——只看 State 的话，status -check 会把断了的链路报成正常，
+	// 巡检脚本因此永远发现不了。
+	Retrying bool   `json:"retrying,omitempty"`
 	ClientIP string `json:"client_ip,omitempty"` // 校园网分配的地址
 	PeerIP   string `json:"peer_ip,omitempty"`   // 客户端 peer 的地址
 	// Since 是进入当前状态的时间，便于判断"卡了多久"。
@@ -101,6 +107,13 @@ func (s *statusStore) setDetail(detail string) {
 	s.status.Detail = detail
 }
 
+// setRetrying 标记链路是否正在重连。
+func (s *statusStore) setRetrying(retrying bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Retrying = retrying
+}
+
 // setAddresses 记录隧道地址与 peer 地址。
 func (s *statusStore) setAddresses(clientIP, peerIP string) {
 	s.mu.Lock()
@@ -129,6 +142,7 @@ func (s *statusStore) applyLocked(next State, detail string) {
 	if next == StateIdle || next == StateError {
 		s.status.ClientIP = ""
 		s.status.PeerIP = ""
+		s.status.Retrying = false
 	}
 }
 

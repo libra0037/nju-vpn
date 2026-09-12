@@ -41,8 +41,6 @@ func newScript(t *testing.T) *script {
 	return s
 }
 
-// newBareConn 返回一条"握手不完整"的连接：它不实现 ServerHelloSessionID。
-
 // 回归：短信接口失败时，会话标识不能丢。
 //
 // 口令已经通过校验，服务端可能已经给这个会话留了名额；TwfID 交不出去就
@@ -70,6 +68,8 @@ func TestSMSRequestFailureKeepsTwfID(t *testing.T) {
 		t.Fatal("没有向服务端发出登出请求")
 	}
 }
+
+// newBareConn 返回一条"握手不完整"的连接：它不实现 ServerHelloSessionID。
 func newBareConn() net.Conn {
 	client, server := net.Pipe()
 	go func() { _, _ = io.Copy(io.Discard, server) }()
@@ -386,5 +386,74 @@ func TestLogoutRunsWithCanceledContext(t *testing.T) {
 	}
 	if n := s.portal.Count("/por/logout.csp"); n != 1 {
 		t.Errorf("取消的上下文下没有发出登出请求（%d 次）", n)
+	}
+}
+
+// 回归：query-ip 的回执可能分两段到达。
+//
+// 隧道是字节流，"服务端写了 36 字节"不等于"我们一次 Read 就能拿到"。
+// 旧实现只读一次，拿到 4 字节就判成响应过短——那是不可重试的协议错误，
+// 三次退避一次都没走，整次 start 直接失败（真机出现过：日志里
+// "query ip: read 4 bytes" 之后就是 unexpected query ip reply）。
+func TestQueryIPAcceptsReplySplitAcrossReads(t *testing.T) {
+	local, remote := net.Pipe()
+	t.Cleanup(func() { remote.Close() })
+
+	go func() {
+		// 先读掉请求，再分两段写回执。
+		buf := make([]byte, 4096)
+		if _, err := remote.Read(buf); err != nil {
+			return
+		}
+		if _, err := remote.Write([]byte{ControlSendIP, 0, 0, 0}); err != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+		_, _ = remote.Write([]byte{172, 29, 56, 18})
+	}()
+
+	client := New(Options{
+		TunnelTLS: func(context.Context) (net.Conn, error) { return local, nil },
+	})
+	var token [streamTokenLen]byte
+	ip, conn, err := client.queryIP(context.Background(), token, false)
+	if err != nil {
+		t.Fatalf("分段到达的回执应当被接受，实际 %v", err)
+	}
+	defer conn.Close()
+	if got := ip.String(); got != "172.29.56.18" {
+		t.Fatalf("分配的地址 = %s，想要 172.29.56.18", got)
+	}
+}
+
+// 回归：退避等待期间断开（stop / 退出）必须立刻生效。
+//
+// 旧实现里 Run 退出时把会话上的 cancel 清成 nil，退避中的循环因此叫不醒：
+// 会话明明已经断开，循环还在睡，睡醒之后又在已关闭的会话上重建两条流。
+func TestRetryBackoffIsInterruptedByCloseLocal(t *testing.T) {
+	s := newScript(t)
+	// 两条流都被一个可重试的控制码拒绝：Run 立刻失败，进入退避等待。
+	s.tunnel.RejectStream(0x05, ControlIPBusy)
+	sess := connectedSession(t, s)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sess.RunWithRetryNotify(context.Background(), RetryPolicy{
+			Attempts: 5, Base: 10 * time.Second, Max: 30 * time.Second,
+		}, nil)
+	}()
+
+	// 等它真的进入退避：第一次 Run 已经失败并睡下。
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	sess.CloseLocal()
+
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("CloseLocal 之后退避还要睡 %s 才醒", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseLocal 没有唤醒退避中的重连循环")
 	}
 }

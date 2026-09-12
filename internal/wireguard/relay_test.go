@@ -162,13 +162,13 @@ func TestRelayWriteWithoutUplink(t *testing.T) {
 	}
 
 	var counted bool
-	for reason := range r.DropStats() {
+	for reason := range dropStats(r) {
 		if strings.Contains(reason, "上行通道") {
 			counted = true
 		}
 	}
 	if !counted {
-		t.Errorf("丢包原因应记入统计，实际 %v", r.DropStats())
+		t.Errorf("丢包原因应记入统计，实际 %v", dropStats(r))
 	}
 }
 
@@ -184,13 +184,13 @@ func TestRelayWriteWithoutSession(t *testing.T) {
 		t.Errorf("没有会话时不该报错，实际 %v", err)
 	}
 	var counted bool
-	for reason := range r.DropStats() {
+	for reason := range dropStats(r) {
 		if strings.Contains(reason, "隧道尚未建立") {
 			counted = true
 		}
 	}
 	if !counted {
-		t.Errorf("丢包原因应记入统计，实际 %v", r.DropStats())
+		t.Errorf("丢包原因应记入统计，实际 %v", dropStats(r))
 	}
 }
 
@@ -269,7 +269,7 @@ func TestDropReasonsAreDistinguished(t *testing.T) {
 		t.Fatalf("Write 不该报错: %v", err)
 	}
 
-	stats := r.DropStats()
+	stats := dropStats(r)
 	var gotAddr bool
 	for reason := range stats {
 		if strings.Contains(reason, "peer_address") {
@@ -304,7 +304,21 @@ func TestRelayReadDropsOversizedPacket(t *testing.T) {
 	if n != 1 || sizes[0] != 40 {
 		t.Fatalf("应交出后面那个 40 字节的包（20 头部 + 20 载荷），得到 n=%d size=%d", n, sizes[0])
 	}
-	if len(r.DropStats()) == 0 {
+	if len(dropStats(r)) == 0 {
 		t.Error("超长包应计入丢弃统计")
 	}
+}
+
+// dropStats 返回每种原因的累计丢包数。
+//
+// 生产代码不读它（丢包会按原因限速打进日志），这里只让测试能断言
+// "哪一种原因被计到了"——把丢包混成一个数字时，排查就没线索了。
+func dropStats(r *Relay) map[string]uint64 {
+	out := make(map[string]uint64, dropReasonCount)
+	for reason := dropReason(0); reason < dropReasonCount; reason++ {
+		if n := r.drops[reason].n.Load(); n > 0 {
+			out[dropReasonText[reason]] = n
+		}
+	}
+	return out
 }

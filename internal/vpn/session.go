@@ -83,10 +83,23 @@ func (s *Session) untrack(conns ...net.Conn) {
 	s.streams = kept
 }
 
-func (s *Session) setRunCancel(cancel context.CancelFunc) {
+// pushRunCancel 登记"当前运行的取消函数"，返回还原函数。
+//
+// 登记是嵌套的：RunWithRetryNotify 先登记整段重试那个（退避等待也要能被
+// 唤醒），Run 每轮再登记自己那个（要打断阻塞中的读写），退出时把外层那个
+// 放回去。以前 Run 退出时直接把字段清成 nil，于是退避窗口里 CloseLocal
+// 拿不到任何 cancel：会话明明已经断开，循环还在睡，睡醒之后又在已关闭的
+// 会话上重建两条流，一路泄漏到会话结束。
+func (s *Session) pushRunCancel(cancel context.CancelFunc) func() {
 	s.mu.Lock()
+	prev := s.runCancel
 	s.runCancel = cancel
 	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		s.runCancel = prev
+		s.mu.Unlock()
+	}
 }
 
 func (s *Session) takeRunCancel() context.CancelFunc {
@@ -114,9 +127,9 @@ func (s *Session) CheckTunnel(ctx context.Context) error {
 // 而关闭连接会让阻塞中的 Read/Write 立刻返回。
 func (s *Session) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
-	s.setRunCancel(cancel)
+	restore := s.pushRunCancel(cancel)
 	defer func() {
-		s.setRunCancel(nil)
+		restore()
 		cancel()
 	}()
 
@@ -168,22 +181,26 @@ func (s *Session) Run(ctx context.Context) error {
 	}
 }
 
-// RunWithRetry 反复调用 Run，按 RetryPolicy 退避重连。
-//
-// 终止性错误（ControlError 里不可重试的控制码）立刻返回：
-// 继续重试只会被服务端继续拒绝，还会把账号打进限流状态。
-func (s *Session) RunWithRetry(ctx context.Context, policy RetryPolicy) error {
-	return s.RunWithRetryNotify(ctx, policy, nil)
-}
-
-// RunWithRetryNotify 与 RunWithRetry 相同，但在每次重连前回调通知。
+// RunWithRetryNotify 反复调用 Run，按 RetryPolicy 退避重连，并在每次
+// 重连前回调通知。
 //
 // 调用方（服务层）靠它把"正在重连"告诉用户：重连期间隧道是断的，
 // 而状态如果一直显示 up，用户会以为链路正常、只是"网慢"。
+//
+// 终止性错误（ControlError 里不可重试的控制码）立刻返回：
+// 继续重试只会被服务端继续拒绝，还会把账号打进限流状态。
 func (s *Session) RunWithRetryNotify(ctx context.Context, policy RetryPolicy, onRetry func(attempt int, err error)) error {
 	if policy.Attempts < 1 || policy.Base <= 0 || policy.Max <= 0 {
 		policy = DefaultRetryPolicy()
 	}
+	// 整段重试（含退避等待）挂在同一个 ctx 上：CloseLocal 一取消，
+	// 正在睡的退避立刻醒过来。
+	ctx, cancel := context.WithCancel(ctx)
+	restore := s.pushRunCancel(cancel)
+	defer func() {
+		restore()
+		cancel()
+	}()
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		err := s.Run(ctx)

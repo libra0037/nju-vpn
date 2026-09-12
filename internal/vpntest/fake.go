@@ -91,7 +91,6 @@ func (p *Portal) Set(path string, resps ...Response) *Portal {
 	return p
 }
 
-// SetFallback 设置未命中路径时的响应。
 // Requests 返回已记录的请求。
 func (p *Portal) Requests() []Request {
 	p.mu.Lock()

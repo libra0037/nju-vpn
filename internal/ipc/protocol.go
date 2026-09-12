@@ -34,6 +34,17 @@ const (
 	CmdSetPeer = "wg-peer"
 	// CmdWGStats 查询 WireGuard 收发统计，用来判断客户端到底通没通。
 	CmdWGStats = "wg-stats"
+	// CmdState 只回报状态名（idle / up / ...）。
+	//
+	// 与 status 分开：那段是给人看的文本，格式随时会变，而 probe 的安全闸
+	// 与 start 的幂等判断要靠状态做决定。以前按 " | " 切第一段来取状态，
+	// 显示格式一改，判断就静默失效了。
+	CmdState = "state"
+	// CmdSetProxy 覆盖出站代理，由 CLI 在拉起服务进程之后立刻发送。
+	//
+	// 走 IPC 而不是子进程命令行：带口令的代理地址进了 argv 就等于对同机
+	// 其他用户公开（/proc/<pid>/cmdline 是人人可读的）。
+	CmdSetProxy = "set-proxy"
 )
 
 // 响应状态码。

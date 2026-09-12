@@ -23,6 +23,17 @@ func EndpointFor(configPath string) string {
 	return endpointPath(InstanceTag(configPath))
 }
 
+// ResolveEndpoint 按"显式配置优先，否则按配置文件路径派生"算出端点。
+//
+// 服务进程与命令行客户端都要用同一条规则，而两处算错任何一处都会让命令
+// 打到别的实例上（那边的账号会被静默操作）。规则只留这一份。
+func ResolveEndpoint(explicit, configPath string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return EndpointFor(configPath)
+}
+
 // InstanceTag 返回配置文件的短标识，8 个十六进制字符。
 //
 // 实例的本地痕迹都从这一个标识派生（IPC 端点、日志文件名、状态输出），

@@ -73,3 +73,45 @@ func TestAuthTimeoutCancelledWhenCodeSubmitted(t *testing.T) {
 		t.Fatalf("验证码已提交后计时器应当被取消，状态却是 %s（%s）", st, h.svc.Status().Detail)
 	}
 }
+
+// 回归：上一轮的"等验证码超时"不许拆掉这一轮。
+//
+// 计时器可能已经触发、命令正排在队列里，而那一轮早就收场（用户重新
+// start 了，或者验证码已经输对）。旧实现没有轮次概念，这条迟到的命令
+// 会把新一轮的 auth_pending 直接收尾：用户刚收到短信，状态就变成
+// "等待验证码超时，已登出"。
+func TestStaleAuthTimeoutIsIgnored(t *testing.T) {
+	h := newHarness(t)
+	h.portal.Set("/por/login_psw.csp", vpntest.Response{
+		Body: "<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>",
+	})
+	h.portal.Set("/por/login_sms.csp", vpntest.Response{
+		Body: "<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>",
+	})
+
+	if err := h.svc.StartWithPassword("p"); !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	}
+	waitState(t, h.svc, StateAuthPending, time.Second)
+	before := h.portal.Count("/por/logout.csp")
+
+	// 模拟上一轮的迟到命令：轮次比当前小，走 actor 投进去。
+	reply := make(chan error, 1)
+	select {
+	case h.svc.cmds <- &command{kind: cmdAuthTimeout, seq: h.svc.authSeq - 1, reply: reply}:
+	case <-time.After(time.Second):
+		t.Fatal("命令通道阻塞")
+	}
+	select {
+	case <-reply:
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 actor 处理超时")
+	}
+
+	if st := h.svc.Status().State; st != StateAuthPending {
+		t.Fatalf("过期命令不该改动状态，实际 %s（%s）", st, h.svc.Status().Detail)
+	}
+	if got := h.portal.Count("/por/logout.csp"); got != before {
+		t.Fatal("过期命令不该触发登出：那一轮已经收场了")
+	}
+}

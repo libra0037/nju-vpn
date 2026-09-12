@@ -21,6 +21,23 @@ func deadlineFrom(ctx context.Context, d time.Duration) time.Time {
 	return deadline
 }
 
+// watchCancel 让 ctx 取消时立刻关掉连接，返回注销函数。
+//
+// 只设 deadline 不够：deadline 是"最坏情况下的上限"，而用户敲 Ctrl-C 或
+// stop 时希望的是马上返回。挂上之后，阻塞在读写上的调用会立刻带着错误
+// 醒过来，不必干等满 Handshake 那 20 秒。
+//
+// 连接交出去之后就不能再挂了：数据阶段有各自的关闭机制（Run 里的
+// AfterFunc、会话的 closeLocal），这里多挂一份只会在正常路径上
+// 提前把还能用的连接关掉。所以调用方必须在返回前注销。
+func watchCancel(ctx context.Context, conn net.Conn) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	return func() { stop() }
+}
+
 // tagContains 判断标签的取值里是否包含某个子串。
 func tagContains(body []byte, tag, sub string) bool {
 	v, ok := tagValue(body, tag)
