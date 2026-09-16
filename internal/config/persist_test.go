@@ -152,3 +152,47 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(raw)
 }
+
+// TestPersistPrivateKeyRefusesFlowSection 验证承载段写成流式时不写回。
+//
+// 往 "wireguard: {…}" 这样的一行后面插一行缩进两格的字段，会让整份文件解析
+// 不过：进程当下照跑，下一次启动却直接以“解析配置文件失败”退出，用户只能
+// 手工删改。写回方宁可失败（调用方按警告处理），也不能造出这种文件。
+func TestPersistPrivateKeyRefusesFlowSection(t *testing.T) {
+	original := "server: vpn.example.edu\nusername: u\nwireguard: {peer_address: 10.66.66.2, listen_port: 51820}\n"
+	path := writeConfig(t, original, 0o600)
+
+	err := PersistPrivateKey(path, "newkey")
+	if err == nil {
+		t.Fatal("流式写法的承载段应当拒绝写回")
+	}
+	if !strings.Contains(err.Error(), "块写法") {
+		t.Errorf("错误应当说清是写法问题，得到 %v", err)
+	}
+	if got := readFile(t, path); got != original {
+		t.Errorf("拒绝写回时文件必须原样不动，现在是:\n%s", got)
+	}
+	// 拒绝之后文件仍然可用：下一次启动还能解析。
+	if _, err := Load(path); err != nil {
+		t.Errorf("文件应当仍然可解析，得到 %v", err)
+	}
+}
+
+// TestPersistPrivateKeyRefusesToWriteBrokenYAML 验证兜底：改动后解析不过时
+// 直接不落盘，文件保持原样。
+func TestPersistPrivateKeyRefusesToWriteBrokenYAML(t *testing.T) {
+	original := "server: vpn.example.edu\n"
+	path := writeConfig(t, original, 0o600)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 直接喂给写回层一份会解析失败的内容：模拟行编辑算法出错的后果。
+	if err := writePreservingMode(path, fi, []string{"server: vpn.example.edu", "  bad: ["}); err == nil {
+		t.Fatal("解析不过的内容应当被拒绝写回")
+	}
+	if got := readFile(t, path); got != original {
+		t.Errorf("被拒绝时文件必须原样不动，现在是:\n%s", got)
+	}
+}

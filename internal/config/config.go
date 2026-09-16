@@ -441,6 +441,10 @@ func persistWireGuardField(path, field, value string, overwrite bool) error {
 				inSection = false
 			}
 			if strings.HasPrefix(trimmed, "wireguard:") {
+				if !isBlockMapping(trimmed, "wireguard:") {
+					return fmt.Errorf("%s 的 wireguard 段不是块写法（%q）：把那一行展开成\n"+
+						"wireguard:\n  private_key: ...\n再启动，或手工填好要写回的字段", path, trimmed)
+				}
 				sectionAt = i
 				sectionEnd = i
 				inSection = true
@@ -474,6 +478,16 @@ func persistWireGuardField(path, field, value string, overwrite bool) error {
 	return writePreservingMode(path, fi, lines)
 }
 
+// isBlockMapping 判断一行 "key:" 是不是块映射的开头。
+//
+// "wireguard:" 与 "wireguard:   # 说明" 都是；"wireguard: {peer_address: ...}"
+// 这种流式写法不是——往它后面插一行缩进两格的字段，整份文件就解析不过了，
+// 所以那种写法必须拒绝写回（由调用方按警告处理），而不是写坏用户的配置。
+func isBlockMapping(line, prefix string) bool {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	return rest == "" || strings.HasPrefix(rest, "#")
+}
+
 // commentOf 取出行尾注释（连前面的分隔空格），没有注释就返回空串。
 // existingValue 取出某一行里字段的当前值（去掉行尾注释与引号）。
 func existingValue(line string) string {
@@ -500,6 +514,13 @@ func commentOf(line string) string {
 // writePreservingMode 写回文件并保持原有权限。
 func writePreservingMode(path string, fi os.FileInfo, lines []string) error {
 	content := strings.Join(lines, "\n")
+	// 兜底：这一层是手写的行编辑，改完必须仍然是能解析的 YAML。解析不过就
+	// 放弃写回——宁可这一项没写进去（下次启动再生成），也不能把用户的配置
+	// 文件写坏到下一次启动直接以“解析配置文件失败”退出。
+	var probe yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &probe); err != nil {
+		return fmt.Errorf("写回 %s 被拒绝：改动后解析不过（%w）", path, err)
+	}
 	// 临时名带 pid：两个进程同时写回时不会互相截断成半截 YAML。
 	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
 	if err := os.WriteFile(tmp, []byte(content), fi.Mode().Perm()); err != nil {
