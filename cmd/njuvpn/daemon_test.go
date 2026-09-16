@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -138,4 +140,71 @@ func shutdownDaemon(endpoint string) error {
 	}
 	_, err = ipc.ReadResponse(bufio.NewReader(conn))
 	return err
+}
+
+// pongServer 在端点上应答探活，模拟另一个已经就绪的服务进程。
+func pongServer(t *testing.T, endpoint string) {
+	t.Helper()
+	ln, err := ipc.Listen(endpoint)
+	if err != nil {
+		t.Fatalf("监听测试端点失败: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if _, err := ipc.ReadRequest(bufio.NewReader(c)); err != nil {
+					return
+				}
+				_ = ipc.WriteResponse(c, ipc.Response{Code: ipc.CodeOK, Message: "pong 另一个调用拉起的服务进程"})
+			}(conn)
+		}
+	}()
+}
+
+// TestWaitServiceReadyAdoptsConcurrentDaemon 验证“我们拉起的子进程退了、但端点
+// 上已有另一个服务进程在应答”时按成功处理：并发调用里只有一个能占住端点，
+// 输的那个立刻退出，不该让看门狗脚本收到一个 exit 1 的假警报。
+func TestWaitServiceReadyAdoptsConcurrentDaemon(t *testing.T) {
+	dir := t.TempDir()
+	endpoint := filepath.Join(dir, "njuvpn-test.sock")
+	logPath := filepath.Join(dir, "service.log")
+	if err := os.WriteFile(logPath, []byte("[日志] 启动失败: 端点已被占用\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 赢家此刻正在就绪：端点晚一小会儿才开始应答。
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		pongServer(t, endpoint)
+	}()
+
+	exited := make(chan error, 1)
+	exited <- errors.New("exit status 1")
+	if err := waitServiceReady(endpoint, logPath, exited, 10*time.Second); err != nil {
+		t.Fatalf("另一个服务进程已就绪时应当按成功处理，得到 %v", err)
+	}
+}
+
+// TestWaitServiceReadyReportsStartupFailure 验证真的起不来时仍然立刻报错，
+// 不会因为上面那条“等一下赢家”的逻辑而把失败吞掉。
+func TestWaitServiceReadyReportsStartupFailure(t *testing.T) {
+	dir := t.TempDir()
+	endpoint := filepath.Join(dir, "njuvpn-test.sock")
+	logPath := filepath.Join(dir, "service.log")
+
+	exited := make(chan error, 1)
+	exited <- errors.New("exit status 1")
+	err := waitServiceReady(endpoint, logPath, exited, 10*time.Second)
+	if err == nil {
+		t.Fatal("没有任何服务进程应答时应当报错")
+	}
+	if !strings.Contains(err.Error(), "启动后立即退出") {
+		t.Fatalf("错误应当指向启动失败，得到 %v", err)
+	}
 }

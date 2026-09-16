@@ -116,13 +116,24 @@ func ensureService(configPath string) error {
 func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		select {
-		case err := <-exited:
-			if err == nil {
-				err = errors.New("退出码 0")
+		if exited != nil {
+			select {
+			case err := <-exited:
+				exited = nil
+				// 我们拉起的子进程退了，但端点可能已经有另一个服务进程在应答：
+				// 并发调用（看门狗与人工同时执行）里只有一个能占住端点，输的
+				// 那个立刻退出，赢的那个此刻正在就绪。直接报“启动后立即退出”
+				// 会给巡检脚本一个假警报，所以先给赢家一点时间。
+				if pumpErr := pingUntil(endpoint, daemonAdoptGrace); pumpErr == nil {
+					log.Printf("服务进程已由另一个调用拉起（本次拉起的子进程退出: %v）", err)
+					return nil
+				}
+				if err == nil {
+					err = errors.New("退出码 0")
+				}
+				return fmt.Errorf("服务进程启动后立即退出（%v）%s", err, logTail(logPath))
+			default:
 			}
-			return fmt.Errorf("服务进程启动后立即退出（%v）%s", err, logTail(logPath))
-		default:
 		}
 		if err := pingService(endpoint); err == nil {
 			return nil
@@ -130,6 +141,27 @@ func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout tim
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("服务进程在 %s 内没有就绪%s", timeout, logTail(logPath))
+}
+
+// daemonAdoptGrace 是“我们拉起的子进程退出后，再等端点一小会儿”的上限。
+//
+// 只要够盖住赢家从绑定端点到能应答的那一小段，不需要更多：真正起不来的
+// 情况（配置写错、端口被占）等再久也不会应答。
+const daemonAdoptGrace = 2 * time.Second
+
+// pingUntil 在 give 时间内轮询端点，应答了就返回 nil。
+func pingUntil(endpoint string, give time.Duration) error {
+	deadline := time.Now().Add(give)
+	var last error
+	for {
+		if last = pingService(endpoint); last == nil {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return last
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // spawnService 以脱离终端的方式启动服务进程。
