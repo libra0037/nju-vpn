@@ -203,17 +203,35 @@ func (c *control) do(ctx context.Context, method, path string, params url.Values
 }
 
 // envelopeData 把响应解成信封并检查 code。
+// envelopeData 解析控制面响应，会话类错误码按"会话已失效"处理。
 func envelopeData(raw []byte) (json.RawMessage, error) {
+	return decodeEnvelope(raw, true)
+}
+
+// envelopeDataAuth 解析"这次登录到底成不成"这一步的响应。
+//
+// 实测：口令错误时服务端回的正是 75500000（HTTP 200 + 该错误码，文案是
+// "The username or password is incorrect. You still have N attempts left"）。
+// 那个码在别的接口上表示会话过期，在这里却是凭据不对——按会话失效处理会
+// 让用户看到"会话已失效"并拿到 500，完全指不到问题所在，所以这一步单独
+// 按"被拒绝"归类。
+func envelopeDataAuth(raw []byte) (json.RawMessage, error) {
+	return decodeEnvelope(raw, false)
+}
+
+// decodeEnvelope 是上面两个函数的公共实现。sessionCodes 为真时，会话类
+// 错误码翻成 ErrSessionGone；为假时一律当作"被拒绝"。
+func decodeEnvelope(raw []byte, sessionCodes bool) (json.RawMessage, error) {
 	var e envelope
 	if err := json.Unmarshal(raw, &e); err != nil {
 		return nil, &ProtocolError{What: "控制面响应不是 JSON", Got: truncateForError(raw)}
 	}
-	switch e.Code {
-	case codeOK:
+	switch {
+	case e.Code == codeOK:
 		return e.Data, nil
-	case codeAlreadyOnline:
+	case e.Code == codeAlreadyOnline:
 		return nil, &ErrAlreadyOnline{Message: e.Message}
-	case codeSessionGone, codeSessionGone2, codeSessionExpire:
+	case sessionCodes && (e.Code == codeSessionGone || e.Code == codeSessionGone2 || e.Code == codeSessionExpire):
 		return nil, &ErrSessionGone{Code: e.Code, Message: e.Message}
 	default:
 		return nil, &ErrCodeRejected{Code: e.Code, Message: e.Message}
@@ -341,7 +359,7 @@ func (c *control) passwordLogin(ctx context.Context, username, password, domain,
 	if err != nil {
 		return out, err
 	}
-	data, err := envelopeData(raw)
+	data, err := envelopeDataAuth(raw)
 	if err != nil {
 		return out, err
 	}

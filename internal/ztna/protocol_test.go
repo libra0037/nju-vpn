@@ -272,6 +272,10 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 		{"端口不在范围内", "10.1.2.3", "tcp", 80, false},
 		{"协议不匹配", "10.1.2.3", "udp", 443, false},
 		{"命中 all 区间", "172.16.0.5", "udp", 53, true},
+		// ICMP 没有端口，协议层传上来的是 0：规则里的端口段是 1-65535，
+		// 拿 0 去比会把整个网段的 ICMP 判成表外（实测踩过：ping 校园网全丢）。
+		{"ICMP 命中 all 区间", "172.16.0.5", "icmp", 0, true},
+		{"ICMP 不该命中只有 TCP 的规则", "10.1.2.3", "icmp", 0, false},
 		{"区间之外", "172.16.0.10", "udp", 53, false},
 		{"表外地址", "8.8.8.8", "tcp", 53, false},
 	}

@@ -352,7 +352,8 @@ func (s *Server) routes() *http.ServeMux {
 		}
 		// 客户端送来的明文是"口令_反重放随机数"。
 		if plain != s.opts.Password+"_"+"rand-1" {
-			writeEnvelope(w, 400, "口令错误", nil)
+			// 与真实服务端一致：口令错误回的是 75500000（HTTP 200 + 该错误码）。
+			writeEnvelope(w, 75500000, "The username or password is incorrect. You still have 9 attempts left", nil)
 			return
 		}
 		if want := s.opts.Username + "@test"; body.Username != want {

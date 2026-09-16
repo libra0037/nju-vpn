@@ -243,6 +243,9 @@ const (
 	dropNoSession
 	// dropNoUplink：有会话但上行通道还没接上（Run 正在建流，或刚被摘掉）。
 	dropNoUplink
+	// dropUplinkRejected：上行通道接上了，但隧道拒绝了这个包
+	//（最常见的是目标不在资源表内、或该流鉴权失败）。
+	dropUplinkRejected
 
 	dropReasonCount
 )
@@ -257,6 +260,7 @@ var dropReasonText = [dropReasonCount]string{
 	dropNoBuffer:        "读缓冲装不下这个包",
 	dropNoSession:       "隧道尚未建立，客户端发来的包被丢弃",
 	dropNoUplink:        "隧道上行通道未就绪，包被丢弃",
+	dropUplinkRejected:  "隧道拒绝了这个上行包",
 }
 
 // dropQuietInterval 是几种"预期之内、会一直重复"的丢包原因的日志间隔。
@@ -280,16 +284,29 @@ type dropCounter struct {
 //
 // 每种原因第一次出现必定打一条（否则用户第一次踩配置错误时什么都没看到），
 // 之后按间隔限速。
-func (r *Relay) countDrop(reason dropReason) {
+// countDrop 记录一次丢包。
+func (r *Relay) countDrop(reason dropReason) { r.countDropDetail(reason, nil) }
+
+// countDropDetail 与 countDrop 同样限速，但把具体原因一起打出来。
+//
+// 上行被拒的理由只有调用点知道（目标不在资源表内、该流鉴权失败……），
+// 混进一句固定文案就等于把排查推回"猜"：实测时日志只说"上行通道未就绪"，
+// 而真实原因是资源表的端口范围把 ICMP 挡在了门外。
+func (r *Relay) countDropDetail(reason dropReason, detail error) {
 	c := &r.drops[reason]
 	n := c.n.Add(1)
 	interval := dropLogInterval
 	if quiet := dropQuietInterval[reason]; quiet > 0 {
 		interval = quiet
 	}
+	text := dropReasonText[reason]
+	if detail != nil {
+		text += ": " + detail.Error()
+	}
+	report := func() { log.Printf("wireguard: 丢弃 %s（累计 %d 个）", text, n) }
 	if c.firstLog.CompareAndSwap(false, true) {
 		c.lastLog.Store(time.Now().UnixNano())
-		log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
+		report()
 		return
 	}
 	now := time.Now().UnixNano()
@@ -297,7 +314,7 @@ func (r *Relay) countDrop(reason dropReason) {
 	if now-last < int64(interval) || !c.lastLog.CompareAndSwap(last, now) {
 		return
 	}
-	log.Printf("wireguard: 丢弃 %s（累计 %d 个）", dropReasonText[reason], n)
+	report()
 }
 
 // File 返回 nil：这里没有操作系统层面的网卡文件描述符。
@@ -382,9 +399,14 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 			pkt = rewritten
 		}
 		if err := sess.ep.Send(pkt); err != nil {
-			// 上行还没注册（Run 正在建流）或刚被摘掉：同样静默丢弃，
-			// 理由同上——回错误只会换来一行按包的 Error 日志。
-			r.countDrop(dropNoUplink)
+			// 上行还没注册（Run 正在建流）与"隧道明确拒绝了这个包"是两回事：
+			// 前者是时序，后者要用户去查资源表或鉴权。两者都静默丢弃，理由
+			// 同上——回错误只会换来一行按包的 Error 日志。
+			if errors.Is(err, l3.ErrNoUplink) {
+				r.countDrop(dropNoUplink)
+			} else {
+				r.countDropDetail(dropUplinkRejected, err)
+			}
 			continue
 		}
 		n++

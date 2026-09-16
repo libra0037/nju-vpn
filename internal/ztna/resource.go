@@ -206,7 +206,10 @@ func (t *resourceTable) match(dst net.IP, proto string, port uint16) (appID, gro
 		if e.proto != "all" && e.proto != proto {
 			continue
 		}
-		if port < e.portMin || port > e.portMax {
+		// ICMP 这类没有端口的协议传进来的是 0。规则里的端口段写的是 1-65535，
+		// 拿 0 去比就会把整个网段的 ICMP 都判成表外——实测（2026-09-16）
+		// 表现是"ping 校园网主机全丢"，而日志只说"目标不在资源表内"。
+		if port != 0 && (port < e.portMin || port > e.portMax) {
 			continue
 		}
 		return e.appID, e.groupID, true

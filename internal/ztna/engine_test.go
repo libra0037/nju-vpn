@@ -175,8 +175,16 @@ func TestConnectUsesPasswordFromOptions(t *testing.T) {
 
 	if _, err := client.Connect(ctx, ConnectOptions{Password: "wrong"}); err == nil {
 		t.Fatal("错误口令应被拒绝")
-	} else if _, ok := AsRejected(err); !ok {
-		t.Errorf("错误口令应报成被拒绝，得到 %v", err)
+	} else {
+		// 实测：口令错误回的是 75500000。它不能被当成"会话已失效"——
+		// 那样用户看到的是 500 会话失效，而不是"口令不对"。
+		if _, ok := AsRejected(err); !ok {
+			t.Errorf("错误口令应报成被拒绝，得到 %v", err)
+		}
+		var gone *ErrSessionGone
+		if errors.As(err, &gone) {
+			t.Errorf("口令错误不该被当成会话失效: %v", err)
+		}
 	}
 }
 
