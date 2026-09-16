@@ -267,6 +267,10 @@ func (s *Server) errorResponse(err error) ipc.Response {
 		return ipc.Response{Code: ipc.CodeAuthRequired, Message: s.svc.Status().Detail}
 	case errors.Is(err, ErrEmptyCode):
 		return badRequest(err)
+	case errors.Is(err, ErrMissingCredential):
+		// 配置里没写账号、或没带上口令：用户得先去填配置/输入口令，
+		// 不是服务进程出了故障。
+		return badRequest(err)
 	case errors.Is(err, ErrBadState), errors.Is(err, ErrNotRunning),
 		errors.Is(err, ErrStopRequested), errors.Is(err, ErrShuttingDown):
 		return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}

@@ -30,6 +30,10 @@ type resourceTable struct {
 	nodes   []nodeAddress
 	major   string
 	dns     []string
+
+	// portFallbacks 是端口段看不懂、按整段（1-65535）处理的规则条数。
+	// 计数而不是忽略：放宽带会让客户端多发鉴权请求，用户至少该有一条线索。
+	portFallbacks int
 }
 
 func ip4ToUint32(ip net.IP) (uint32, bool) {
@@ -108,7 +112,12 @@ func parseResourceTable(raw []byte, serverHost string) (*resourceTable, error) {
 				if !ok {
 					continue // 域名资源走的是另一条路，这里不参与 L3 匹配
 				}
-				pmin, pmax := parsePortRange(addr.Port)
+				pmin, pmax, okRange := parsePortRange(addr.Port)
+				if !okRange {
+					// 端口段看不懂：按整段处理并计数，由调用方提示一次。
+					// 跳过这条规则会让服务端放行的资源在客户端就被挡掉。
+					t.portFallbacks++
+				}
 				t.entries = append(t.entries, resourceEntry{
 					ipMin: lo, ipMax: hi, portMin: pmin, portMax: pmax,
 					proto: proto, appID: app.ID, groupID: app.NodeGroupID,
@@ -172,24 +181,29 @@ func parseIPRange(host string) (uint32, uint32, bool) {
 	return 0, 0, false
 }
 
-func parsePortRange(spec string) (uint16, uint16) {
+// parsePortRange 解析规则里的端口段。第二个返回值表示"看懂了"。
+//
+// 看不懂时调用方按 1-65535 处理并计数：这只会多发几次鉴权请求（越权判定本来
+// 就在服务端），而按"跳过这条规则"处理会让客户端把服务端放行的资源也挡掉，
+// 那才是真的断网。
+func parsePortRange(spec string) (uint16, uint16, bool) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" || spec == "0" {
-		return 1, 65535
+		return 1, 65535, true
 	}
 	if i := strings.Index(spec, "-"); i > 0 {
 		lo, err1 := strconv.Atoi(spec[:i])
 		hi, err2 := strconv.Atoi(spec[i+1:])
-		if err1 == nil && err2 == nil && lo > 0 && hi >= lo {
-			return uint16(min(lo, 65535)), uint16(min(hi, 65535))
+		if err1 == nil && err2 == nil && lo > 0 && hi >= lo && lo <= 65535 {
+			return uint16(min(lo, 65535)), uint16(min(hi, 65535)), true
 		}
-		return 1, 65535
+		return 1, 65535, false
 	}
 	v, err := strconv.Atoi(spec)
-	if err != nil || v <= 0 {
-		return 1, 65535
+	if err != nil || v <= 0 || v > 65535 {
+		return 1, 65535, false
 	}
-	return uint16(min(v, 65535)), uint16(min(v, 65535))
+	return uint16(v), uint16(v), true
 }
 
 // match 找出目标命中的资源。只在新建一条流的时候调用一次，
@@ -206,10 +220,11 @@ func (t *resourceTable) match(dst net.IP, proto string, port uint16) (appID, gro
 		if e.proto != "all" && e.proto != proto {
 			continue
 		}
-		// ICMP 这类没有端口的协议传进来的是 0。规则里的端口段写的是 1-65535，
-		// 拿 0 去比就会把整个网段的 ICMP 都判成表外——实测（2026-09-16）
-		// 表现是"ping 校园网主机全丢"，而日志只说"目标不在资源表内"。
-		if port != 0 && (port < e.portMin || port > e.portMax) {
+		// ICMP 没有端口，五元组里传进来的是 0：拿它去比规则里的 1-65535 会把
+		// 整个网段的 ICMP 判成表外（实测 2026-09-16：ping 校园网全丢，日志只
+		// 说"目标不在资源表内"）。按协议区分，而不是按"端口是不是 0"区分——
+		// TCP/UDP 里目的端口 0 是畸形包，不该因此绕过端口判断。
+		if proto != "icmp" && (port < e.portMin || port > e.portMax) {
 			continue
 		}
 		return e.appID, e.groupID, true

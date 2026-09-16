@@ -230,14 +230,27 @@ func TestParseIPRangeAndPortRange(t *testing.T) {
 		t.Error("域名不该被当成可匹配的资源")
 	}
 
-	if a, b := parsePortRange(""); a != 1 || b != 65535 {
-		t.Errorf("空端口 = %d-%d，期望全放行", a, b)
+	if a, b, ok := parsePortRange(""); a != 1 || b != 65535 || !ok {
+		t.Errorf("空端口 = %d-%d（%v），期望全放行", a, b, ok)
 	}
-	if a, b := parsePortRange("443"); a != 443 || b != 443 {
-		t.Errorf("单端口 = %d-%d", a, b)
+	if a, b, ok := parsePortRange("0"); a != 1 || b != 65535 || !ok {
+		t.Errorf("端口 0 = %d-%d（%v），期望全放行", a, b, ok)
 	}
-	if a, b := parsePortRange("8000-8100"); a != 8000 || b != 8100 {
-		t.Errorf("端口段 = %d-%d", a, b)
+	if a, b, ok := parsePortRange("443"); a != 443 || b != 443 || !ok {
+		t.Errorf("单端口 = %d-%d（%v）", a, b, ok)
+	}
+	if a, b, ok := parsePortRange("8000-8100"); a != 8000 || b != 8100 || !ok {
+		t.Errorf("端口段 = %d-%d（%v）", a, b, ok)
+	}
+	// 看不懂的写法要明确报出来（调用方按整段处理并计数），而不是悄悄放行。
+	for _, spec := range []string{"abc", "443-80", "-1", "70000", "80,"} {
+		a, b, ok := parsePortRange(spec)
+		if ok {
+			t.Errorf("%q 不该被解析成 %d-%d", spec, a, b)
+		}
+		if a != 1 || b != 65535 {
+			t.Errorf("%q 的兜底 = %d-%d，期望 1-65535", spec, a, b)
+		}
 	}
 }
 
@@ -276,6 +289,8 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 		// 拿 0 去比会把整个网段的 ICMP 判成表外（实测踩过：ping 校园网全丢）。
 		{"ICMP 命中 all 区间", "172.16.0.5", "icmp", 0, true},
 		{"ICMP 不该命中只有 TCP 的规则", "10.1.2.3", "icmp", 0, false},
+		// TCP/UDP 里目的端口 0 是畸形包：按协议区分之后它不再绕过端口判断。
+		{"TCP 目的端口 0 不命中 443 规则", "10.1.2.3", "tcp", 0, false},
 		{"区间之外", "172.16.0.10", "udp", 53, false},
 		{"表外地址", "8.8.8.8", "tcp", 53, false},
 	}
@@ -296,6 +311,30 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 	}
 	if got := table.candidateNodes(""); len(got) != 2 || got[0] != "node-a:441" {
 		t.Errorf("没有优先组时应退到主节点组: %v", got)
+	}
+}
+
+// TestResourceTableCountsUnparsedPortSpecs 验证看不懂的端口段会被计数（会话据此
+// 提示一次），而不是悄悄按整段放行。
+//
+// 兜底仍然是整段：这条过滤只决定"要不要为这个目标发鉴权请求"，越权判定在
+// 服务端。按"跳过这条规则"处理会把服务端放行的资源在客户端就挡掉，那才是
+// 真的断网。
+func TestResourceTableCountsUnparsedPortSpecs(t *testing.T) {
+	raw := []byte(`{"data":{"appList":{"data":{"appInfo":[{"apps":[
+		{"id":"app-a","accessModel":"L3VPN","addressList":[
+			{"protocol":"tcp","port":"80,443","host":"10.3.0.0/16"}]}
+		]}],"config":{"nodeGroupConf":{"majorNodeGroup":{"id":"g"},"nodeGroupList":[
+		{"id":"g","addressInfo":[{"address":"node-a:441","type":"wan"}]}]}}}}}}`)
+	table, err := parseResourceTable(raw, "vpn.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if table.portFallbacks != 1 {
+		t.Errorf("看不懂的端口段计数 = %d，期望 1", table.portFallbacks)
+	}
+	if _, _, ok := table.match(net.ParseIP("10.3.4.5"), "tcp", 12345); !ok {
+		t.Error("兜底应当是整段放行（越权判定在服务端）")
 	}
 }
 

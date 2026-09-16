@@ -200,6 +200,42 @@ func TestConnectUsesPasswordFromOptions(t *testing.T) {
 	}
 }
 
+// TestDeviceSessionWithoutLoginDoesNotPanic 验证登录在早期就失败时，交出去的
+// 空会话不会让后续方法空指针 panic。
+//
+// OpenDevices 故意在失败时也返回一个对象：登录走到一半失败时那个会话占着
+// 服务端名额，调用方要拿它去登出。空会话因此是合法状态，方法必须自己挡住。
+func TestDeviceSessionWithoutLoginDoesNotPanic(t *testing.T) {
+	// 设备标识是登录的必要参数，留空就会在早期失败——不碰任何网络。
+	client := New(Options{Server: "vpn.test", Username: testUser, Password: testPass})
+	ctx := context.Background()
+	d, err := client.OpenDevices(ctx, "")
+	if err == nil {
+		t.Fatal("缺少设备标识时应当报错")
+	}
+	if d == nil {
+		t.Fatal("失败时也该返回可安全使用的对象（调用方要能关掉它）")
+	}
+	if _, err := d.Status(ctx); err == nil {
+		t.Error("没有会话时查询状态应当报错")
+	}
+	if _, err := d.Trust(ctx); err == nil {
+		t.Error("没有会话时绑定应当报错")
+	}
+	if _, err := d.Untrust(ctx, true); err == nil {
+		t.Error("没有会话时解绑应当报错")
+	}
+	if err := d.Auth(ctx, "123456"); err == nil {
+		t.Error("没有会话时提交验证码应当报错")
+	}
+	if err := d.Close(ctx); err != nil {
+		t.Errorf("关掉空会话应当无害: %v", err)
+	}
+	if d.NeedsAuth() {
+		t.Error("空会话不该等着验证码")
+	}
+}
+
 func TestOpenDevicesTrustAndUntrust(t *testing.T) {
 	srv := newFake(t, ztnatest.Options{})
 	client := newTestClient(t, srv, testPass)

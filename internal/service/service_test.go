@@ -102,6 +102,33 @@ func waitState(t *testing.T, svc *Service, want State) {
 	t.Fatalf("状态停在 %s（%s），期望 %s", svc.Status().State, svc.Status().Detail, want)
 }
 
+// TestMissingCredentialIsBadRequest 验证"缺凭据"按 400 报，而不是 500。
+//
+// 按状态码分流的脚本把 4xx 当输入问题、5xx 当服务故障：用户忘了填 username、
+// 或既没写口令也没在请求里带口令时回 500，会把人引去查进程日志与服务端状态。
+func TestMissingCredentialIsBadRequest(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	cases := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{"配置里没有 username", func(c *config.Config) { c.Username = "" }},
+		{"配置里没有口令", func(c *config.Config) { c.Password = "" }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := newTestConfig(t, srv)
+			c.mutate(cfg)
+			svc := newTestService(t, srv, cfg)
+			s := &Server{svc: svc, closing: make(chan struct{}), quit: make(chan struct{})}
+			resp := s.dispatch(ipc.Request{Command: ipc.CmdStart})
+			if resp.Code != ipc.CodeBadRequest {
+				t.Errorf("状态码 = %d（%s），期望 400", resp.Code, resp.Message)
+			}
+		})
+	}
+}
+
 func TestStartWithSecondFactorThenTrustAndStop(t *testing.T) {
 	srv := newFakeServer(t, ztnatest.Options{RequireSMS: true, VerifyCode: testCode})
 	svc := newTestService(t, srv, newTestConfig(t, srv))
@@ -476,5 +503,45 @@ func TestAttachKeepsExistingPeer(t *testing.T) {
 	}
 	if got := svc.br.dev.PeerInstalls(); got != 2 {
 		t.Fatalf("换了公钥应当重装 peer，累计 %d 次", got)
+	}
+}
+
+// TestLateTunnelReportIgnoredAfterTeardown 验证隧道那一代结束之后，它再投进来
+// 的汇报不再被受理。
+//
+// 场景：重连连续失败、状态收敛成 error，而那条协程最后一次投出的"正在重连"
+// 汇报才轮到自己被处理——用户于是看到一个 error 状态配一句"正在重连（第 N
+// 次）"，可根本没有东西在重连，按状态分流的巡检脚本也会被误导。
+func TestLateTunnelReportIgnoredAfterTeardown(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
+
+	if err := svc.Start(false, testPass); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	waitState(t, svc, StateUp)
+	gen := svc.gen
+
+	// 让这一代彻底结束：服务端没了，重连必然失败。
+	srv.Close()
+	srv.CloseTunnel()
+	waitState(t, svc, StateError)
+	if svc.Status().Retrying {
+		t.Fatalf("收敛成 error 之后不该标着正在重连: %+v", svc.Status())
+	}
+
+	// 同一代的迟到汇报：必须被丢掉。
+	reply := make(chan error, 1)
+	svc.cmds <- &command{kind: cmdTunnelRetry, gen: gen, attempt: 9, err: errors.New("迟到的汇报"), reply: reply}
+	select {
+	case <-reply:
+	case <-time.After(5 * time.Second):
+		t.Fatal("注入的汇报没有被处理")
+	}
+	if svc.Status().Retrying {
+		t.Errorf("过期代次的汇报仍被受理: %+v", svc.Status())
+	}
+	if strings.Contains(svc.Status().Detail, "正在重连") {
+		t.Errorf("过期代次的汇报改掉了状态说明: %q", svc.Status().Detail)
 	}
 }

@@ -33,6 +33,10 @@ var (
 	ErrStopRequested = errors.New("已收到断开请求，这条命令没有执行")
 	// ErrEmptyCode 表示请求里没有验证码。属于用法问题，IPC 层回 400。
 	ErrEmptyCode = errors.New("验证码为空")
+	// ErrMissingCredential 表示这次操作没有可用的凭据（配置里没写 username，
+	// 或者口令既没写在配置里、也没在这次请求里带上）。属于用法问题：按状态码
+	// 分流的脚本不该把一个输入问题当成服务进程故障。
+	ErrMissingCredential = errors.New("缺少可用凭据")
 )
 
 // closeGrace 是 Close 等待 actor 收尾的上限。正常收尾就是一次登出请求，
@@ -874,6 +878,10 @@ func (s *Service) fail(err error) error {
 // 登出失败会写进状态说明：会话对象没了，但服务端那边可能还占着名额，
 // 用户需要知道"下次 start 可能被拒"而不是看到一个干净的 idle。
 func (s *Service) teardown(detail string) {
+	// 代次立刻推进：这一代已经不存在了。它之后投进来的汇报（断开、正在重连、
+	// 链路恢复）都不该再被受理——否则用户会在 error 状态下看到一句"正在重连
+	// （第 N 次）"，而根本没有东西在重连，巡检脚本也会被这句误导。
+	s.gen++
 	// 先停表再登出：登出可能要几十秒，而计时器到点会按"等验证码超时"
 	// 收尾——那会把紧接着的一轮操作（用户重新 start）一起拆掉。
 	s.stopAuthTimer()
@@ -918,11 +926,11 @@ func (s *Service) applyPassword(password string) (string, error) {
 	// 口令可能从终端带进来换行，去掉首尾空白再用于登录。
 	s.cred.password = strings.TrimSpace(s.cred.password)
 	if s.cred.username == "" {
-		return "", errors.New("配置文件里缺少 username")
+		return "", fmt.Errorf("%w：配置文件里缺少 username", ErrMissingCredential)
 	}
 	if s.cred.password == "" {
-		return "", errors.New("没有可用的口令：配置文件里的 password 为空，且这次请求没有带上；" +
-			"请在 njuvpn start 的提示下输入")
+		return "", fmt.Errorf("%w：没有可用的口令——配置文件里的 password 为空，且这次请求"+
+			"没有带上；请在 njuvpn start 的提示下输入", ErrMissingCredential)
 	}
 	return s.cred.password, nil
 }

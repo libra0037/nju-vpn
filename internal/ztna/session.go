@@ -2,6 +2,7 @@ package ztna
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"log"
@@ -243,6 +244,10 @@ func (s *Session) prepare(ctx context.Context) error {
 	}
 	s.table = table
 	s.client.logf("资源表: %d 条规则，%d 个隧道节点", len(table.entries), len(table.nodes))
+	if table.portFallbacks > 0 {
+		s.client.logf("资源表里有 %d 条规则的端口段看不懂，已按 1-65535 处理（可能会多发几次鉴权请求）",
+			table.portFallbacks)
+	}
 
 	node, err := probeNodes(ctx, s.client.opts.Dial, table.candidateNodes(table.major), 6*time.Second)
 	if err != nil {
@@ -493,11 +498,18 @@ func pickPasswordMethod(methods []authMethod, domain string) (authMethod, error)
 }
 
 // randomSignKey 生成逐流鉴权用的签名密钥。
-// 实测服务端不校验签名（密钥从不外发），这里仍然按协议填一个随机值。
+//
+// 实测服务端不校验签名（密钥从不外发），但没理由因此用一个常量：它一旦被
+// 校验起来，所有部署会共用同一把密钥。
 func randomSignKey() []byte {
 	b := make([]byte, 32)
-	for i := range b {
-		b[i] = byte(i*7 + 13)
+	if _, err := rand.Read(b); err != nil {
+		// 取不到随机数不该让登录失败：当前部署里它不影响任何行为。
+		// 退回确定性填充，并留一条线索，免得将来服务端真的校验时查不出原因。
+		log.Printf("生成逐流签名密钥失败，退回固定填充（当前部署不受影响）: %v", err)
+		for i := range b {
+			b[i] = byte(i*7 + 13)
+		}
 	}
 	return b
 }

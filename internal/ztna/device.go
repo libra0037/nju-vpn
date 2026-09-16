@@ -36,7 +36,22 @@ func (c *Client) OpenDevices(ctx context.Context, password string) (*DeviceSessi
 
 // Status 查询授信终端列表与本机状态。
 func (d *DeviceSession) Status(ctx context.Context) (DeviceStatus, error) {
+	if err := d.requireSession(); err != nil {
+		return DeviceStatus{}, err
+	}
 	return d.sess.ctrl.queryDevice(ctx, "trust")
+}
+
+// requireSession 挡住"登录在早期就失败、会话是空的"这种情况。
+//
+// OpenDevices 即使失败也要返回一个能安全继续用的对象：登录走到一半失败时
+// 那个会话占着服务端名额，调用方得拿它去登出。于是空会话也可能被交出去，
+// 剩下的方法不能直接解引用。
+func (d *DeviceSession) requireSession() error {
+	if d == nil || d.sess == nil {
+		return &ProtocolError{What: "授信终端操作没有可用会话（登录未能开始）"}
+	}
+	return nil
 }
 
 // Trust 把本机绑成授信终端，返回绑定后的状态。
@@ -88,6 +103,9 @@ func (d *DeviceSession) Untrust(ctx context.Context, all bool) (DeviceStatus, er
 
 // Auth 在登录需要验证码时继续。
 func (d *DeviceSession) Auth(ctx context.Context, code string) error {
+	if err := d.requireSession(); err != nil {
+		return err
+	}
 	return d.sess.Auth(ctx, code)
 }
 
