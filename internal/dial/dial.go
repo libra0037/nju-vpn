@@ -10,12 +10,14 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"time"
 )
@@ -41,21 +43,22 @@ func New(proxy string) (DialFunc, error) {
 
 	u, err := url.Parse(proxy)
 	if err != nil {
-		// 错误串会一路走到日志与 status 里，代理地址可能带着口令：
-		// 解析失败时给不出 Redacted，就干脆不回显原文。
-		return nil, fmt.Errorf("解析代理地址失败（写法示例：http://127.0.0.1:7897）: %w", err)
+		// 错误串会一路走到日志与 status 里，而代理地址可能带着口令。
+		// 原始错误（*url.Error）里带着整串 URL，%w 出去就等于泄露；
+		// 这里只取底层原因，并再抹一道形如 user:pass@ 的片段。
+		return nil, fmt.Errorf("解析代理地址失败（写法示例：http://127.0.0.1:7897）: %s", proxyParseReason(err))
 	}
 
 	switch u.Scheme {
 	case "http", "https":
 		if u.Hostname() == "" {
-			return nil, fmt.Errorf("代理地址 %q 缺少主机名", u.Redacted())
+			return nil, errors.New("代理地址缺少主机名（写法示例：http://127.0.0.1:7897）")
 		}
 		warnCleartextCredentials(u)
 		return httpProxyDialer(u)
 	case "socks5", "socks5h":
 		if u.Hostname() == "" {
-			return nil, fmt.Errorf("代理地址 %q 缺少主机名", u.Redacted())
+			return nil, errors.New("代理地址缺少主机名（写法示例：socks5://127.0.0.1:1080）")
 		}
 		warnCleartextCredentials(u)
 		return socks5ProxyDialer(u)
@@ -81,7 +84,25 @@ func warnCleartextCredentials(u *url.URL) {
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		return
 	}
-	log.Printf("警告: 代理 %s 的凭据是明文发送的，只应对本机代理使用", u.Redacted())
+	// 连用户名一起不打印：u.Redacted() 只抹口令，用户名同样不该落到日志里。
+	log.Printf("警告: 代理 %s 的凭据是明文发送的，只应对本机代理使用", u.Host)
+}
+
+// credentialLike 匹配 URL 里 user:pass@ 形式的凭据片段。
+var credentialLike = regexp.MustCompile(`[^/\s@:]+:[^/\s@]*@`)
+
+// proxyParseReason 把 url.Parse 的错误变成可以外发的文案。
+//
+// *url.Error 带着整串原始 URL，而代理地址可能是 user:pass@host；直接回显
+// 等于把口令写进日志、状态与命令行输出。这里只取底层原因，并再抹一道
+// 凭据样式的片段——底层错误在极端输入下也可能带上 URL 片段。
+func proxyParseReason(err error) string {
+	var uerr *url.Error
+	reason := err.Error()
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		reason = uerr.Err.Error()
+	}
+	return credentialLike.ReplaceAllString(reason, "****:****@")
 }
 
 // httpProxyDialer 通过 HTTP 代理的 CONNECT 方法建到目标地址的隧道。

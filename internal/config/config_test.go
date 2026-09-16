@@ -272,3 +272,36 @@ func TestDefaultPath(t *testing.T) {
 		})
 	}
 }
+
+// TestRedactProxyHidesPassword 验证代理地址里的口令不会经状态与日志漏出。
+//
+// 常态（带协议前缀）只该抹掉口令；没有协议前缀时 Go 会把 "alice:pw@host"
+// 解析成 scheme=alice + opaque 主体，Redacted() 对这种形式原样返回，
+// 所以必须整体换成占位符。
+func TestRedactProxyHidesPassword(t *testing.T) {
+	cases := []struct {
+		name  string
+		proxy string
+	}{
+		{"带协议前缀", "http://alice:s3cr3t@127.0.0.1:7897"},
+		{"带协议的 socks5", "socks5://alice:s3cr3t@127.0.0.1:1080"},
+		{"没有协议前缀", "alice:s3cr3t@127.0.0.1:7897"},
+		{"只有协议前缀", "http://"},
+		{"解析不了的端口", "http://alice:s3cr3t@127.0.0.1:79x7"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := RedactProxy(c.proxy)
+			if strings.Contains(got, "s3cr3t") {
+				t.Errorf("RedactProxy(%q) = %q，口令漏了出来", c.proxy, got)
+			}
+		})
+	}
+
+	if got := RedactProxy(""); got != "" {
+		t.Errorf("空地址应当原样返回空串，得到 %q", got)
+	}
+	if got := RedactProxy("http://alice:s3cr3t@127.0.0.1:7897"); !strings.Contains(got, "127.0.0.1:7897") {
+		t.Errorf("常态应当保留主机与端口，得到 %q", got)
+	}
+}

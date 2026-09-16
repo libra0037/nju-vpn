@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -127,6 +128,30 @@ func TestProxyURLRequiresHost(t *testing.T) {
 	for _, proxy := range []string{"http://", "socks5://", "http://:7897"} {
 		if _, err := New(proxy); err == nil {
 			t.Errorf("%q 缺少主机名，应当报错", proxy)
+		}
+	}
+}
+
+// 回归：代理地址解析失败时，错误串里不能出现原文——它可能带着 user:pass@，
+// 而这条错误会一路走到日志、status 与命令行输出，排查时经常整份贴出去。
+func TestProxyParseErrorDoesNotLeakCredentials(t *testing.T) {
+	bad := []string{
+		"http://alice:s3cr3t@127.0.0.1:79x7", // 端口不是数字
+		"http://alice:s3cr3t@[::1:7897",      // 缺右方括号
+		"http://alice:s3cr3t@127.0.0.1:7897/%zz",
+	}
+	for _, proxy := range bad {
+		_, err := New(proxy)
+		if err == nil {
+			t.Errorf("%q 应当解析失败", proxy)
+			continue
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "s3cr3t") {
+			t.Errorf("错误串泄露了口令: %q", msg)
+		}
+		if strings.Contains(msg, "alice") {
+			t.Errorf("错误串泄露了用户名: %q", msg)
 		}
 	}
 }

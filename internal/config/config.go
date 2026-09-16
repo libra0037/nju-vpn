@@ -285,6 +285,12 @@ func RedactProxy(proxy string) string {
 	if err != nil {
 		return "（无法解析的代理地址）"
 	}
+	// Opaque 非空或没有主机名时不可信："alice:pw@127.0.0.1:7897" 会被解析成
+	// scheme=alice + opaque 主体，Redacted() 只抹 User 与口令字段，对这两种
+	// 形式会原样返回含口令的字符串。
+	if u.Opaque != "" || u.Host == "" {
+		return "（无法安全显示的代理地址）"
+	}
 	return u.Redacted()
 }
 
