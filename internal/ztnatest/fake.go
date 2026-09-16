@@ -807,6 +807,13 @@ func readServerFrame(r *bufio.Reader) (serverFrame, error) {
 	f.cmd = head[1]
 	switch f.cmd {
 	case verHeartbeatReq:
+		// 心跳帧= 05 15 00 00：那两个保留字节必须读掉。留着它们的话，
+		// 下一轮会把 00 00 当成帧头（帧版本不是 0x05），假服务端于是自己
+		// 把隧道断开——凡是活过 15 秒的用例都会看到一次莫名其妙的断链。
+		var reserved [2]byte
+		if _, err := io.ReadFull(r, reserved[:]); err != nil {
+			return f, err
+		}
 		return f, nil
 	case verAuthReq:
 		var l [2]byte

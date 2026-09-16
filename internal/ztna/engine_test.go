@@ -326,8 +326,20 @@ func TestReconnectRotatesNodes(t *testing.T) {
 
 	restored := make(chan struct{}, 1)
 	done := make(chan error, 1)
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		done <- sess.Run(ctx, LinkEvents{Restored: func() { restored <- struct{}{} }})
+	}()
+	// 收尾要等到 Run 真的退出：它还会用 t.Logf 记日志（会话自己的日志函数
+	// 就是它），用例返回之后再写就是与 testing 包的收尾状态打架。
+	defer func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("ctx 取消之后 Run 没有退出")
+		}
 	}()
 
 	setReachable(false, true)
@@ -348,6 +360,68 @@ func TestReconnectRotatesNodes(t *testing.T) {
 	}
 	if n := srv.Tunnels(); n < 2 {
 		t.Errorf("服务端上的隧道连接数 = %d，期望至少 2", n)
+	}
+}
+
+// TestTunnelSurvivesHeartbeatRoundTrip 验证心跳真的走通了一次往返，而且之后
+// 隧道仍然活着。
+//
+// 这条路径此前在离线环境里没有被覆盖过：假服务端读心跳帧时没消费那两个保留
+// 字节，残留的 0x00 0x00 被当成下一轮的帧头（版本不是 0x05），它于是自己把
+// 隧道断掉——凡是活过 15 秒的用例都会看到一次莫名其妙的断链。
+//
+// 心跳间隔 15 秒，跑一轮要 20 秒上下，-short 下跳过。
+func TestTunnelSurvivesHeartbeatRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要等一个心跳周期（15 秒），-short 下跳过")
+	}
+	srv := newFake(t, ztnatest.Options{})
+	client := newTestClient(t, srv, testPass)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sess, err := client.Connect(ctx, ConnectOptions{})
+	if err != nil {
+		t.Fatalf("登录应成功: %v", err)
+	}
+	defer sess.Close(context.Background())
+
+	down := make(chan error, 1)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		down <- sess.Run(ctx, LinkEvents{})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("ctx 取消之后 Run 没有退出")
+		}
+	}()
+
+	// 等第一次心跳：间隔 15 秒，给到 40 秒；期间隧道断开就直接失败。
+	deadline := time.Now().Add(40 * time.Second)
+	for srv.Heartbeats() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("一个心跳周期（15 秒）内没有收到心跳")
+		}
+		select {
+		case err := <-down:
+			t.Fatalf("隧道在心跳之前断开: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	// 心跳之后再看几秒：残留字节若没读掉，隧道会在收到心跳的瞬间被服务端
+	// 关掉，重连会把隧道连接数顶到 2。
+	select {
+	case err := <-down:
+		t.Fatalf("隧道在心跳之后断开: %v", err)
+	case <-time.After(3 * time.Second):
+	}
+	if got := srv.Tunnels(); got != 1 {
+		t.Errorf("隧道连接数 = %d，期望 1（重连说明链路被断过）", got)
 	}
 }
 

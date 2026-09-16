@@ -2,13 +2,39 @@ package ztna
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/l3"
 )
+
+// logSink 收集来自后台协程的日志。
+//
+// 这些协程里不能直接调 t.Logf：用例返回之后它们还会跑一小会儿（readLoop
+// 收尾时会把断开原因记进日志），那时再碰 testing.T 就是 DATA RACE。
+type logSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (s *logSink) logf(format string, args ...any) {
+	s.mu.Lock()
+	s.lines = append(s.lines, fmt.Sprintf(format, args...))
+	s.mu.Unlock()
+}
+
+func (s *logSink) dump(t *testing.T) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, line := range s.lines {
+		t.Log(line)
+	}
+}
 
 // TestHeartbeatGapOnlyClearedOnReceivedFrames 验证失联计数只由“收到服务端帧”
 // 清零，写成功不算。
@@ -18,8 +44,20 @@ import (
 // 只能等内核 TCP 重传耗尽（分钟级）才报错。
 func TestHeartbeatGapOnlyClearedOnReceivedFrames(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	loopDone := make(chan struct{})
+	sink := &logSink{}
+	defer sink.dump(t) // 先注册、后收尾：dump 在两个协程都停稳之后才跑
+	defer func() {
+		// 收尾要彻底：等 readLoop 和那个丢弃字节的协程都退出，否则它们可能
+		// 在用例返回之后才写日志，与 testing 包的收尾状态打架。
+		server.Close()
+		client.Close()
+		select {
+		case <-loopDone:
+		case <-time.After(2 * time.Second):
+			t.Error("readLoop 没有在连接关闭后退出")
+		}
+	}()
 
 	tc := &tunnelConn{
 		node:     "test-node",
@@ -29,7 +67,7 @@ func TestHeartbeatGapOnlyClearedOnReceivedFrames(t *testing.T) {
 		table:    &resourceTable{},
 		closeCh:  make(chan struct{}),
 		authWake: make(chan struct{}, 1),
-		logf:     t.Logf,
+		logf:     sink.logf,
 	}
 	// net.Pipe 是同步的：没有对端读，write 会一直阻塞。这里把服务端方向
 	// 的字节读掉，模拟“对端还在收，但什么都不回”。
@@ -48,7 +86,10 @@ func TestHeartbeatGapOnlyClearedOnReceivedFrames(t *testing.T) {
 
 	// 收到一个服务端帧才清零。
 	tc.r = bufio.NewReader(client)
-	go tc.readLoop()
+	go func() {
+		defer close(loopDone)
+		tc.readLoop()
+	}()
 	if _, err := server.Write([]byte{Version, cmdHeartbeatResp, 0, 0}); err != nil {
 		t.Fatalf("发心跳响应: %v", err)
 	}
