@@ -8,6 +8,9 @@
 /config.yaml
 *.local.yaml
 
+# 独立审查报告（本地产物，不入库）
+/REVIEW.md
+
 # 编辑器 / 操作系统
 .idea/
 .vscode/
