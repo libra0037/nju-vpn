@@ -39,6 +39,13 @@ const (
 
 	// 单个数据帧里允许的最大包数，服务端不会一次给更多。
 	maxFramesPerFrame = 0xFF
+
+	// handshakeFrameLimit 是握手阶段的信封帧数上限。
+	//
+	// 握手正常只有一两帧（一个鉴权结果加一个虚拟地址），而读循环本身没有尽头：
+	// 对端一直刷帧就能让它一直跑下去，每帧还会新分配一块载荷。给个上限，超出
+	// 就按协议错误收场。
+	handshakeFrameLimit = 32
 )
 
 // vipBodyLen 返回给定地址类型的虚拟地址体长度。
@@ -105,7 +112,10 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 		return res, &ProtocolError{What: "非预期的方法响应", Got: hex2(method)}
 	}
 
-	for {
+	for frames := 0; ; frames++ {
+		if frames >= handshakeFrameLimit {
+			return res, &ProtocolError{What: "握手帧数超过上限", Got: fmt.Sprintf("%d 帧", frames)}
+		}
 		head := make([]byte, 4)
 		if _, err := io.ReadFull(r, head); err != nil {
 			return res, fmt.Errorf("读信封头: %w", err)

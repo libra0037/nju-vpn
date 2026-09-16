@@ -58,6 +58,9 @@ type Options struct {
 
 	// VIP 是隧道分配的地址。
 	VIP string
+	// StallTunnelHandshake 让隧道节点收下握手请求后不回任何帧（只把后续
+	// 字节读掉），用来验证客户端侧的握手超时与取消。不设它时总是立刻响应。
+	StallTunnelHandshake bool
 	// SelfID 是本机在授信终端列表里的 id，Trusted 是初始已授信的 id 列表。
 	SelfID     string
 	Trusted    []string
@@ -641,6 +644,13 @@ func (s *Server) handleTunnel(conn net.Conn, r *bufio.Reader) {
 	// 握手请求的尾巴：版本、方法、保留位、地址类型与 6 字节地址体。
 	tail := make([]byte, 10)
 	if _, err := io.ReadFull(r, tail); err != nil {
+		return
+	}
+
+	// 故意不回帧：读到对端放弃（客户端超时会关掉连接）为止。用于验证
+	// 客户端在“TLS 通了但节点不响应”时必须自己收场。
+	if s.opts.StallTunnelHandshake {
+		_, _ = io.Copy(io.Discard, r)
 		return
 	}
 

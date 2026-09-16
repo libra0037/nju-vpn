@@ -29,6 +29,13 @@ const (
 	authScanInterval = 250 * time.Millisecond
 	// 一次最多发多少条鉴权请求。
 	authBatchSize = 32
+	// defaultHandshakeTimeout 是隧道握手阶段（TLS 加上之后的协议握手）的整体上限。
+	//
+	// 没有它的话，节点在完成 TCP/TLS 之后不再回帧，这一次读会永久阻塞：调用方
+	// 的 ctx 取消不了它，守护进程的命令通道跟着卡死（stop / status 排不上队），
+	// 而杀进程会跳过登出、把服务端的名额留着。10 秒比首包往返宽松得多，不会
+	// 误伤慢链路。
+	defaultHandshakeTimeout = 10 * time.Second
 )
 
 // tunnelConn 是一条 L3 隧道连接：TLS 之上跑本协议的帧。
@@ -71,6 +78,9 @@ type tunnelOptions struct {
 	DeviceID string
 	SignKey  []byte
 	Logf     func(format string, args ...any)
+	// HandshakeTimeout 覆盖握手阶段的默认上限；0 表示用 defaultHandshakeTimeout。
+	// 生产调用不设它，只有测试会传一个很短的值。
+	HandshakeTimeout time.Duration
 }
 
 // dialTunnel 建立一条隧道连接并完成握手。返回时两个后台协程已经在跑。
@@ -83,14 +93,29 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 		ServerName:         opts.Server,
 		InsecureSkipVerify: true,
 	})
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = tlsConn.SetDeadline(deadline)
+
+	// 握手阶段整体带期限：TLS 与协议握手都算在内，成功后再清掉，否则会把
+	// 之后的数据面读写一起拖死。
+	timeout := opts.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = defaultHandshakeTimeout
 	}
+	deadline := time.Now().Add(timeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := tlsConn.SetDeadline(deadline); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("设置握手期限: %w", err)
+	}
+	// ctx 取消要能立刻打断正在进行的读：Go 没有别的办法叫醒一次阻塞的 Read。
+	stopCancelWatch := watchCancel(ctx, tlsConn)
+	defer stopCancelWatch()
+
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("隧道节点 TLS 握手: %w", err)
 	}
-	_ = tlsConn.SetDeadline(time.Time{})
 
 	t := &tunnelConn{
 		node:         opts.Node,
@@ -120,6 +145,11 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 		_ = tlsConn.Close()
 		return nil, err
 	}
+	// 握手已经结束：先停掉取消监听再清期限。反过来会留下一个窗口——监听器
+	// 把刚清掉的期限又设成“现在”，数据面从第一包起就全废。
+	stopCancelWatch()
+	_ = tlsConn.SetDeadline(time.Time{})
+
 	t.r = br
 	t.setVIP(res.VIP)
 
@@ -129,6 +159,23 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 	go t.authLoop()
 	t.logf("隧道已建立: 节点 %s，地址 %s", t.node, t.vip.String())
 	return t, nil
+}
+
+// watchCancel 让 ctx 的取消能打断一次阻塞中的读写。
+//
+// Go 没有别的办法叫醒已经在进行的 Read：把连接的期限提前到当前时刻，阻塞中
+// 的调用会立刻以超时错误返回。返回的函数停止监听，可安全重复调用。
+func watchCancel(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // Done 在连接关闭时关闭，供重连逻辑等待。
