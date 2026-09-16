@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -62,6 +63,51 @@ func readOne(t *testing.T, r *Relay, size int) []byte {
 		t.Fatal("等待下行包超时")
 		return nil
 	}
+}
+
+// TestRelaySessionSwapDropsPartialPacket 验证会话切换时残留的半包被丢掉。
+//
+// 切包缓冲跨会话共用：旧会话断开时若正好只送来半个包，那半截会被当成新会话
+// 第一个包的前半段，接下来的字节全部错位（重组出一个长度对得上、内容全错的
+// 包），表现是"重连成功之后一段时间下行没有反应"，而丢包统计里一条记录都
+// 没有。
+func TestRelaySessionSwapDropsPartialPacket(t *testing.T) {
+	peer := [4]byte{10, 66, 66, 2}
+	pub := [4]byte{172, 29, 56, 18}
+	full := ipv4Pkt(pub, peer, 100)
+
+	t.Run("换绑会话", func(t *testing.T) {
+		r, epA := newTestRelay(t)
+		// 旧会话只送来半个包。
+		epA.Deliver(full[:30])
+		if len(r.frameBuf) != 30 {
+			t.Fatalf("半包没进缓冲：%d 字节", len(r.frameBuf))
+		}
+
+		epB := l3.New()
+		r.InstallSession(epB, nil)
+		if len(r.frameBuf) != 0 {
+			t.Fatalf("换绑之后缓冲里还剩 %d 字节", len(r.frameBuf))
+		}
+		waitDrop(t, r, dropSessionSwap)
+
+		// 新会话的第一个包必须原样出来，不能与旧半包拼接。
+		epB.Deliver(full)
+		got := readOne(t, r, 4096)
+		if !bytes.Equal(got, full) {
+			t.Fatalf("下行包被旧会话的半包污染了：%d 字节", len(got))
+		}
+	})
+
+	t.Run("摘掉会话", func(t *testing.T) {
+		r, ep := newTestRelay(t)
+		ep.Deliver(full[:30])
+		r.ClearSession()
+		if len(r.frameBuf) != 0 {
+			t.Fatalf("摘掉会话之后缓冲里还剩 %d 字节", len(r.frameBuf))
+		}
+		waitDrop(t, r, dropSessionSwap)
+	})
 }
 
 // 回归：隧道下行是字节流，服务端可能把两个包写进一次 TLS 记录。

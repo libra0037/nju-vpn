@@ -115,6 +115,7 @@ func NewRelay(opts RelayOptions) *Relay {
 // 可以反复调用。换绑之后旧会话的回调立刻失效；旧会话残留的下行包即使
 // 挤进来，也会因为目的地址不等于新会话分配到的地址而被 Mapper 丢掉。
 func (r *Relay) InstallSession(ep *l3.Endpoint, mapper *Mapper) {
+	r.dropPartialFrame()
 	r.session.Store(&relaySession{ep: ep, mapper: mapper})
 	ep.SetDownlink(r.deliver)
 }
@@ -132,8 +133,25 @@ func (r *Relay) HoldDownlink(hold bool) {
 
 // ClearSession 摘掉当前会话。设备继续监听，但不再有任何包进出隧道。
 func (r *Relay) ClearSession() {
+	r.dropPartialFrame()
 	if old := r.session.Swap(nil); old != nil {
 		old.ep.ClearDownlink()
+	}
+}
+
+// dropPartialFrame 丢掉切包缓冲里残留的半包。
+//
+// 缓冲是跨会话共用的：旧会话断开时若正好只送来半个包，那半截会被当成新会话
+// 第一个包的前半段，接下来的字节全部错位，表现是"重连成功之后一段时间下行
+// 没有反应"。会话换绑是唯一知道"这条字节流到此为止"的时刻，在这里清最省事，
+// 也让这件事在丢包统计里留下一条记录。
+func (r *Relay) dropPartialFrame() {
+	r.frameMu.Lock()
+	pending := len(r.frameBuf)
+	r.frameBuf = nil
+	r.frameMu.Unlock()
+	if pending > 0 {
+		r.countDrop(dropSessionSwap)
 	}
 }
 
@@ -157,6 +175,12 @@ func (r *Relay) deliver(chunk []byte) {
 	}
 
 	r.frameMu.Lock()
+	// 会话可能在切包过程中被换掉：这段字节属于旧会话，丢掉。没有这道判断
+	// 的话，旧会话的尾巴会接在新会话的第一个包前面（见 dropPartialFrame）。
+	if r.session.Load() != sess {
+		r.frameMu.Unlock()
+		return
+	}
 	r.frameBuf = append(r.frameBuf, chunk...)
 	var packets [][]byte
 	for {
@@ -246,6 +270,9 @@ const (
 	// dropUplinkRejected：上行通道接上了，但隧道拒绝了这个包
 	//（最常见的是目标不在资源表内、或该流鉴权失败）。
 	dropUplinkRejected
+	// dropSessionSwap：会话切换（重连、换账号）时切包缓冲里还留着半个包，
+	// 只能丢掉——留着它会让新会话的下行全部错位。
+	dropSessionSwap
 
 	dropReasonCount
 )
@@ -261,6 +288,7 @@ var dropReasonText = [dropReasonCount]string{
 	dropNoSession:       "隧道尚未建立，客户端发来的包被丢弃",
 	dropNoUplink:        "隧道上行通道未就绪，包被丢弃",
 	dropUplinkRejected:  "隧道拒绝了这个上行包",
+	dropSessionSwap:     "会话切换时丢掉了残留的半包（重连时正常）",
 }
 
 // dropQuietInterval 是几种"预期之内、会一直重复"的丢包原因的日志间隔。
@@ -271,6 +299,7 @@ var dropReasonText = [dropReasonCount]string{
 // 零值表示用默认的 dropLogInterval。
 var dropQuietInterval = [dropReasonCount]time.Duration{
 	dropPeerNotReady: 5 * time.Minute,
+	dropSessionSwap:  5 * time.Minute,
 }
 
 // dropCounter 是一种原因的计数与限速状态。
