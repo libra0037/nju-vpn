@@ -1,68 +1,53 @@
-// Command njuvpn 是 NJU VPN 的服务端与命令行客户端。
+// Command njuvpn 把校园网隧道接出成一个本地 WireGuard 承载。
 //
 // 同一个二进制承担两种角色：
 //
-//	njuvpn run                                    服务进程（一般由 start 自动拉起）
-//	njuvpn start|stop|status|restart|ping         命令行客户端，通过本地 IPC 与服务进程通信
-//	njuvpn probe                                  直接连服务端做协议探测，不经过服务进程
+//	njuvpn run                       服务进程（一般由 start 自动拉起）
+//	njuvpn start|stop|status|...     命令行客户端，通过本地 IPC 与服务进程通信
+//
+// 命令行是纯客户端：它不做协议交互，也不长期活着。所有需要登录、需要长期
+// 保持连接的事情都在服务进程里做，两者之间只有一条本地套接字。
 package main
 
 import (
-	"context"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"log"
 	"os"
-	"os/signal"
-	"strings"
-	"syscall"
 	"time"
-
-	"github.com/libra0037/nju-vpn/internal/config"
-	"github.com/libra0037/nju-vpn/internal/dial"
-	"github.com/libra0037/nju-vpn/internal/ipc"
-	"github.com/libra0037/nju-vpn/internal/service"
-	"github.com/libra0037/nju-vpn/internal/vpn"
-	"github.com/libra0037/nju-vpn/internal/wireguard"
 )
 
 const prog = "njuvpn"
 
-// startTimeout 是 start 与 auth 两次请求的超时。
+// startTimeout 是需要登录的那些请求的超时。
 //
-// 给足：服务端最坏路径是 submitCode + portalToken + acquireIP（3 次尝试 ×
-// 30 秒退避），加起来可能超过 3 分钟。
+// 给足：最坏路径是登录、发短信、拉资源表、逐个探测隧道节点、建隧道，
+// 中间还可能有退避。
 const startTimeout = 5 * time.Minute
 
-// version 是发行版本号，由构建脚本用 -ldflags 注入；
-// 源码直接构建时是 dev，便于区分「自己编的」与「下载的」。
+// version 是发行版本号，由构建脚本用 -ldflags 注入；源码直接构建时是 dev，
+// 便于区分"自己编的"与"下载的"。
 var version = "dev"
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `%s - NJU VPN 服务端与命令行客户端
+	fmt.Fprintf(os.Stderr, `%s - 把校园网隧道接出成本地 WireGuard 承载
 
 用法:
-  %s run                          以服务进程身份运行（一般由 start 自动拉起）
-  %s start                        建立隧道（必要时自动拉起服务进程，需要时提示输入口令与验证码）
-  %s stop                         断开隧道，服务进程继续运行
-  %s status                       查看服务与隧道状态
-  %s restart                      重启服务进程（改完配置后用它，不必手工杀进程）
-  %s ping                         查看服务进程是否在运行，并报出它的身份
-  %s probe                        探测协议可用性（直接连服务端，不经过服务进程）
-  %s wg-peer <公钥>                更新 WireGuard 接入公钥（不重建隧道）
-  %s wg-stats                      查看 WireGuard 收发统计
-  %s version                      查看版本号
+  %s run                       以服务进程身份运行（一般由 start 自动拉起）
+  %s start [--trust]           建立隧道（必要时自动拉起服务进程）
+  %s stop                      断开隧道，服务进程继续运行
+  %s status [--check]          查看服务与隧道状态
+  %s trust                     把本机绑成授信终端（之后登录免二次验证）
+  %s untrust [--all]           解除本机授信；--all 解除该账号下全部授信终端
+  %s restart                   重启服务进程（改完配置后用它，不必手工杀进程）
+  %s version                   查看版本号
 
 全局参数:
-  -config <path>                  配置文件路径（默认见下）
-  -proxy <url>                    覆盖配置文件里的出站代理（run / start / restart / probe 可用）
+  -config <path>                   配置文件路径（默认见下）
 
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
   Windows  %%LOCALAPPDATA%%\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -81,18 +66,14 @@ func main() {
 		err = cmdStart(args)
 	case "stop":
 		err = cmdStop(args)
-	case "restart":
-		err = cmdRestart(args)
 	case "status":
 		err = cmdStatus(args)
-	case "ping":
-		err = cmdPing(args)
-	case "wg-peer":
-		err = cmdSetPeer(args)
-	case "wg-stats":
-		err = runCommand("wg-stats", args, ipc.Request{Command: ipc.CmdWGStats}, time.Minute)
-	case "probe":
-		err = cmdProbe(args)
+	case "trust":
+		err = cmdTrust(args)
+	case "untrust":
+		err = cmdUntrust(args)
+	case "restart":
+		err = cmdRestart(args)
 	case "version", "-v", "--version":
 		fmt.Printf("%s %s\n", prog, version)
 		return
@@ -111,282 +92,11 @@ func main() {
 	}
 }
 
-// cmdRun 是服务进程入口：由 `njuvpn start` 按需拉起，也可以直接在终端里跑。
-func cmdRun(args []string) error {
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
-	if _, err := parseInterleaved(fs, args); err != nil {
-		return err
-	}
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	if *proxy != "" {
-		cfg.Proxy = *proxy
-	}
-
-	// 第一行就报出身份：同机多实例时日志几乎逐字相同，没有这一行就分不清
-	// 眼前这份日志属于哪个实例。
-	endpoint := endpointOf(cfg)
-	log.SetFlags(log.LstdFlags)
-	log.Printf("%s 服务进程启动 pid=%d 账号=%s 配置=%s 端点=%s",
-		prog, os.Getpid(), cfg.Username, cfg.SourcePath(), endpoint)
-	log.Printf("目标 %s", cfg.ServerAddr())
-	for _, w := range cfg.Warnings() {
-		log.Printf("警告: %s", w)
-	}
-	if cfg.Proxy != "" {
-		log.Printf("出站路径: %s", config.RedactProxy(cfg.Proxy))
-	}
-
-	// WireGuard 私钥缺失时生成一个并写回配置：服务端公钥要填到客户端配置里，
-	// 每次重启换一个会让客户端配置失效。
-	if cfg.WireGuard.PrivateKey == "" {
-		if err := generateWireGuardKey(cfg); err != nil {
-			log.Printf("警告: %v", err)
-		}
-	}
-	logWireGuardPublicKey(cfg)
-
-	// 承载设备在这里就建起来：端口被占、密钥写错这类问题必须在启动时
-	// 报出来，而不是等用户输完验证码、白烧一条短信之后。
-	svc, err := service.New(cfg)
-	if err != nil {
-		return err
-	}
-	log.Printf("WireGuard 承载: %s", svc.BearerSummary())
-
-	// 退出路径上无条件登出：服务端同一账号只允许一个客户端，
-	// 残留会话会让后续建隧道被拒。这里相当于 atexit。
-	defer svc.Close()
-
-	return service.RunServer(svc, endpoint)
-}
-
-// generateWireGuardKey 生成私钥并写回配置文件。
-func generateWireGuardKey(cfg *config.Config) error {
-	key, err := wireguard.GenerateKey()
-	if err != nil {
-		return fmt.Errorf("生成 WireGuard 私钥失败: %w", err)
-	}
-	cfg.WireGuard.PrivateKey = key.String()
-	if err := config.PersistPrivateKey(cfg.SourcePath(), key.String()); err != nil {
-		return fmt.Errorf("私钥已生成但无法写回 %s（%v）；重启后公钥会变，客户端需要重新配置",
-			cfg.SourcePath(), err)
-	}
-	log.Printf("已生成 WireGuard 私钥并写回 %s", cfg.SourcePath())
-	return nil
-}
-
-// logWireGuardPublicKey 打印服务端公钥，用户需要把它填进客户端配置。
-func logWireGuardPublicKey(cfg *config.Config) {
-	if cfg.WireGuard.PrivateKey == "" {
-		return
-	}
-	key, err := wireguard.ParseKey(cfg.WireGuard.PrivateKey)
-	if err != nil {
-		log.Printf("警告: wireguard.private_key 无法解析: %v", err)
-		return
-	}
-	pub, err := key.PublicKey()
-	if err != nil {
-		log.Printf("警告: 推导 WireGuard 公钥失败: %v", err)
-		return
-	}
-	log.Printf("WireGuard 服务端公钥: %s", pub.String())
-}
-
-// cmdStart 用一条命令走完整个建立流程。
-//
-// 配置里没写口令时先问口令（不回显），服务端要求二次验证时再问验证码：
-// 用户不再需要先 start 再 auth。口令只经本地套接字传给服务进程，留在
-// 它的内存里；验证码是一次性的，也随之用完即弃。
-func cmdStart(args []string) error {
-	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理（只在拉起服务进程时生效）")
-	if _, err := parseInterleaved(fs, args); err != nil {
-		return err
-	}
-
-	cfg, err := clientConfig(*configPath)
-	if err != nil {
-		return err
-	}
-	endpoint := endpointOf(cfg)
-	password, err := passwordFor(cfg, endpoint)
-	if err != nil {
-		return err
-	}
-
-	// 服务进程没在跑就先拉起来：这是"按需拉起"的入口。
-	if err := ensureService(*configPath, *proxy); err != nil {
-		return err
-	}
-
-	req := ipc.Request{Command: ipc.CmdStart}
-	if password != "" {
-		req.Args = []string{ipc.EncodeSecret(password)}
-	}
-	resp, err := call(endpoint, req, startTimeout)
-	if err != nil {
-		return err
-	}
-	fmt.Println(resp.Message)
-	switch resp.Code {
-	case ipc.CodeOK:
-		return nil
-	case ipc.CodeAuthRequired:
-		// 需要二次验证：提示输入验证码，然后接着把隧道建起来。
-	default:
-		return fmt.Errorf("服务进程返回 %d", resp.Code)
-	}
-
-	code, err := promptCode()
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return errors.New("读不到验证码，且标准输入已经结束：验证码只能交互输入，" +
-				"无人值守的部署请在配置里写 totp_secret")
-		}
-		return err
-	}
-	if code == "" {
-		return errors.New("验证码为空")
-	}
-	resp, err = call(endpoint, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, startTimeout)
-	if err != nil {
-		return err
-	}
-	fmt.Println(resp.Message)
-	if resp.Code == ipc.CodeOK {
-		return nil
-	}
-	return fmt.Errorf("服务进程返回 %d", resp.Code)
-}
-
-// passwordFor 决定本次 start 要不要现问口令。
-//
-// 配置里写了口令就用配置里的（服务进程自己会读）；没写就现问一遍，只经
-// 本地套接字传过去。stdin 是管道时也照读，便于脚本一次喂口令和验证码。
-//
-// 隧道已经在跑时不问：这条路径是幂等的（看门狗式脚本每隔几分钟敲一次
-// start），每次都停在口令提示上等于让脚本永远失败——stdin 是 /dev/null
-// 时更是直接以一句裸 EOF 收场。
-func passwordFor(cfg *config.Config, endpoint string) (string, error) {
-	if cfg == nil || cfg.Password != "" {
-		return "", nil
-	}
-	if state, err := serviceState(endpoint); err == nil && state == string(service.StateUp) {
-		return "", nil
-	}
-	password, err := promptSecret("请输入校园网口令: ")
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return "", errors.New("读不到口令，且标准输入已经结束（非交互运行？）：" +
-				"请在配置文件的 password 里写入口令，或改用交互式终端运行")
-		}
-		return "", err
-	}
-	return strings.TrimSpace(password), nil
-}
-
-func cmdStop(args []string) error {
-	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop}, time.Minute)
-}
-
-// cmdRestart 重启服务进程：先请它自己退出（会登出），再拉起一个新的。
-//
-// 改完配置用它，不必手工杀进程——手工杀会跳过登出，服务端那条名额
-// 要等它自己超时才释放，期间同一个账号建不上隧道。
-func cmdRestart(args []string) error {
-	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
-	if _, err := parseInterleaved(fs, args); err != nil {
-		return err
-	}
-
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	if err := shutdownService(endpoint); err != nil {
-		log.Printf("服务进程未在运行（%v），直接拉起", err)
-	} else if err := waitServiceGone(endpoint, serviceStopTimeout); err != nil {
-		return err
-	}
-	if err := ensureService(*configPath, *proxy); err != nil {
-		return err
-	}
-	fmt.Println("服务进程已重启")
-	return nil
-}
-
-func cmdStatus(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	check := fs.Bool("check", false, "隧道不在 up 状态时以非 0 退出（给巡检脚本用）")
-	if _, err := parseInterleaved(fs, args); err != nil {
-		return err
-	}
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	req := ipc.Request{Command: ipc.CmdStatus}
-	if *check {
-		req.Args = []string{"check"}
-	}
-	return runAt(endpoint, req, 30*time.Second)
-}
-
-// cmdPing 探活：报出这个端点上有没有服务进程，以及它是哪个实例。
-//
-// 它不改任何状态，是回答"我的命令到底打给了谁"最省事的办法
-// （同机跑多个实例时，各实例的日志几乎逐字相同）。
-func cmdPing(args []string) error {
-	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	if _, err := parseInterleaved(fs, args); err != nil {
-		return err
-	}
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	return runAt(endpoint, ipc.Request{Command: ipc.CmdPing}, 5*time.Second)
-}
-
-// cmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
-//
-//	njuvpn wg-peer <客户端公钥>
-func cmdSetPeer(args []string) error {
-	fs := flag.NewFlagSet("wg-peer", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	positional, err := parseInterleaved(fs, args)
-	if err != nil {
-		return err
-	}
-	key := strings.TrimSpace(strings.Join(positional, ""))
-	if key == "" {
-		return errors.New("用法: njuvpn wg-peer <客户端公钥>")
-	}
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	return runAt(endpoint, ipc.Request{Command: ipc.CmdSetPeer, Args: []string{key}}, time.Minute)
-}
-
 // parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。
 //
-// Go 的 flag 包遇到第一个位置参数就停止解析，而命令行里这两者经常混着写
-// （njuvpn wg-peer <公钥> -config x.yaml）。这里循环调用 Parse：每轮吃掉一个
-// 位置参数，再从剩下的继续解析。解析语义完全由标准库决定（-flag=value、
-// 布尔 flag、-- 终止符都正确），不再自己维护一份 flag 语法。
+// Go 的 flag 包遇到第一个位置参数就停止解析，而命令行里这两者经常混着写。
+// 这里循环调用 Parse：每轮吃掉一个位置参数，再从剩下的继续解析。解析语义
+// 完全由标准库决定（-flag=value、布尔 flag、-- 终止符都正确）。
 func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positional []string
 	for {
@@ -400,201 +110,4 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 		positional = append(positional, args[0])
 		args = args[1:]
 	}
-}
-
-// cmdProbe 走一遍完整的协议握手，用来验证服务端仍然接受当前的客户端实现。
-//
-//	njuvpn probe -config config.yaml [-proxy http://127.0.0.1:7897] [-totp <code>] [-debug]
-func cmdProbe(args []string) error {
-	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	proxy := fs.String("proxy", "", "覆盖配置文件里的出站代理")
-	totpCode := fs.String("totp", "", "TOTP 验证码，留空则用配置里的密钥自动生成")
-	twfID := fs.String("twf-id", "", "复用已有的 TwfID，跳过 Web 登录（调试用）")
-	logout := fs.Bool("logout", false, "只调用服务端登出接口然后退出，不建立隧道")
-	keep := fs.Bool("keep", false, "探测结束后不登出，保留服务端会话以便复用")
-	force := fs.Bool("force", false, "本机隧道正在运行时也强行探测（会把当前隧道踢下线）")
-	debug := fs.Bool("debug", false, "打印每一步的报文")
-	if _, err := parseInterleaved(fs, args); err != nil {
-		return err
-	}
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	if *proxy != "" {
-		cfg.Proxy = *proxy
-	}
-
-	if !*force {
-		if err := ensureProbeIsSafe(cfg); err != nil {
-			return err
-		}
-	}
-
-	dialFn, err := dial.New(cfg.Proxy)
-	if err != nil {
-		return err
-	}
-	if cfg.Proxy == "" {
-		log.Printf("出站路径: 直连")
-	} else {
-		log.Printf("出站路径: %s", config.RedactProxy(cfg.Proxy))
-	}
-
-	client := vpn.New(vpn.Options{
-		Server:   cfg.ServerAddr(),
-		DialAddr: cfg.DialAddr(),
-		Dial:     dialFn,
-	})
-	defer client.CloseIdleConnections()
-
-	// Ctrl-C 能立刻中断探测，不再需要等满退避。
-	ctx, cancel := signalContext()
-	defer cancel()
-
-	if *logout {
-		if *twfID == "" {
-			return errors.New("-logout 需要配合 -twf-id 指定要登出的会话")
-		}
-		if err := client.Logout(ctx, *twfID); err != nil {
-			return err
-		}
-		fmt.Println("服务端已注销该会话")
-		return nil
-	}
-
-	code := *totpCode
-	if code == "" && cfg.TOTPSecret != "" {
-		code, err = vpn.GenerateTOTP(cfg.TOTPSecret)
-		if err != nil {
-			return err
-		}
-		log.Printf("已用配置文件里的密钥生成 TOTP 验证码")
-	}
-
-	trace := &vpn.Trace{}
-	// 复用已有会话时不需要口令；否则配置里没写就现问一遍（不回显）。
-	password := cfg.Password
-	if password == "" && *twfID == "" {
-		if password, err = promptSecret("请输入校园网口令: "); err != nil {
-			return err
-		}
-		password = strings.TrimSpace(password)
-	}
-	opt := vpn.ConnectOptions{
-		Username: cfg.Username,
-		Password: password,
-		TwfID:    *twfID,
-		Code:     code,
-		Debug:    *debug,
-		Trace:    trace,
-	}
-
-	sess, err := client.Connect(ctx, opt)
-
-	// 会话从这一刻起归本函数所有：后面任何一条返回路径都要登出，
-	// 否则服务端那条"同一账号只允许一个客户端"的名额会被一直占着
-	//（以前就是在提示输入验证码那一步失败时直接 return，漏掉了登出）。
-	defer func() {
-		if sess == nil {
-			return
-		}
-		if *keep {
-			sess.CloseLocal()
-			return
-		}
-		if closeErr := sess.Close(context.Background()); closeErr != nil {
-			fmt.Printf("登出未成功: %v\n", closeErr)
-		} else {
-			fmt.Printf("已登出并释放服务端会话\n")
-		}
-	}()
-
-	// 服务端要求二次验证时，向终端索取验证码后在同一个会话里继续。
-	if authErr, ok := vpn.AsAuthRequired(err); ok && code == "" {
-		prompted, promptErr := askCode(authErr.Kind)
-		if promptErr != nil {
-			return promptErr
-		}
-		opt.TwfID = authErr.TwfID
-		opt.Code = prompted
-		opt.AuthKind = authErr.Kind
-		prev := sess
-		sess, err = client.Connect(ctx, opt)
-		// 续用同一个 TwfID 时只能释放本地资源：对旧对象登出会把正在
-		// 续用的服务端会话一起杀掉。
-		if prev != nil && prev != sess {
-			if sess != nil && prev.TwfID() == sess.TwfID() {
-				prev.CloseLocal()
-			} else {
-				_ = prev.Close(context.Background())
-			}
-		}
-	}
-
-	printTrace(trace)
-
-	if err != nil {
-		return err
-	}
-
-	if *keep {
-		fmt.Printf("TwfID: %s（可用 -twf-id 复用，跳过再次登录）\n", sess.TwfID())
-	}
-
-	if err := trace.Step("tunnel-handshake", func() error { return sess.CheckTunnel(ctx) }); err != nil {
-		printTrace(trace)
-		return err
-	}
-	printTrace(trace)
-	fmt.Printf("\n%s\n", trace.Summary())
-	return nil
-}
-
-// printTrace 打印各阶段结果。
-func printTrace(t *vpn.Trace) {
-	fmt.Printf("\n%-20s %-10s %s\n", "阶段", "耗时", "结果")
-	for _, s := range t.Stages() {
-		status := "OK"
-		if s.Err != nil {
-			status = s.Err.Error()
-		}
-		fmt.Printf("%-20s %-10s %s\n", s.Name, s.Duration.Round(time.Millisecond), status)
-	}
-}
-
-// askCode 在服务端要求二次验证时向终端索取验证码。
-// 短信验证码只在当前登录会话内有效，所以必须在同一次连接里提交。
-func askCode(kind error) (string, error) {
-	if errors.Is(kind, vpn.ErrAuthSMS) {
-		fmt.Print("服务端已发送短信验证码，请输入: ")
-	} else {
-		fmt.Print("请输入 TOTP 验证码: ")
-	}
-	// 与口令共用同一个 bufio.Reader：管道里一次喂两行（先口令后验证码）时，
-	// 各读各的会把多读到的字节丢掉，验证码这一步就 EOF 了。
-	code, err := readStdinLine()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(code), nil
-}
-
-// signalContext 返回一个在收到中断信号时取消的上下文。
-func signalContext() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		select {
-		case <-signals:
-			fmt.Fprintln(os.Stderr, "已中断")
-			cancel()
-		case <-ctx.Done():
-		}
-		signal.Stop(signals)
-	}()
-	return ctx, cancel
 }

@@ -1,734 +1,390 @@
 package service
 
 import (
-	"context"
 	"errors"
-	"net/http"
-	"os"
+	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/config"
-	"github.com/libra0037/nju-vpn/internal/vpn"
-	"github.com/libra0037/nju-vpn/internal/vpntest"
+	"github.com/libra0037/nju-vpn/internal/ipc"
 	"github.com/libra0037/nju-vpn/internal/wireguard"
+	"github.com/libra0037/nju-vpn/internal/ztna"
+	"github.com/libra0037/nju-vpn/internal/ztnatest"
 )
 
-// harness 装一套假的 portal 与假隧道，用来在没有校园网的情况下
-// 驱动完整的服务生命周期。
-type harness struct {
-	svc    *Service
-	portal *vpntest.Portal
-	tunnel *vpntest.Tunnel
-	// lastOptions 是生产代码算出、测试再补过的构造参数。
-	lastOptions vpn.Options
-}
+const (
+	testUser = "600000000000"
+	testPass = "secret"
+	testCode = "123456"
+	testVIP  = "172.16.0.9"
+)
 
-func newHarness(t *testing.T) *harness {
-	return newHarnessWith(t, nil)
-}
-
-// newHarnessWith 与 newHarness 相同，但允许在构造服务对象之前改配置。
-func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
+func newFakeServer(t *testing.T, opts ztnatest.Options) *ztnatest.Server {
 	t.Helper()
-	portal := vpntest.NewPortal()
-	tunnel := vpntest.NewTunnel()
-
-	portal.On("/por/login_auth.csp", vpntest.Response{Body: vpntest.LoginAuthPage()})
-	portal.On("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>-1</NextAuth><TwfID>fedcba9876543210</TwfID></Auth>`,
-	})
-	portal.On("/por/logout.csp", vpntest.Response{
-		Body: `<Auth><Message><![CDATA[logout user success]]></Message></Auth>`,
-	})
-
-	cfg := &config.Config{
-		Server:   "vpn.example.edu",
-		Port:     443,
-		Username: "u",
-		Password: "p",
-		MTU:      1320,
-		WireGuard: config.WireGuard{
-			PeerAddress: "10.66.66.2",
-			// 承载层需要一个能用的私钥；这里现生成，端口取 0 让系统分配。
-			PrivateKey: testPrivateKey(t),
-			ListenPort: 0,
-		},
+	if opts.Username == "" {
+		opts.Username = testUser
 	}
-	if mutate != nil {
-		mutate(cfg)
+	if opts.Password == "" {
+		opts.Password = testPass
 	}
-
-	svc, err := New(cfg)
+	if opts.Phone == "" {
+		opts.Phone = "138****0000"
+	}
+	srv, err := ztnatest.New(opts)
 	if err != nil {
-		t.Fatalf("构造服务对象失败: %v", err)
+		t.Fatalf("启动假服务端失败: %v", err)
 	}
-	h := &harness{svc: svc, portal: portal, tunnel: tunnel}
-	// 只补协议层内部的注入点；Server / DialAddr / Dial 由生产代码算，
-	// 顺便记下来供 TestClientOptionsUseProductionWiring 断言。
-	svc.SetClientOptions(func(opts *vpn.Options) {
-		h.lastOptions = *opts
-		opts.HTTP = portal.HTTPClient()
-		opts.PortalTLS = tunnel.Dial
-		opts.TunnelTLS = tunnel.Dial
-		opts.Timeouts = vpn.Timeouts{HTTP: 5 * time.Second, Handshake: 5 * time.Second}
-	})
-	t.Cleanup(svc.Close)
-
-	return h
+	t.Cleanup(func() { srv.Close() })
+	return srv
 }
 
-// testPrivateKey 生成一个测试用的 WireGuard 私钥。
-func testPrivateKey(t *testing.T) string {
+func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 	t.Helper()
 	key, err := wireguard.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return key.String()
+	host, portText, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Server:   "vpn.test",
+		ServerIP: host,
+		Port:     port,
+		Username: testUser,
+		Password: testPass,
+		DeviceID: "device-test-1",
+		MTU:      1320,
+		WireGuard: config.WireGuard{
+			ListenPort:  0,
+			PrivateKey:  key.String(),
+			PeerAddress: "10.66.66.2",
+		},
+		Log: config.Log{Level: "info"},
+	}
+	cfg.SetSourcePath(filepath.Join(t.TempDir(), "config.yaml"))
+	return cfg
 }
 
-// waitState 等待服务进入某个状态。
-func waitState(t *testing.T, svc *Service, want State, timeout time.Duration) {
+func newTestService(t *testing.T, srv *ztnatest.Server, cfg *config.Config) *Service {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatalf("启动服务对象失败: %v", err)
+	}
+	svc.SetDialer(srv.Dial)
+	t.Cleanup(svc.Close)
+	return svc
+}
+
+func waitState(t *testing.T, svc *Service, want State) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if svc.Status().State == want {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("等待状态 %s 超时，当前 %s（%s）", want, svc.Status().State, svc.Status().Detail)
+	t.Fatalf("状态停在 %s（%s），期望 %s", svc.Status().State, svc.Status().Detail, want)
 }
 
-// reportTunnelExit 通过 actor 上报一次隧道协程退出，等同于真实路径。
-func reportTunnelExit(t *testing.T, svc *Service, gen uint64, err error) {
-	t.Helper()
-	reply := make(chan error, 1)
-	select {
-	case svc.cmds <- &command{kind: cmdTunnelDown, gen: gen, err: err, reply: reply}:
-	case <-time.After(time.Second):
-		t.Fatal("命令通道阻塞")
-	}
-	select {
-	case <-reply:
-	case <-time.After(3 * time.Second):
-		t.Fatal("等待 actor 处理超时")
-	}
-}
+func TestStartWithSecondFactorThenTrustAndStop(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{RequireSMS: true, VerifyCode: testCode})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
 
-// 回归（功能不可用）：短信验证模式下，njuvpn auth <code> 提交的验证码
-// 必须真的送到服务端，而不是被整条链路丢掉。
-func TestAuthSubmitsCodeToServer(t *testing.T) {
-	h := newHarness(t)
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
-	})
-
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	err := svc.Start(false, testPass)
+	if !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("应停在等验证码这一步，得到 %v", err)
 	}
-	if st := h.svc.Status().State; st != StateAuthPending {
-		t.Fatalf("状态应为 auth_pending，实际 %s", st)
+	st := svc.Status()
+	if st.State != StateAuthPending {
+		t.Fatalf("状态 = %s，期望 auth_pending", st.State)
+	}
+	if !strings.Contains(st.Detail, "138****0000") {
+		t.Errorf("状态里应带上脱敏手机号，得到 %q", st.Detail)
+	}
+	if srv.SMSSends() != 1 {
+		t.Errorf("发码请求 %d 次，期望 1 次", srv.SMSSends())
 	}
 
-	if err := h.svc.Auth("123456"); err != nil {
-		t.Fatalf("提交验证码失败: %v", err)
+	// 验证码错误：留在等待状态，让用户再输一次。
+	if err := svc.Auth("000000"); err == nil {
+		t.Fatal("错误的验证码应被拒绝")
+	} else if _, ok := ztna.AsRejected(err); !ok {
+		t.Errorf("验证码错误应报成被拒绝，得到 %v", err)
 	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	form := h.portal.LastForm("/por/login_sms1.csp")
-	if form == nil {
-		t.Fatal("验证码没有提交到服务端")
-	}
-	if got := form.Get("svpn_inputsms"); got != "123456" {
-		t.Errorf("提交的验证码 = %q", got)
-	}
-}
-
-// 回归：Auth 成功后必须记住新的 TwfID，否则登出用的是过期标识，
-// 服务端会话不会被释放。
-func TestAuthUpdatesSessionIDUsedForLogout(t *testing.T) {
-	h := newHarness(t)
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
-	})
-
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
-	}
-	if err := h.svc.Auth("123456"); err != nil {
-		t.Fatalf("提交验证码失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	if err := h.svc.Stop(); err != nil {
-		t.Fatalf("Stop 失败: %v", err)
+	if got := svc.Status().State; got != StateAuthPending {
+		t.Errorf("验证码错误后状态 = %s，期望仍停在 auth_pending", got)
 	}
 
-	cookie := ""
-	for _, r := range h.portal.Requests() {
-		if r.Path == "/por/logout.csp" {
-			cookie = r.Cookie
-		}
+	if err := svc.Auth(testCode); err != nil {
+		t.Fatalf("正确的验证码应通过: %v", err)
 	}
-	if cookie == "" {
-		t.Fatal("没有发出登出请求")
+	st = svc.Status()
+	if st.State != StateUp {
+		t.Fatalf("状态 = %s，期望 up", st.State)
 	}
-	if cookie != "TWFID=aabbccddeeff0011" {
-		t.Errorf("登出用的是过期会话: %q", cookie)
+	if st.ClientIP != testVIP || st.PeerIP != "10.66.66.2" {
+		t.Errorf("地址 = %s / %s，期望 %s / 10.66.66.2", st.ClientIP, st.PeerIP, testVIP)
+	}
+
+	// 隧道在跑时，授信终端操作复用当前会话：不重新登录、不重建隧道。
+	if err := svc.Trust(""); err != nil {
+		t.Fatalf("绑定授信终端失败: %v", err)
+	}
+	if got := srv.Trusted(); len(got) != 1 || got[0] != "self-1" {
+		t.Errorf("服务端授信终端 = %v，期望 [self-1]", got)
+	}
+	if srv.Tunnels() != 1 {
+		t.Errorf("隧道连接数 = %d，期望 1（复用会话，不该重建）", srv.Tunnels())
+	}
+	if !strings.Contains(svc.Status().Detail, "已确认为授信终端") {
+		t.Errorf("状态说明 = %q，期望带上绑定结果", svc.Status().Detail)
+	}
+
+	if err := svc.Untrust("", true); err != nil {
+		t.Fatalf("解除全部授信失败: %v", err)
+	}
+	if got := srv.Trusted(); len(got) != 0 {
+		t.Errorf("解除全部之后仍有授信终端: %v", got)
+	}
+	if srv.Tunnels() != 1 {
+		t.Errorf("解除授信不该重建隧道，隧道连接数 = %d", srv.Tunnels())
+	}
+
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("断开失败: %v", err)
+	}
+	if svc.Status().State != StateIdle {
+		t.Errorf("断开后状态 = %s，期望 idle", svc.Status().State)
+	}
+	if n := srv.LogoutCount(); n != 1 {
+		t.Errorf("登出次数 = %d，期望 1", n)
+	}
+	if err := svc.Stop(); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("重复断开应报未运行，得到 %v", err)
 	}
 }
 
-// 验证码错误时保持 auth_pending，用户可以再输一次。
-func TestAuthWrongCodeKeepsPendingState(t *testing.T) {
-	h := newHarness(t)
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms failed. invalid code</Auth>`,
-	})
+func TestStartWithoutPasswordFails(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	cfg := newTestConfig(t, srv)
+	cfg.Password = ""
+	svc := newTestService(t, srv, cfg)
 
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	err := svc.Start(false, "")
+	if err == nil || !strings.Contains(err.Error(), "没有可用的口令") {
+		t.Fatalf("缺口令时应给出可操作的错误，得到 %v", err)
 	}
-	err := h.svc.Auth("000000")
-	if err == nil {
-		t.Fatal("验证码错误必须返回错误")
+	if svc.Status().State != StateError {
+		t.Errorf("状态 = %s，期望 error", svc.Status().State)
 	}
-	if !vpn.IsAuthCodeError(err) {
-		t.Errorf("应被识别为验证码输入错误: %v", err)
+
+	// 口令随本次请求带进来就该成功。
+	if err := svc.Start(false, testPass); err != nil {
+		t.Fatalf("带口令的启动应成功: %v", err)
 	}
-	if st := h.svc.Status().State; st != StateAuthPending {
-		t.Errorf("状态应保持 auth_pending，实际 %s", st)
+	if svc.Status().State != StateUp {
+		t.Errorf("状态 = %s，期望 up", svc.Status().State)
 	}
 }
 
-// 回归：旧隧道协程退出后把刚建立的新会话一起拆掉。
-func TestStaleTunnelExitIsIgnored(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
+func TestTrustAndUntrustLogInOnlyWhenNeeded(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
 
-	gen := h.svc.gen
-	reportTunnelExit(t, h.svc, gen-1, errors.New("上一代协程退出"))
+	// 隧道没在跑：为这次操作单独登录一次，结束后登出。
+	if err := svc.Trust(""); err != nil {
+		t.Fatalf("绑定授信终端失败: %v", err)
+	}
+	if got := srv.Trusted(); len(got) != 1 {
+		t.Errorf("服务端授信终端 = %v", got)
+	}
+	if srv.Tunnels() != 0 {
+		t.Errorf("授信终端操作不该建立隧道，收到 %d 条", srv.Tunnels())
+	}
+	if n := srv.LogoutCount(); n != 1 {
+		t.Errorf("登出次数 = %d，期望 1（这次登录只为操作）", n)
+	}
+	if got := svc.Status().State; got != StateIdle {
+		t.Errorf("状态 = %s，期望回到 idle", got)
+	}
 
-	if st := h.svc.Status().State; st != StateUp {
-		t.Errorf("过期协程不应影响当前会话，状态 = %s", st)
+	if err := svc.Untrust("", false); err != nil {
+		t.Fatalf("解除授信失败: %v", err)
 	}
-	if n := h.portal.Count("/por/logout.csp"); n != 0 {
-		t.Errorf("过期退出报告不该触发登出（%d 次）", n)
+	if got := srv.Trusted(); len(got) != 0 {
+		t.Errorf("解除之后仍有授信终端: %v", got)
 	}
-}
-
-// 当前代次的隧道断开必须收敛到 error 并释放资源。
-func TestCurrentTunnelExitTransitionsToError(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	reportTunnelExit(t, h.svc, h.svc.gen, errors.New("模拟断开"))
-
-	if st := h.svc.Status().State; st != StateError {
-		t.Errorf("状态应为 error，实际 %s", st)
-	}
-	if ip := h.svc.Status().PeerIP; ip != "" {
-		t.Errorf("error 状态不应保留 peer 地址: %q", ip)
-	}
-	if n := h.portal.Count("/por/logout.csp"); n != 1 {
-		t.Errorf("隧道断开应释放服务端会话，登出次数 = %d", n)
+	if n := srv.LogoutCount(); n != 2 {
+		t.Errorf("登出次数 = %d，期望 2", n)
 	}
 }
 
-// 回归：Start 全程持锁做网络 I/O 时，进程退出路径的登出会被永久阻塞。
-// 现在 Close 必须能打断进行中的操作并完成收尾。
-func TestCloseInterruptsLongOperation(t *testing.T) {
-	h := newHarness(t)
-	blocked := make(chan struct{})
-	h.svc.SetClientOptions(func(opts *vpn.Options) {
-		opts.HTTP = &http.Client{Transport: blockingTransport{unblock: blocked}}
-		opts.PortalTLS = h.tunnel.Dial
-		opts.TunnelTLS = h.tunnel.Dial
-	})
+func TestAuthWaitTimeoutReleasesSession(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{RequireSMS: true, VerifyCode: testCode})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
 
-	go func() { _ = h.svc.StartWithPassword("") }()
-	waitState(t, h.svc, StateLoggingIn, 2*time.Second)
+	old := authWaitTimeout
+	authWaitTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { authWaitTimeout = old })
 
-	done := make(chan struct{})
-	go func() {
-		h.svc.Close()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Close 被进行中的网络 I/O 阻塞")
+	if err := svc.Start(false, testPass); !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("应停在等验证码这一步，得到 %v", err)
 	}
-	close(blocked)
-}
-
-// 回归：任何一处 panic 都不该带走整个进程——服务端的会话还开着。
-func TestPanicInOperationIsContained(t *testing.T) {
-	h := newHarness(t)
-	h.svc.SetClientOptions(func(opts *vpn.Options) {
-		opts.HTTP = &http.Client{Transport: panicTransport{}}
-		opts.PortalTLS = h.tunnel.Dial
-		opts.TunnelTLS = h.tunnel.Dial
-	})
-
-	err := h.svc.StartWithPassword("")
-	if err == nil {
-		t.Fatal("内部错误必须返回错误")
+	waitState(t, svc, StateError)
+	if !strings.Contains(svc.Status().Detail, "等待验证码超过") {
+		t.Errorf("状态说明 = %q，期望说明超时原因", svc.Status().Detail)
 	}
-	if st := h.svc.Status().State; st != StateError {
-		t.Errorf("panic 后状态应为 error，实际 %s", st)
-	}
-
-	// 服务必须还活着：后续命令继续可用。
-	if err := h.svc.Stop(); err != nil && !errors.Is(err, ErrNotRunning) {
-		t.Errorf("panic 后服务不可用: %v", err)
-	}
-}
-
-// 状态收敛：stop 之后地址信息必须清掉，不能继续对外展示。
-func TestStopClearsAddresses(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	if err := h.svc.Stop(); err != nil {
-		t.Fatalf("Stop 失败: %v", err)
-	}
-	st := h.svc.Status()
-	if st.State != StateIdle {
-		t.Errorf("状态应为 idle，实际 %s", st.State)
-	}
-	if st.PeerIP != "" || st.ClientIP != "" {
-		t.Errorf("idle 状态不应保留地址: peer=%q client=%q", st.PeerIP, st.ClientIP)
-	}
-}
-
-// 重复 Stop 应返回 ErrNotRunning，而不是报成服务端故障。
-func TestStopWhenIdle(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.Stop(); !errors.Is(err, ErrNotRunning) {
-		t.Errorf("空闲时 Stop 应返回 ErrNotRunning，实际 %v", err)
-	}
-}
-
-// 退出路径必须尝试登出，否则服务端会留下占名额的会话。
-func TestCloseLogsOutOnce(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	h.svc.Close()
-	h.svc.Close()
-
-	if n := h.portal.Count("/por/logout.csp"); n != 1 {
+	// 超时必须登出：否则服务端那条唯一的名额会被一直占着。
+	if n := srv.LogoutCount(); n != 1 {
 		t.Errorf("登出次数 = %d，期望 1", n)
 	}
 }
 
-// Status 不经过 actor，长操作期间也必须立即可用。
-func TestStatusNeverBlocksDuringLongOperation(t *testing.T) {
-	h := newHarness(t)
-	blocked := make(chan struct{})
-	h.svc.SetClientOptions(func(opts *vpn.Options) {
-		opts.HTTP = &http.Client{Transport: blockingTransport{unblock: blocked}}
-		opts.PortalTLS = h.tunnel.Dial
-		opts.TunnelTLS = h.tunnel.Dial
-	})
-	go func() { _ = h.svc.StartWithPassword("") }()
-	waitState(t, h.svc, StateLoggingIn, 2*time.Second)
+func TestTunnelReconnectKeepsSession(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
 
-	done := make(chan Status, 1)
-	go func() { done <- h.svc.Status() }()
-	select {
-	case st := <-done:
-		if st.State != StateLoggingIn {
-			t.Errorf("状态 = %s，期望 logging_in", st.State)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Status 被长操作阻塞")
+	if err := svc.Start(false, testPass); err != nil {
+		t.Fatalf("启动失败: %v", err)
 	}
-	close(blocked)
-}
+	if srv.Tunnels() != 1 {
+		t.Fatalf("隧道连接数 = %d，期望 1", srv.Tunnels())
+	}
 
-// 命令在服务退出后必须立刻返回，不能永久挂住调用方。
-func TestCallAfterCloseReturnsError(t *testing.T) {
-	h := newHarness(t)
-	h.svc.Close()
-
-	done := make(chan error, 1)
-	go func() { done <- h.svc.StartWithPassword("") }()
-	select {
-	case err := <-done:
-		if !errors.Is(err, ErrShuttingDown) {
-			t.Errorf("退出后调用应返回 ErrShuttingDown，实际 %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("退出后调用被挂住")
+	// 掐断隧道：应自己重连，不重新登录（重登会花一条短信，也会抢名额）。
+	srv.CloseTunnel()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && srv.Tunnels() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if srv.Tunnels() < 2 {
+		t.Fatalf("隧道没有重连（连接数仍是 %d）", srv.Tunnels())
+	}
+	if n := srv.LogoutCount(); n != 0 {
+		t.Errorf("重连不该登出，登出次数 = %d", n)
+	}
+	waitState(t, svc, StateUp)
+	if svc.Status().Retrying {
+		t.Error("重连成功后不该还标着正在重连")
 	}
 }
 
-// blockingTransport 一直不返回，直到被放开或请求上下文被取消。
-type blockingTransport struct {
-	unblock chan struct{}
-}
+func TestTunnelGivingUpLandsInError(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
 
-func (b blockingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	select {
-	case <-b.unblock:
-		return nil, errors.New("测试：连接被放开")
-	case <-req.Context().Done():
-		return nil, req.Context().Err()
+	if err := svc.Start(false, testPass); err != nil {
+		t.Fatalf("启动失败: %v", err)
 	}
-}
-
-// panicTransport 在往返里 panic，用来验证 actor 的 panic 边界。
-type panicTransport struct{}
-
-func (panicTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	panic("测试用的内部错误")
-}
-
-// 回归（真机实测发现）：二次验证续用的就是 start 留下的那个会话，
-// 但如果 auth 建好新会话对象后去"释放上一个会话"，就会用同一个 TwfID
-// 把正在续用的会话登出。
-//
-// 真机表现：auth 返回成功、状态一度是 up，紧接着上行流握手被服务端以
-// Shutdown(8) 拒绝——因为会话刚被自己杀掉。这里断言续用期间**一次登出
-// 都不能发生**。
-func TestAuthContinuationDoesNotLogoutSharedSession(t *testing.T) {
-	h := newHarness(t)
-	// 服务端不返回新 TwfID，即续用登录时的那个。
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms suc</Auth>`,
-	})
-
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
-	}
-	if n := h.portal.Count("/por/logout.csp"); n != 0 {
-		t.Fatalf("还在等验证码就登出了 %d 次", n)
-	}
-
-	if err := h.svc.Auth("123456"); err != nil {
-		t.Fatalf("提交验证码失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	if n := h.portal.Count("/por/logout.csp"); n != 0 {
-		t.Errorf("续用会话期间发生了 %d 次登出——会把正在使用的会话杀掉", n)
-	}
-	// 隧道必须还能用：下行流握手不该被拒。
-	if err := h.svc.session.CheckTunnel(context.Background()); err != nil {
-		t.Errorf("续用后隧道不可用: %v", err)
+	// 关掉假服务端再掐断隧道：重连必然失败，状态要收敛成 error。
+	srv.Close()
+	srv.CloseTunnel()
+	waitState(t, svc, StateError)
+	if !strings.Contains(svc.Status().Detail, "隧道已断开") {
+		t.Errorf("状态说明 = %q，期望说明隧道已断开", svc.Status().Detail)
 	}
 }
 
-// 回归：attach 遇到共用同一 TwfID 的会话时只能释放本地资源。
-func TestAttachSameSessionDoesNotLogout(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
+func TestServerDispatchContract(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
+	s := &Server{svc: svc, closing: make(chan struct{}), quit: make(chan struct{})}
 
-	prev := h.svc.session
-	// 造一个新会话对象，但携带同一个 TwfID。
-	same, err := h.svc.client.Connect(context.Background(), vpn.ConnectOptions{
-		Username: "u",
-		Password: "p",
-		TwfID:    prev.TwfID(),
-		Trace:    &vpn.Trace{},
-	})
-	if err != nil {
-		t.Fatalf("续用失败: %v", err)
+	if resp := s.dispatch(ipc.Request{Command: "nope"}); resp.Code != ipc.CodeBadRequest {
+		t.Errorf("未知命令的状态码 = %d，期望 400", resp.Code)
 	}
-	defer same.Close(context.Background())
-
-	h.svc.attach(same)
-
-	if n := h.portal.Count("/por/logout.csp"); n != 0 {
-		t.Errorf("共用 TwfID 的会话被登出了 %d 次", n)
+	if resp := s.dispatch(ipc.Request{Command: ipc.CmdStart, Args: []string{"trust=maybe"}}); resp.Code != ipc.CodeBadRequest {
+		t.Errorf("参数写错的状态码 = %d，期望 400", resp.Code)
 	}
-}
-
-// 服务端说"没有这个会话"时，释放资源不该报成错误。
-func TestTeardownToleratesMissingServerSession(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
+	if resp := s.dispatch(ipc.Request{Command: ipc.CmdAuth, Args: []string{"123456"}}); resp.Code != ipc.CodeRejected {
+		t.Errorf("不需要验证码时提交验证码的状态码 = %d，期望 409", resp.Code)
 	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	// 之后再有人登出同一个会话，服务端会回 logout user failed。
-	h.portal.Set("/por/logout.csp", vpntest.Response{
-		Body: `<Auth><Message><![CDATA[logout user failed]]></Message></Auth>`,
-	})
-
-	if err := h.svc.Stop(); err != nil {
-		t.Errorf("会话已不存在时 Stop 不该报错: %v", err)
+	if resp := s.dispatch(ipc.Request{Command: ipc.CmdState}); resp.Code != ipc.CodeOK || resp.Message != string(StateIdle) {
+		t.Errorf("state = %d %q，期望 200 idle", resp.Code, resp.Message)
 	}
-	if st := h.svc.Status().State; st != StateIdle {
-		t.Errorf("状态应为 idle，实际 %s", st)
-	}
-}
-
-// 回归：peer 更新必须能写回配置文件，且不需要重建隧道。
-func TestSetPeerPersistsAndApplies(t *testing.T) {
-	h := newHarness(t)
-	h.svc.cfg.SetSourcePath(filepath.Join(t.TempDir(), "config.yaml"))
-	// 先写出一份能被解析的配置文件。
-	if err := os.WriteFile(h.svc.cfg.SourcePath(), []byte(
-		"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  listen_port: 51820\n  peer_public_key: \"\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	h.svc.cfg.WireGuard.PeerPublicKey = ""
-
-	peerPriv, err := wireguard.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	peerPub, err := peerPriv.PublicKey()
-	if err != nil {
-		t.Fatal(err)
+	if resp := s.dispatch(ipc.Request{Command: ipc.CmdPing}); resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, "pong") {
+		t.Errorf("ping = %d %q", resp.Code, resp.Message)
 	}
 
-	// 隧道没建立时也要接受：只写回配置。
-	if err := h.svc.SetPeer(peerPub.String()); err != nil {
-		t.Fatalf("设置 peer 失败: %v", err)
+	resp := s.dispatch(ipc.Request{Command: ipc.CmdStart, Args: []string{"trust=0", ipc.EncodeSecret(testPass)}})
+	if resp.Code != ipc.CodeOK {
+		t.Fatalf("start = %d %s", resp.Code, resp.Message)
 	}
-	if got := h.svc.cfg.WireGuard.PeerPublicKey; got != peerPub.String() {
-		t.Errorf("内存里的配置没更新: %q", got)
+	// 幂等：再看门狗式地敲一次 start 不该报错。
+	resp = s.dispatch(ipc.Request{Command: ipc.CmdStart, Args: []string{"trust=0"}})
+	if resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, "已在运行") {
+		t.Errorf("重复 start = %d %q", resp.Code, resp.Message)
 	}
-
-	raw, err := os.ReadFile(h.svc.cfg.SourcePath())
-	if err != nil {
-		t.Fatal(err)
+	// 已经在跑时带 --trust：顺带确保授信，同样报成功。
+	resp = s.dispatch(ipc.Request{Command: ipc.CmdStart, Args: []string{"trust=1"}})
+	if resp.Code != ipc.CodeOK {
+		t.Errorf("带 --trust 的重复 start = %d %q", resp.Code, resp.Message)
 	}
-	if !strings.Contains(string(raw), "peer_public_key: "+peerPub.String()) {
-		t.Errorf("配置文件没写回:\n%s", raw)
-	}
-
-	// 隧道建立后，更新应当立刻作用到设备上，且 peer 数量仍为 1。
-	if err := h.svc.StartWithPassword(""); err != nil {
-		t.Fatalf("Start 失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	second, err := wireguard.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondPub, err := second.PublicKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.svc.SetPeer(secondPub.String()); err != nil {
-		t.Fatalf("热更新 peer 失败: %v", err)
-	}
-	stats, err := h.svc.currentDevice().Stats()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(stats) != 1 {
-		t.Errorf("peer 数量 = %d，期望 1（replace_peers 应清掉旧的）", len(stats))
-	}
-	// 隧道本身不该被影响。
-	if st := h.svc.Status().State; st != StateUp {
-		t.Errorf("更新 peer 后状态变成了 %s", st)
-	}
-}
-
-// 非法公钥必须被拒绝，且不能动已有配置。
-func TestSetPeerRejectsBadKey(t *testing.T) {
-	h := newHarness(t)
-	if err := h.svc.SetPeer("not-a-key"); err == nil {
-		t.Error("非法公钥应被拒绝")
-	}
-	if err := h.svc.SetPeer(""); err == nil {
-		t.Error("空公钥应被拒绝")
-	}
-}
-
-// 回归（原 E5）：注入点以前是"整体替换 Client 的构造方式"，于是
-// Server / DialAddr 这条生产接线从没进过测试——server_ip 是个必须用的
-// 字段（校园内 DNS 解析不了域名），接错了也照样全绿。
-func TestClientOptionsUseProductionWiring(t *testing.T) {
-	h := newHarness(t)
-	h.svc.cfg.ServerIP = "203.0.113.69"
-
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
-	})
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	if got := srv.Trusted(); len(got) != 1 {
+		t.Errorf("带 --trust 的重复 start 应完成绑定，服务端授信终端 = %v", got)
 	}
 
-	if got, want := h.lastOptions.Server, h.svc.cfg.ServerAddr(); got != want {
-		t.Errorf("Server = %q，期望 %q", got, want)
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: []string{"check"}}); resp.Code != ipc.CodeOK {
+		t.Errorf("status check = %d %s", resp.Code, resp.Message)
 	}
-	if got, want := h.lastOptions.DialAddr, "203.0.113.69:443"; got != want {
-		t.Errorf("DialAddr = %q，期望 %q（server_ip 必须生效）", got, want)
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus}); resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, testVIP) {
+		t.Errorf("status = %d %q，期望带上校园网地址", resp.Code, resp.Message)
 	}
-	if h.lastOptions.Dial == nil {
-		t.Error("Dial 没接上：出站路径会直接 panic")
-	}
-}
 
-// 回归（原 C14）：隧道重连期间，对外状态必须说明"正在重连"。
-//
-// 以前重连要退避 2+4+8+16 秒才返回，这期间状态一直是 up，
-// 用户/客户端看到"已建立"却没有流量，只能以为网慢。
-func TestTunnelRetryUpdatesDetail(t *testing.T) {
-	h := newHarness(t)
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
-	})
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdUntrust, Args: []string{"all=1"}}); resp.Code != ipc.CodeOK {
+		t.Errorf("untrust all = %d %s", resp.Code, resp.Message)
 	}
-	if err := h.svc.Auth("123456"); err != nil {
-		t.Fatalf("提交验证码失败: %v", err)
+	if got := srv.Trusted(); len(got) != 0 {
+		t.Errorf("解除全部之后仍有授信终端: %v", got)
 	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
 
-	// 模拟隧道协程上报一次重连。
-	gen := h.svc.gen
-	reply := make(chan error, 1)
-	select {
-	case h.svc.cmds <- &command{kind: cmdTunnelRetry, arg: "1", gen: gen, err: errors.New("流断开"), reply: reply}:
-	case <-time.After(time.Second):
-		t.Fatal("命令通道阻塞")
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStop}); resp.Code != ipc.CodeOK {
+		t.Errorf("stop = %d %s", resp.Code, resp.Message)
+	}
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStop}); resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, "本来就没有运行") {
+		t.Errorf("重复 stop = %d %q，期望按成功处理", resp.Code, resp.Message)
+	}
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: []string{"check"}}); resp.Code != ipc.CodeRejected {
+		t.Errorf("链路不在 up 时 status check = %d，期望 409", resp.Code)
+	}
+
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdShutdown}); resp.Code != ipc.CodeOK {
+		t.Errorf("shutdown = %d %s", resp.Code, resp.Message)
 	}
 	select {
-	case <-reply:
-	case <-time.After(3 * time.Second):
-		t.Fatal("等待 actor 处理超时")
-	}
-
-	st := h.svc.Status()
-	if st.State != StateUp {
-		t.Errorf("状态应保持 up（隧道对象还在），实际 %s", st.State)
-	}
-	if !strings.Contains(st.Detail, "正在重连") {
-		t.Errorf("说明文字应提示正在重连，实际 %q", st.Detail)
-	}
-}
-
-// 过期代次的重连上报必须被忽略：否则旧协程会把新会话的状态改坏。
-func TestStaleTunnelRetryIsIgnored(t *testing.T) {
-	h := newHarness(t)
-	before := h.svc.Status()
-	reply := make(chan error, 1)
-	h.svc.cmds <- &command{kind: cmdTunnelRetry, arg: "3", gen: h.svc.gen + 99, err: errors.New("旧协程"), reply: reply}
-	select {
-	case <-reply:
-	case <-time.After(3 * time.Second):
-		t.Fatal("等待 actor 处理超时")
-	}
-	if got := h.svc.Status(); got.Detail != before.Detail {
-		t.Errorf("过期代次不该改状态：%q → %q", before.Detail, got.Detail)
-	}
-}
-
-// 回归：隧道已经在跑时再敲一次 start，报的是"状态不允许"（IPC 层映射成 409），
-// 而不是 500 —— 脚本据此区分"用法问题"和"服务端故障"。
-func TestStartOnRunningTunnelReportsBadState(t *testing.T) {
-	h := newHarness(t)
-	h.portal.Set("/por/login_psw.csp", vpntest.Response{
-		Body: `<Auth><Result>1</Result><NextAuth>2</NextAuth><NextService>auth/sms</NextService></Auth>`,
-	})
-	h.portal.Set("/por/login_sms.csp", vpntest.Response{
-		Body: `<Auth><ErrorCode>1</ErrorCode><USER_PHONE>****</USER_PHONE><SmsSendInterval>178</SmsSendInterval></Auth>`,
-	})
-	h.portal.Set("/por/login_sms1.csp", vpntest.Response{
-		Body: `<Auth>Auth sms suc</Auth><TwfID>aabbccddeeff0011</TwfID>`,
-	})
-	if err := h.svc.StartWithPassword(""); !errors.Is(err, ErrAuthRequired) {
-		t.Fatalf("Start 应停在等待验证码，实际 %v", err)
-	}
-	if err := h.svc.Auth("123456"); err != nil {
-		t.Fatalf("提交验证码失败: %v", err)
-	}
-	waitState(t, h.svc, StateUp, 3*time.Second)
-
-	err := h.svc.StartWithPassword("")
-	if !errors.Is(err, ErrBadState) {
-		t.Fatalf("隧道已在运行时 start 应返回 ErrBadState，实际 %v", err)
-	}
-	// 已经在跑的隧道不该被这次调用拆掉。
-	if st := h.svc.Status().State; st != StateUp {
-		t.Errorf("状态被改成了 %s", st)
-	}
-}
-
-// 回归：退出期间挤进 actor 的命令必须被拒绝。
-//
-// Close 已经走过登出，此时若还执行 start，就会新建一条没人管的会话，
-// 而服务端同一账号只允许一个客户端——下次启动会直接建不上隧道。
-func TestDispatchRejectsCommandAfterClose(t *testing.T) {
-	h := newHarness(t)
-	h.svc.Close()
-
-	// 模拟"关闭瞬间 actor 恰好取到了一条排队中的命令"。
-	cmd := &command{kind: cmdStart, reply: make(chan error, 1)}
-	h.svc.dispatch(cmd)
-
-	select {
-	case err := <-cmd.reply:
-		if !errors.Is(err, ErrShuttingDown) {
-			t.Errorf("关闭后的命令应被拒绝，得到 %v", err)
-		}
+	case <-s.Done():
 	default:
-		t.Fatal("关闭后的命令没有收到回复")
+		t.Error("shutdown 之后服务端应进入退出流程")
 	}
 }
+
+func TestServerMapsAuthRequiredToPrompt(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{RequireSMS: true, VerifyCode: testCode})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
+	s := &Server{svc: svc, closing: make(chan struct{}), quit: make(chan struct{})}
+
+	resp := s.dispatch(ipc.Request{Command: ipc.CmdStart, Args: []string{"trust=0", ipc.EncodeSecret(testPass)}})
+	if resp.Code != ipc.CodeAuthRequired {
+		t.Fatalf("start = %d %s，期望 428", resp.Code, resp.Message)
+	}
+	if !strings.Contains(resp.Message, "138****0000") {
+		t.Errorf("428 的文案应带上验证码发到哪了，得到 %q", resp.Message)
+	}
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdAuth, Args: []string{testCode}}); resp.Code != ipc.CodeOK {
+		t.Errorf("提交验证码 = %d %s", resp.Code, resp.Message)
+	}
+}
+
+var _ = ztna.AsRejected

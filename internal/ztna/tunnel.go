@@ -1,0 +1,471 @@
+package ztna
+
+import (
+	"bufio"
+	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/libra0037/nju-vpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/l3"
+)
+
+const (
+	// 心跳间隔。服务端在无心跳约 40 秒后断开，15 秒留了足够余量。
+	heartbeatInterval = 15 * time.Second
+	// 连续多少次心跳没回就把连接判死。15×3=45 秒，比服务端的
+	// 40 秒宽松一点，先由服务端断开也是可以接受的。
+	heartbeatMissLimit = 3
+	// 扫描待鉴权流的间隔。
+	authScanInterval = 250 * time.Millisecond
+	// 一次最多发多少条鉴权请求。
+	authBatchSize = 32
+)
+
+// tunnelConn 是一条 L3 隧道连接：TLS 之上跑本协议的帧。
+type tunnelConn struct {
+	node string
+	conn net.Conn
+	r    *bufio.Reader
+
+	ep    *l3.Endpoint
+	flows *flowTable
+	table *resourceTable
+
+	sid          string
+	deviceID     string
+	connectionID string
+	signKey      []byte
+
+	vipMu sync.RWMutex
+	vip   net.IP
+
+	writeMu sync.Mutex
+
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	closeErr  atomic.Pointer[error]
+
+	authWake     chan struct{}
+	heartbeatGap atomic.Int32
+
+	logf func(format string, args ...any)
+}
+
+type tunnelOptions struct {
+	Node     string
+	Server   string // SNI 与 Host
+	Dial     dial.DialFunc
+	Table    *resourceTable
+	Endpoint *l3.Endpoint
+	SID      string
+	DeviceID string
+	SignKey  []byte
+	Logf     func(format string, args ...any)
+}
+
+// dialTunnel 建立一条隧道连接并完成握手。返回时两个后台协程已经在跑。
+func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
+	raw, err := dialWithContext(ctx, opts.Dial, "tcp", opts.Node)
+	if err != nil {
+		return nil, fmt.Errorf("连接隧道节点 %s: %w", opts.Node, err)
+	}
+	tlsConn := tls.Client(raw, &tls.Config{
+		ServerName:         opts.Server,
+		InsecureSkipVerify: true,
+	})
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(deadline)
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("隧道节点 TLS 握手: %w", err)
+	}
+	_ = tlsConn.SetDeadline(time.Time{})
+
+	t := &tunnelConn{
+		node:         opts.Node,
+		conn:         tlsConn,
+		ep:           opts.Endpoint,
+		flows:        newFlowTable(),
+		table:        opts.Table,
+		sid:          opts.SID,
+		deviceID:     opts.DeviceID,
+		signKey:      opts.SignKey,
+		connectionID: fmt.Sprintf("%X-%d", md5.Sum([]byte(opts.DeviceID)), time.Now().UnixMicro()),
+		closeCh:      make(chan struct{}),
+		authWake:     make(chan struct{}, 1),
+		logf:         opts.Logf,
+	}
+	if t.logf == nil {
+		t.logf = func(string, ...any) {}
+	}
+
+	br := bufio.NewReader(tlsConn)
+	if _, err := tlsConn.Write(handshakeRequest(t.sid)); err != nil {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("发送握手: %w", err)
+	}
+	res, err := readHandshake(br)
+	if err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+	t.r = br
+	t.setVIP(res.VIP)
+
+	t.ep.SetUplink(t.Send)
+	go t.readLoop()
+	go t.heartbeatLoop()
+	go t.authLoop()
+	t.logf("隧道已建立: 节点 %s，地址 %s", t.node, t.vip.String())
+	return t, nil
+}
+
+// Done 在连接关闭时关闭，供重连逻辑等待。
+func (t *tunnelConn) Done() <-chan struct{} { return t.closeCh }
+
+// Err 返回连接断开的原因；主动关闭时返回 nil。
+func (t *tunnelConn) Err() error {
+	if p := t.closeErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func (t *tunnelConn) VIP() net.IP {
+	t.vipMu.RLock()
+	defer t.vipMu.RUnlock()
+	return t.vip
+}
+
+func (t *tunnelConn) setVIP(ip net.IP) {
+	t.vipMu.Lock()
+	t.vip = append(net.IP(nil), ip...)
+	t.vipMu.Unlock()
+}
+
+func (t *tunnelConn) write(buf []byte) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	_, err := t.conn.Write(buf)
+	if err == nil {
+		t.heartbeatGap.Store(0)
+	}
+	return err
+}
+
+// Send 是上行入口：承载层每来一个 IP 包都会调它。
+//
+// 它不做 I/O 之外的等待：命中资源表之后要么直接发出去，要么缓存首包
+// 并唤醒鉴权协程。资源表没命中的包直接丢掉——发给服务端也会被丢。
+func (t *tunnelConn) Send(pkt []byte) error {
+	info, err := parsePacket(pkt)
+	if err != nil {
+		return err
+	}
+	proto := protoName(info.proto)
+	appID, groupID, ok := t.table.match(info.dstIP, proto, info.dstPort)
+	if !ok {
+		return fmt.Errorf("目标不在资源表内: %s %s:%d", proto, info.dstIP, info.dstPort)
+	}
+
+	f := t.flows.get(info.key, appID, groupID)
+	if f.state == flowFailed {
+		return fmt.Errorf("该流鉴权失败: %s", info.key)
+	}
+	token, ready := t.flows.token(info.key)
+	if !ready {
+		t.flows.cache(info.key, pkt)
+		t.wakeAuth()
+		return nil
+	}
+	frame, err := encodeDataFrame(token, pkt)
+	if err != nil {
+		return err
+	}
+	return t.write(frame)
+}
+
+func (t *tunnelConn) wakeAuth() {
+	select {
+	case t.authWake <- struct{}{}:
+	default:
+	}
+}
+
+func (t *tunnelConn) readLoop() {
+	var stream []byte
+	for {
+		fr, err := readFrame(t.r)
+		if err != nil {
+			t.close(fmt.Errorf("隧道读取: %w", err))
+			return
+		}
+		switch fr.cmd {
+		case cmdDataResp:
+			stream = append(stream, fr.payload...)
+			pkts, rest, err := splitPackets(stream)
+			if err != nil {
+				t.close(err)
+				return
+			}
+			stream = rest
+			for _, pkt := range pkts {
+				t.ep.Deliver(pkt)
+			}
+		case cmdAuthResp:
+			t.handleAuthResp(fr.status, fr.payload)
+		case cmdHeartbeatResp:
+			t.heartbeatGap.Store(0)
+		case cmdVIPUpdate:
+			t.handleVIPUpdate(fr.status, fr.payload)
+		}
+	}
+}
+
+// handleAuthResp 记录令牌并把该流缓存的包补发出去。
+//
+// 注意状态字节为 0 也可能是失败：会话失效时服务端正是这么回的。
+func (t *tunnelConn) handleAuthResp(status byte, payload []byte) {
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			ConnectToken  string `json:"connectToken"`
+			ConntrackHash uint64 `json:"conntrackHash"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		t.logf("鉴权响应无法解析: %v", err)
+		return
+	}
+	if status != 0 || resp.Code != 0 {
+		t.logf("鉴权被拒: status=%d code=%d message=%s", status, resp.Code, resp.Message)
+		t.flows.completeAuth(resp.Data.ConntrackHash, "", fmt.Errorf("鉴权被拒（%d）", resp.Code))
+		return
+	}
+	_, pending := t.flows.completeAuth(resp.Data.ConntrackHash, resp.Data.ConnectToken, nil)
+	if len(pending) == 0 {
+		return
+	}
+	frame, err := encodeDataFrame(resp.Data.ConnectToken, pending...)
+	if err != nil {
+		t.logf("补发首包失败: %v", err)
+		return
+	}
+	if err := t.write(frame); err != nil {
+		t.close(err)
+	}
+}
+
+func (t *tunnelConn) handleVIPUpdate(status byte, payload []byte) {
+	if status != 0 {
+		return
+	}
+	var resp struct {
+		Data struct {
+			VIP string `json:"vip"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil || resp.Data.VIP == "" {
+		return
+	}
+	if ip := net.ParseIP(resp.Data.VIP); ip != nil && ip.To4() != nil {
+		t.setVIP(ip)
+		t.logf("服务端更新了地址: %s", ip)
+	}
+}
+
+func (t *tunnelConn) heartbeatLoop() {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			t.flows.expire(time.Now())
+			if t.heartbeatGap.Load() >= heartbeatMissLimit {
+				t.close(fmt.Errorf("心跳连续 %d 次没有回应", heartbeatMissLimit))
+				return
+			}
+			if err := t.write(encodeHeartbeat()); err != nil {
+				t.close(err)
+				return
+			}
+			t.heartbeatGap.Add(1)
+		case <-t.closeCh:
+			return
+		}
+	}
+}
+
+func (t *tunnelConn) authLoop() {
+	ticker := time.NewTicker(authScanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.authWake:
+			if !t.dispatchAuth() {
+				return
+			}
+		case <-ticker.C:
+			if !t.dispatchAuth() {
+				return
+			}
+		case <-t.closeCh:
+			return
+		}
+	}
+}
+
+func (t *tunnelConn) dispatchAuth() bool {
+	for _, f := range t.flows.pendingAuth(authBatchSize) {
+		if err := t.sendAuthRequest(f); err != nil {
+			t.close(err)
+			return false
+		}
+		t.flows.markAuthSent(f.key)
+	}
+	return true
+}
+
+func (t *tunnelConn) sendAuthRequest(f *flow) error {
+	body, err := t.buildAuthRequest(f)
+	if err != nil {
+		return err
+	}
+	frame, err := encodeAuthRequest(body)
+	if err != nil {
+		return err
+	}
+	return t.write(frame)
+}
+
+type authIPJSON struct {
+	Atype    int    `json:"atype"`
+	Protocol int    `json:"protocol"`
+	DestAddr string `json:"destAddr"`
+	DestPort int    `json:"destPort"`
+	SrcAddr  string `json:"srcAddr"`
+	SrcPort  int    `json:"srcPort"`
+}
+
+type processJSON struct {
+	Name             string `json:"name"`
+	DigitalSignature string `json:"digital_signature"`
+	Platform         string `json:"platform"`
+	Fingerprint      string `json:"fingerprint"`
+	Description      string `json:"description"`
+	Path             string `json:"path"`
+	Version          string `json:"version"`
+	SecurityEnv      string `json:"security_env"`
+}
+
+type envJSON struct {
+	Application struct {
+		Runtime struct {
+			Process        processJSON `json:"process"`
+			ProcessTrusted string      `json:"process_trusted"`
+		} `json:"runtime"`
+	} `json:"application"`
+}
+
+type authRequestJSON struct {
+	Sid           string     `json:"sid"`
+	AppID         string     `json:"appId"`
+	URL           string     `json:"url"`
+	DeviceID      string     `json:"deviceId"`
+	ConnectionID  string     `json:"connectionId"`
+	Env           envJSON    `json:"env"`
+	ConntrackHash uint64     `json:"conntrackHash"`
+	Lang          string     `json:"lang"`
+	IP            authIPJSON `json:"ip"`
+	ProcHash      string     `json:"procHash"`
+}
+
+// buildAuthRequest 组装逐流鉴权请求。
+//
+// 签名字段单独拼在末尾：签名覆盖的是不含它的那段 JSON 字节。
+func (t *tunnelConn) buildAuthRequest(f *flow) ([]byte, error) {
+	ipProto := int(protoTCP)
+	switch f.key.proto {
+	case protoUDP:
+		ipProto = protoUDP
+	case protoICMP:
+		ipProto = protoICMP
+	}
+	vip := t.VIP()
+	procPath := "/usr/bin/njuvpn"
+	sum := sha256.Sum256([]byte(procPath))
+
+	req := authRequestJSON{
+		Sid:           t.sid,
+		AppID:         f.appID,
+		URL:           fmt.Sprintf("%s:%s:%d", protoName(f.key.proto), f.key.dst, f.key.dport),
+		DeviceID:      t.deviceID,
+		ConnectionID:  t.connectionID,
+		ConntrackHash: f.authID,
+		Lang:          "en-US",
+		IP: authIPJSON{
+			Atype: 0x0800, Protocol: ipProto,
+			DestAddr: f.key.dst, DestPort: int(f.key.dport),
+			SrcAddr: f.key.src, SrcPort: int(f.key.sport),
+		},
+		ProcHash: fmt.Sprintf("%X", sum),
+	}
+	req.Env.Application.Runtime.Process = processJSON{
+		Name: clientIdentity, DigitalSignature: "TrustAppClosed", Platform: "Linux",
+		Fingerprint: fmt.Sprintf("%X", sum), Description: "TrustAppClosed",
+		Path: procPath, Version: "TrustAppClosed", SecurityEnv: "normal",
+	}
+	req.Env.Application.Runtime.ProcessTrusted = "TRUSTED"
+	_ = vip
+
+	unsigned, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha256.New, t.signKey)
+	mac.Write(unsigned)
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return append([]byte(string(unsigned[:len(unsigned)-1])), []byte(fmt.Sprintf(",%q:%q}", "xRequestSig", upperHex(sig)))...), nil
+}
+
+func upperHex(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'a' && c <= 'f' {
+			b[i] = c - 'a' + 'A'
+		}
+	}
+	return string(b)
+}
+
+func (t *tunnelConn) close(err error) {
+	t.closeOnce.Do(func() {
+		if err != nil {
+			t.closeErr.Store(&err)
+		}
+		close(t.closeCh)
+		t.ep.ClearUplink()
+		_ = t.conn.Close()
+		if err != nil {
+			t.logf("隧道断开: %v", err)
+		}
+	})
+}
+
+// Close 供重连逻辑使用：关掉连接并注销上行回调。
+func (t *tunnelConn) Close() error {
+	t.close(nil)
+	return nil
+}

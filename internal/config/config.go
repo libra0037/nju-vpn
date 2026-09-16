@@ -25,16 +25,21 @@ type Config struct {
 	Server string `yaml:"server"`
 	// ServerIP 可选：服务端域名在本机解析不了时，直接连这个地址，
 	// 协议层仍用 Server 生成 Host 头。
-	ServerIP   string    `yaml:"server_ip"`
-	Port       int       `yaml:"port"`
-	Username   string    `yaml:"username"`
-	Password   string    `yaml:"password"`
-	TOTPSecret string    `yaml:"totp_secret"`
-	Proxy      string    `yaml:"proxy"`
-	WireGuard  WireGuard `yaml:"wireguard"`
-	IPC        IPC       `yaml:"ipc"`
-	MTU        int       `yaml:"mtu"`
-	Log        Log       `yaml:"log"`
+	ServerIP string `yaml:"server_ip"`
+	Port     int    `yaml:"port"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	// LoginDomain 是口令登录的域。服务端通常给出多个可选域，
+	// 留空时用返回的第一个口令方式。
+	LoginDomain string `yaml:"login_domain"`
+	// DeviceID 是本机在服务端那边的设备标识。它决定"授信终端"绑的是谁，
+	// 首次启动自动生成并写回配置文件——换了它就要重新做一次短信认证。
+	DeviceID  string    `yaml:"device_id"`
+	Proxy     string    `yaml:"proxy"`
+	WireGuard WireGuard `yaml:"wireguard"`
+	IPC       IPC       `yaml:"ipc"`
+	MTU       int       `yaml:"mtu"`
+	Log       Log       `yaml:"log"`
 }
 
 type WireGuard struct {
@@ -114,7 +119,7 @@ func Load(path string) (*Config, error) {
 
 // restrictPermissions 把配置文件的权限收紧到 0600，返回要提示用户的话。
 //
-// 配置里有校园网口令、TOTP 密钥与 WireGuard 私钥，0644 会让它们顺手进备份、
+// 配置里有校园网口令、设备标识与 WireGuard 私钥，0644 会让它们顺手进备份、
 // 进打包给别人排查的压缩包、进镜像快照。这不是隔离边界（挡不住 root，
 // 也挡不住同账户的进程），只是别让它默认摊开。
 //
@@ -292,8 +297,11 @@ func (c *Config) Warnings() []string {
 	if c.WireGuard.PeerPublicKey == "" {
 		out = append(out, "未配置 wireguard.peer_public_key，任何客户端都无法接入")
 	}
-	if c.TOTPSecret == "" {
-		out = append(out, "未配置 totp_secret，二次验证时需要人工输入验证码")
+	if c.LoginDomain == "" {
+		out = append(out, "未配置 login_domain，将使用服务端返回的第一个口令登录方式")
+	}
+	if c.DeviceID == "" {
+		out = append(out, "未配置 device_id，启动时会自动生成并写回配置文件")
 	}
 	if c.Password == "" {
 		out = append(out, "未配置 password，njuvpn start 会提示输入（只留在服务进程内存里）")
@@ -340,6 +348,55 @@ func validateHost(field, host string) error {
 // 私钥与正在跑的那个进程内存里的不一致——之后所有客户端配置都会失效。
 func PersistPrivateKey(path, key string) error {
 	return persistWireGuardField(path, "private_key", key, false)
+}
+
+// PersistDeviceID 把设备标识写回配置文件（顶层字段）。
+func PersistDeviceID(path, id string) error {
+	return persistTopLevelField(path, "device_id", id, false)
+}
+
+// persistTopLevelField 就地替换顶层字段，保留注释；没有该行时追加。
+func persistTopLevelField(path, field, value string, overwrite bool) error {
+	if path == "" {
+		return fmt.Errorf("没有配置文件路径")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	insertAt := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			if insertAt < 0 {
+				insertAt = i
+			}
+			continue
+		}
+		if len(line)-len(strings.TrimLeft(line, " 	")) != 0 {
+			continue
+		}
+		if strings.HasPrefix(trimmed, field+":") {
+			if !overwrite && existingValue(line) != "" {
+				return nil
+			}
+			lines[i] = field + ": " + value + commentOf(line)
+			return writePreservingMode(path, fi, lines)
+		}
+		if insertAt < 0 {
+			insertAt = i + 1
+		}
+	}
+	if insertAt < 0 {
+		insertAt = len(lines)
+	}
+	lines = append(lines[:insertAt], append([]string{field + ": " + value}, lines[insertAt:]...)...)
+	return writePreservingMode(path, fi, lines)
 }
 
 // PersistPeerPublicKey 把客户端公钥写回配置文件。
@@ -461,9 +518,20 @@ func (c *Config) ServerAddr() string {
 }
 
 // DialAddr 返回实际连接地址。配置了 server_ip 时优先用它。
+//
+// 它是给拨号用的：本机解析不了学校域名时（校园网内经常如此），业务上仍然
+// 用 server 生成 Host 头与 SNI，只有 TCP 连到 server_ip。
 func (c *Config) DialAddr() string {
 	if c.ServerIP != "" {
 		return net.JoinHostPort(c.ServerIP, strconv.Itoa(c.Port))
 	}
 	return ""
+}
+
+// ConnectAddr 返回需要实际建连的地址：优先 server_ip，否则用 server。
+func (c *Config) ConnectAddr() string {
+	if addr := c.DialAddr(); addr != "" {
+		return addr
+	}
+	return c.ServerAddr()
 }

@@ -1,8 +1,15 @@
 // Package service 是服务进程的主体：状态机加上隧道生命周期。
 //
 // 结构上是一个 actor：所有会改状态的操作都被送到单条命令通道上串行执行，
-// 因此"状态"不需要用锁保护，也不会出现两个操作同时动同一份资源。
-// 对外的只读查询走一份独立的快照，永远不会被正在进行的网络 I/O 挡住。
+// 因此状态不需要用锁保护，也不会出现两个操作同时动同一份资源。对外的
+// 只读查询走一份独立的快照，永远不会被正在进行的网络 I/O 挡住。
+//
+// 三条贯穿全包的规则：
+//
+//   - 不在持锁时做网络 I/O；
+//   - 半完成的登录必须留下来（拿着它才登得出去），不能丢掉，否则服务端
+//     那条"同一账号只允许一个客户端"的名额要等它自己超时才释放；
+//   - 隧道协程的每一条汇报都带代次，过期汇报不许改状态。
 package service
 
 import (
@@ -16,9 +23,8 @@ type State string
 
 const (
 	StateIdle        State = "idle"         // 未连接
-	StateLoggingIn   State = "logging_in"   // 正在登录
+	StateLoggingIn   State = "logging_in"   // 正在登录 / 建隧道
 	StateAuthPending State = "auth_pending" // 等待用户提交验证码
-	StateConnecting  State = "connecting"   // 正在建立承载
 	StateUp          State = "up"           // 隧道已通
 	StateError       State = "error"        // 上一次操作失败
 )
@@ -29,9 +35,9 @@ type Status struct {
 	Detail string `json:"detail,omitempty"`
 	// Retrying 表示链路已经断开、正在退避重连。
 	//
-	// 这时状态仍是 up（隧道对象与承载层都还在，重连成功后不需要重建），
-	// 但链路是断的——只看 State 的话，status -check 会把断了的链路报成正常，
-	// 巡检脚本因此永远发现不了。
+	// 这时状态仍是 up（登录会话、隧道对象与承载层都还在，重连成功后不必
+	// 重建它们），但链路是断的——只看 State 的话，巡检脚本会把断了的链路
+	// 报成正常，因此它必须能单独看见。
 	Retrying bool   `json:"retrying,omitempty"`
 	ClientIP string `json:"client_ip,omitempty"` // 校园网分配的地址
 	PeerIP   string `json:"peer_ip,omitempty"`   // 客户端 peer 的地址
@@ -58,10 +64,9 @@ type Identity struct {
 // 没有恢复路径的状态机是运维事故的温床。
 var transitions = map[State][]State{
 	StateIdle:        {StateLoggingIn, StateError},
-	StateLoggingIn:   {StateAuthPending, StateConnecting, StateIdle, StateError},
-	StateAuthPending: {StateLoggingIn, StateConnecting, StateIdle, StateError},
-	StateConnecting:  {StateUp, StateIdle, StateError},
-	StateUp:          {StateIdle, StateError},
+	StateLoggingIn:   {StateAuthPending, StateUp, StateIdle, StateError},
+	StateAuthPending: {StateLoggingIn, StateUp, StateIdle, StateError},
+	StateUp:          {StateIdle, StateError, StateLoggingIn},
 	StateError:       {StateIdle, StateLoggingIn, StateError},
 }
 
@@ -87,8 +92,8 @@ func (s *statusStore) Get() Status {
 // set 迁移到 next 状态。
 //
 // 非法迁移会写日志并照样迁移：调用点分布在错误路径上，返回错误只会被
-// 丢掉（以前 8 个调用点里有 5 个写成下划线），结果是状态静默停在原地，
-// 对外还是一个看起来正常的状态，比迁移错误本身更难排查。
+// 丢掉，结果是状态静默停在原地，对外还是一个看起来正常的状态，比迁移
+// 错误本身更难排查。
 func (s *statusStore) set(next State, detail string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,7 +105,7 @@ func (s *statusStore) set(next State, detail string) {
 	s.applyLocked(next, detail)
 }
 
-// setDetail 只更新说明文字。
+// setDetail 只更新说明文字，状态不变。
 func (s *statusStore) setDetail(detail string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

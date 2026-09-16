@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/l3"
 )
 
 // ipv4Pkt 造一个长度合法的 IPv4 包（最小头部 + 指定大小的载荷）。
@@ -25,9 +25,9 @@ func ipv4Pkt(src, dst [4]byte, payload int) []byte {
 	return pkt
 }
 
-func newTestRelay(t *testing.T) (*Relay, *vpn.TunnelEndpoint) {
+func newTestRelay(t *testing.T) (*Relay, *l3.Endpoint) {
 	t.Helper()
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	r := NewRelay(RelayOptions{MTU: 1320})
 	r.InstallSession(ep, nil)
 	t.Cleanup(func() { r.Close() })
@@ -196,7 +196,7 @@ func TestRelayWriteWithoutSession(t *testing.T) {
 
 // 上行包必须经过地址改写：客户端用 peer 地址，隧道里必须用隧道地址。
 func TestRelayAppliesMapperOnUplink(t *testing.T) {
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +227,7 @@ func TestRelayAppliesMapperOnUplink(t *testing.T) {
 
 // 下行包必须改回 peer 地址，否则客户端认不出这个包是自己的。
 func TestRelayAppliesMapperOnDownlink(t *testing.T) {
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +253,7 @@ func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 // 客户端的 ip 与 wireguard.peer_address 不一致——只表现为
 // "隧道是 up 的，但一个包都过不去"，日志里没有任何线索。
 func TestDropReasonsAreDistinguished(t *testing.T) {
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)

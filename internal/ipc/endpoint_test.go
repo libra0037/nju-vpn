@@ -18,9 +18,9 @@ func TestEndpointForIsStableForSameConfig(t *testing.T) {
 
 // TestEndpointForDependsOnlyOnPath 验证端点只依赖路径身份。
 //
-// 内容是会变的：服务进程启动时会往配置里写回 WireGuard 私钥，
-// wg-peer 会写回客户端公钥。按内容派生的话，端点在第一次启动后就漂移，
-// CLI 再也找不到正在跑的那个进程。
+// 内容是会变的：服务进程启动时会往配置里写回自动生成的设备标识与
+// WireGuard 私钥。按内容派生的话，端点在第一次启动后就漂移，命令行再也
+// 找不到正在跑的那个进程。
 func TestEndpointForDependsOnlyOnPath(t *testing.T) {
 	path := writeConfig(t, t.TempDir(), "config.yaml")
 	before := EndpointFor(path)

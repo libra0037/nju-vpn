@@ -1,18 +1,16 @@
 package wireguard
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.zx2c4.com/wireguard/device"
 
-	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/l3"
 )
 
 // DeviceOptions 是创建 WireGuard 承载设备的参数。
@@ -47,6 +45,9 @@ type Device struct {
 	// relay 是同一个对象的另一种视角：会话换绑要经过它。
 	relay *Relay
 
+	listenPort int
+	listenHost ListenHost
+
 	closeOnce sync.Once
 }
 
@@ -78,7 +79,12 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		return nil, fmt.Errorf("启动 WireGuard 设备: %w", err)
 	}
 
-	return &Device{dev: dev, relay: relay}, nil
+	return &Device{
+		dev:        dev,
+		relay:      relay,
+		listenPort: opts.ListenPort,
+		listenHost: opts.ListenHost,
+	}, nil
 }
 
 // uapiConfig 组装设备级配置：私钥与监听端口。
@@ -106,7 +112,7 @@ func peerConfig(pub Key, addr net.IP) (string, error) {
 }
 
 // SetSession 把承载层接到一次校园网会话上。
-func (d *Device) SetSession(ep *vpn.TunnelEndpoint, mapper *Mapper) {
+func (d *Device) SetSession(ep *l3.Endpoint, mapper *Mapper) {
 	d.relay.InstallSession(ep, mapper)
 }
 
@@ -150,28 +156,12 @@ func (d *Device) ClearPeer() error {
 	return nil
 }
 
-// uapiConfig 是一次 IpcGet 的解析结果。
+// deviceConfig 是一次 IpcGet 的解析结果。
 //
-// 以前 ListenPort 与 Stats 各自把整份 UAPI 配置序列化并解析一遍，
-// 而且 Stats 用指向切片元素的指针，靠"同一 peer 的字段总在下一个 append
-// 之前写完"才成立——按索引写就没有这种隐式前提了。
+// 只解析真正用得到的字段：设备配置由本进程写下去，回读只为确认系统分配的
+// 端口。
 type deviceConfig struct {
 	listenPort int
-	peers      []PeerStats
-}
-
-// base64Key 把 UAPI 里的十六进制公钥换成 base64。
-//
-// 只有 UAPI 用十六进制：配置文件、启动日志与 wg-peer 的参数都是 base64。
-// 照搬十六进制会让 wg-stats 打出一把跟用户手里长得不一样的钥匙，想核对
-// 「接进来的到底是不是我这个客户端」就得自己再转一遍。
-// 认不出来的值原样回报：显示得难看也比丢掉一条统计强。
-func base64Key(hexKey string) string {
-	raw, err := hex.DecodeString(hexKey)
-	if err != nil || len(raw) != 32 {
-		return hexKey
-	}
-	return base64.StdEncoding.EncodeToString(raw)
 }
 
 // parseUAPI 解析 UAPI 的 key=value 文本。
@@ -182,25 +172,8 @@ func parseUAPI(out string) deviceConfig {
 		if !ok {
 			continue
 		}
-		switch key {
-		case "listen_port":
+		if key == "listen_port" {
 			cfg.listenPort, _ = strconv.Atoi(strings.TrimSpace(value))
-		case "public_key":
-			cfg.peers = append(cfg.peers, PeerStats{PublicKey: base64Key(value)})
-		case "rx_bytes":
-			if i := len(cfg.peers) - 1; i >= 0 {
-				cfg.peers[i].RxBytes, _ = strconv.ParseInt(value, 10, 64)
-			}
-		case "tx_bytes":
-			if i := len(cfg.peers) - 1; i >= 0 {
-				cfg.peers[i].TxBytes, _ = strconv.ParseInt(value, 10, 64)
-			}
-		case "last_handshake_time_sec":
-			if i := len(cfg.peers) - 1; i >= 0 {
-				if sec, _ := strconv.ParseInt(value, 10, 64); sec > 0 {
-					cfg.peers[i].LastHandshake = time.Unix(sec, 0)
-				}
-			}
 		}
 	}
 	return cfg
@@ -220,29 +193,6 @@ func (d *Device) ListenPort() (int, error) {
 	return cfg.listenPort, nil
 }
 
-// PeerStats 是某个 peer 的流量统计。
-type PeerStats struct {
-	// PublicKey 是 peer 的公钥（base64）。
-	PublicKey string
-	// RxBytes / TxBytes 是设备视角的收发字节数。
-	RxBytes int64
-	TxBytes int64
-	// LastHandshake 是最近一次握手的时间，零值表示从未握手。
-	LastHandshake time.Time
-}
-
-// Stats 返回所有 peer 的流量统计。
-//
-// 这是"隧道到底通没通"最直接的判据：Clash 一旦握手成功，
-// 这里就会有非零的收发与握手时间。
-func (d *Device) Stats() ([]PeerStats, error) {
-	cfg, err := d.config()
-	if err != nil {
-		return nil, err
-	}
-	return cfg.peers, nil
-}
-
 // config 读一次 UAPI 配置并解析。
 func (d *Device) config() (deviceConfig, error) {
 	out, err := d.dev.IpcGet()
@@ -251,6 +201,20 @@ func (d *Device) config() (deviceConfig, error) {
 	}
 	return parseUAPI(out), nil
 }
+
+// ListenPortOrDefault 返回设备实际监听的 UDP 端口。
+//
+// 端口配成 0 时由系统分配，只有回读才知道真实端口；回读失败时退到配置值，
+// 只为日志好看一点，不承担正确性。
+func (d *Device) ListenPortOrDefault() int {
+	if actual, err := d.ListenPort(); err == nil && actual > 0 {
+		return actual
+	}
+	return d.listenPort
+}
+
+// ListenHost 返回设备绑定的范围。
+func (d *Device) ListenHost() ListenHost { return d.listenHost }
 
 // Close 停止设备。可安全重复调用。
 func (d *Device) Close() error {

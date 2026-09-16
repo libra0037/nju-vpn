@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -15,11 +16,17 @@ import (
 	"golang.org/x/term"
 )
 
-// clientConfig 是命令行客户端需要的配置：只有 IPC 端点。
+// errStateUnknown 表示服务进程应答了，但答不出状态。
 //
-// 显式指定的配置文件读不出来时直接失败：端点按配置文件路径派生，此时既
-// 算不出端点，回落默认值又会打到另一个实例上——stop 与 restart 会误伤
-// 别人的服务进程，比"命令用不了"糟得多。
+// 最可能的成因是命令行与服务进程来自不同版本（端点按配置路径派生，旧进程
+// 还占着那个端点）。
+var errStateUnknown = errors.New("服务进程没有回报状态")
+
+// clientConfig 是命令行客户端需要的配置。
+//
+// 显式指定的配置文件读不出来时直接失败：端点按配置文件路径派生，此时既算
+// 不出端点，回落默认值又会打到另一个实例上——stop 与 restart 会误伤别人的
+// 服务进程，比"命令用不了"糟得多。
 func clientConfig(configPath string) (*config.Config, error) {
 	cfg, err := config.LoadForClient(configPath)
 	if err == nil {
@@ -39,8 +46,8 @@ func clientConfig(configPath string) (*config.Config, error) {
 
 // call 向服务进程发一条请求并返回响应。
 //
-// 带超时：服务进程可能在等短信验证码、或正在退避重试，
-// 没有超时的客户端会一直挂着，而用户看不出发生了什么。
+// 带超时：服务进程可能在等短信验证码、或正在退避重连，没有超时的客户端会
+// 一直挂着，而用户看不出发生了什么。
 func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response, error) {
 	conn, err := ipc.Dial(endpoint)
 	if err != nil {
@@ -64,14 +71,14 @@ func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response
 
 // endpointOf 解析出 IPC 端点。
 //
-// 显式配置了 ipc.endpoint 就用它；否则按配置文件的路径派生。后者是
-// 多实例互不打架的关键：同一台机器上的每个实例各有一份配置文件，
-// 端点自然互不相同（见 ipc.EndpointFor）。
+// 显式配置了 ipc.endpoint 就用它；否则按配置文件的路径派生。后者是多实例
+// 互不打架的关键：同一台机器上的每个实例各有一份配置文件，端点自然互不
+// 相同（见 ipc.EndpointFor）。规则只有一份，在 ipc 包里——服务进程算实例
+// 身份时用的是同一个函数。
 func endpointOf(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
-	// 规则只有一份，在 ipc 包里：服务进程算实例身份时用的是同一个函数。
 	return ipc.ResolveEndpoint(cfg.IPC.Endpoint, cfg.SourcePath())
 }
 
@@ -86,8 +93,8 @@ func endpointFor(configPath string) (string, error) {
 
 // serviceState 问服务进程当前处在什么状态。
 //
-// 用专门的 state 命令而不是从 status 的显示文本里切第一段：那行是给人看的，
-// 格式一改，判断就静默失效（而按文本写的测试还会继续通过）。
+// 用专门的 state 命令而不是从 status 的显示文本里切第一段：那行是给人看
+// 的，格式一改，判断就静默失效（而按文本写的测试还会继续通过）。
 func serviceState(endpoint string) (string, error) {
 	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdState}, 5*time.Second)
 	if err != nil {
@@ -99,46 +106,10 @@ func serviceState(endpoint string) (string, error) {
 	return strings.TrimSpace(resp.Message), nil
 }
 
-// errStateUnknown 表示服务进程应答了，但答不出状态。
+// runCommand 是那些"只发一条请求、没有位置参数"的命令的公共实现。
 //
-// 最可能的成因是命令行与服务进程来自不同版本（端点按配置路径派生，旧进程
-// 还占着那个端点）。
-var errStateUnknown = errors.New("服务进程没有回报状态")
-
-// ensureProbeIsSafe 在本机持有会话时拦一下 probe。
-//
-// probe 会完整登录一次，占掉该账号唯一的会话名额：正在跑的隧道会被服务端
-// 踢下线（同一账号只允许一条会话），短信模式下还要再花一条验证码。
-// 只是想把某个会话登掉的话，用 probe -logout -twf-id 就够。
-func ensureProbeIsSafe(cfg *config.Config) error {
-	state, err := serviceState(endpointOf(cfg))
-	switch {
-	case err == nil:
-	case errors.Is(err, errStateUnknown):
-		// 问不出"有没有会话"时保守拦住：拦错了只是让用户加 -force，
-		// 放过则会踢掉正在跑的隧道，短信模式下还白花一条验证码。
-		return fmt.Errorf("无法确认本机服务进程的状态（%v）：probe 可能另开一个会话，"+
-			"把正在跑的隧道踢下线；先 njuvpn restart 让两边版本一致，或加 -force 继续", err)
-	default:
-		return nil // 服务进程没在跑，随便探
-	}
-	switch state {
-	case string(service.StateIdle), string(service.StateError):
-		// 只有这两种状态是"本机没有会话"。
-		return nil
-	}
-	// 反过来列举放行状态，而不是列举要拦的状态：登录中（logging_in）与
-	// 建承载中（connecting）都会完整登录一次，以前它们不在黑名单里，
-	// probe 会把本机正在进行的 start 踢掉，短信模式下还多花一条验证码。
-	return fmt.Errorf("本机服务进程正持有会话（%s）：probe 会另开一个会话把它踢下线"+
-		"（同一账号只允许一条会话，短信模式下还会多花一条验证码）；"+
-		"先 njuvpn stop，或加 -force 继续", state)
-}
-
-// runCommand 是 stop 与 wg-stats 的公共实现：只发一条请求，不接受位置参数。
-//
-// 退出码语义直接由响应状态码决定，不依赖提示文案：
-// 200 算成功，其余算失败。
+// timeout 由命令自己给：一次授信终端操作可能要登录一次（含短信），超时给
+// 得跟 start 一样宽。
 func runCommand(name string, args []string, req ipc.Request, timeout time.Duration) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
@@ -149,32 +120,90 @@ func runCommand(name string, args []string, req ipc.Request, timeout time.Durati
 	if err != nil {
 		return err
 	}
-	return runAt(endpoint, req, timeout)
-}
-
-// runAt 向指定端点发一条请求，并按响应状态码决定退出码。
-//
-// 428（需要验证码）只由 start / auth 产生，而它们不走这里，所以这里
-// 没有那条分支。
-func runAt(endpoint string, req ipc.Request, timeout time.Duration) error {
 	resp, err := call(endpoint, req, timeout)
 	if err != nil {
 		return err
 	}
-	fmt.Println(resp.Message)
+	return finish(endpoint, resp)
+}
 
-	switch resp.Code {
-	case ipc.CodeOK:
-		return nil
-	default:
-		return fmt.Errorf("服务进程返回 %d", resp.Code)
+// maxCodeAttempts 是一次流程里最多让用户输几次验证码。
+const maxCodeAttempts = 3
+
+// finish 处理一条可能停在验证码上的响应。
+//
+// 428 表示服务端在等验证码：把提示打出来、把用户输的码送回去，然后接着看
+// 结果。验证码输错时服务进程回 400 但会话还等着，这时再给一次机会——用户
+// 手一抖不该让整条流程从头再来一遍（重新登录、重新发短信）。
+func finish(endpoint string, resp ipc.Response) error {
+	for attempts := 0; ; {
+		fmt.Println(resp.Message)
+
+		switch {
+		case resp.Code == ipc.CodeOK:
+			return nil
+		case resp.Code == ipc.CodeAuthRequired:
+			// 需要用户输验证码，走下面的提示。
+		case resp.Code == ipc.CodeBadRequest && attempts > 0 && awaitingCode(endpoint):
+			// 已经输过一次验证码又被拒：多半是码不对，而服务端还等着。
+		default:
+			return fmt.Errorf("服务进程返回 %d: %s", resp.Code, resp.Message)
+		}
+
+		if attempts >= maxCodeAttempts {
+			return fmt.Errorf("验证码连续 %d 次没有通过，已放弃：重新执行 %s start 可以再试一次", attempts, prog)
+		}
+		code, err := promptCode()
+		if err != nil {
+			return err
+		}
+		if code == "" {
+			return errors.New("验证码为空")
+		}
+		attempts++
+
+		if resp, err = call(endpoint, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, startTimeout); err != nil {
+			return err
+		}
 	}
+}
+
+// awaitingCode 报告服务进程是不是还在等验证码。
+func awaitingCode(endpoint string) bool {
+	state, err := serviceState(endpoint)
+	return err == nil && state == string(service.StateAuthPending)
+}
+
+// passwordFor 决定本次要不要现问口令。
+//
+// 配置里写了口令就用配置里的（服务进程自己会读）；没写就现问一遍，只经本地
+// 套接字传过去。stdin 是管道时也照读，便于脚本一次喂口令和验证码。
+//
+// 隧道已经在跑时不问：这条路径上的操作（start 幂等、授信终端操作复用当前
+// 会话）都不需要口令，而看门狗式脚本每隔几分钟敲一次 start，每次都停在口令
+// 提示上等于让脚本永远失败——stdin 是 /dev/null 时更是直接以一句裸 EOF 收场。
+func passwordFor(cfg *config.Config, endpoint string) (string, error) {
+	if cfg == nil || cfg.Password != "" {
+		return "", nil
+	}
+	if state, err := serviceState(endpoint); err == nil && state == string(service.StateUp) {
+		return "", nil
+	}
+	password, err := promptSecret("请输入校园网口令: ")
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", errors.New("读不到口令，且标准输入已经结束（非交互运行？）：" +
+				"请在配置文件的 password 里写入口令，或改用交互式终端运行")
+		}
+		return "", err
+	}
+	return strings.TrimSpace(password), nil
 }
 
 // stdinReader 是复用的标准输入读取器。
 //
-// 管道里可能一次喂了多行（先口令后验证码），每次新建 bufio.Reader 会把
-// 多读到的那些字节一起丢掉。
+// 管道里可能一次喂了多行（先口令后验证码），每次新建 bufio.Reader 会把多读
+// 到的那些字节一起丢掉。
 var stdinReader *bufio.Reader
 
 // readStdinLine 读一行标准输入并去掉行尾。
@@ -196,6 +225,9 @@ func promptCode() (string, error) {
 	fmt.Fprint(os.Stderr, "请输入验证码: ")
 	code, err := readStdinLine()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", errors.New("读不到验证码，且标准输入已经结束（非交互运行？）")
+		}
 		return "", err
 	}
 	return strings.TrimSpace(code), nil

@@ -16,7 +16,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
-	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/l3"
 )
 
 // 这个文件做一次真正的端到端回环：本进程的承载设备（Relay + 映射 + 假校园网隧道）
@@ -151,7 +151,7 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 	}
 
 	// 假的校园网隧道：上行包进 channel，下行包由测试注入。
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	uplinkCh := make(chan []byte, 16)
 	ep.SetUplink(func(pkt []byte) error {
 		cp := append([]byte(nil), pkt...)
@@ -182,8 +182,13 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 		t.Fatalf("配置 peer 失败: %v", err)
 	}
 
-	if stats, err := server.Stats(); err != nil || len(stats) != 1 {
-		t.Fatalf("peer 数量 = %d, err = %v，期望 1", len(stats), err)
+	// 设备里确实装上了这个 peer（UAPI 里公钥是十六进制）。
+	uapi, err := server.dev.IpcGet()
+	if err != nil {
+		t.Fatalf("读取设备配置失败: %v", err)
+	}
+	if !strings.Contains(uapi, hex.EncodeToString(clientPub[:])) {
+		t.Fatalf("设备配置里没有客户端公钥: %s", uapi)
 	}
 
 	// 客户端：一台真实的 WireGuard 设备 + 内存 TUN。
@@ -264,7 +269,7 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 		t.Fatal("测试构造有误")
 	}
 
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	uplinkCh := make(chan []byte, 4)
 	ep.SetUplink(func(pkt []byte) error {
 		select {
@@ -324,7 +329,7 @@ func TestDeviceCloseStopsForwarding(t *testing.T) {
 		t.Skip("Windows 的 ring bind 需要管理员权限")
 	}
 
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	delivered := make(chan struct{}, 1)
 	ep.SetUplink(func(pkt []byte) error {
 		select {
@@ -421,7 +426,7 @@ func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ep := vpn.NewEndpoint()
+	ep := l3.New()
 	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)

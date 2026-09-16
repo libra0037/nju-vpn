@@ -20,7 +20,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
-	"github.com/libra0037/nju-vpn/internal/vpn"
+	"github.com/libra0037/nju-vpn/internal/l3"
 )
 
 // ErrClosed 表示 relay 已经关闭。
@@ -47,7 +47,7 @@ type RelayOptions struct {
 // 不同，Mapper 就得跟着换一份。整个结构体原子替换，两个方向都不会看到
 // "上行已换新、下行还指着旧会话"这种中间状态。
 type relaySession struct {
-	ep     *vpn.TunnelEndpoint
+	ep     *l3.Endpoint
 	mapper *Mapper
 }
 
@@ -114,7 +114,7 @@ func NewRelay(opts RelayOptions) *Relay {
 //
 // 可以反复调用。换绑之后旧会话的回调立刻失效；旧会话残留的下行包即使
 // 挤进来，也会因为目的地址不等于新会话分配到的地址而被 Mapper 丢掉。
-func (r *Relay) InstallSession(ep *vpn.TunnelEndpoint, mapper *Mapper) {
+func (r *Relay) InstallSession(ep *l3.Endpoint, mapper *Mapper) {
 	r.session.Store(&relaySession{ep: ep, mapper: mapper})
 	ep.SetDownlink(r.deliver)
 }

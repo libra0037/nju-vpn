@@ -21,30 +21,32 @@ import (
 	"unicode/utf8"
 )
 
-// 请求命令。
+// 请求命令。每个命令的参数都是固定位置、固定个数，布尔值写成 名字=0/1：
+// 这样"少写一个参数"与"写错一个值"不会互相冒充。
 const (
-	CmdStart  = "start"  // 建立隧道
-	CmdStop   = "stop"   // 断开隧道
-	CmdStatus = "status" // 查询状态
-	CmdAuth   = "auth"   // 提交验证码
-	CmdPing   = "ping"   // 探活
+	// CmdPing 探活。服务进程在运行就回 pong 与自己的身份。
+	CmdPing = "ping"
+	// CmdState 只回报状态名（idle / logging_in / ...）。
+	//
+	// 与 status 分开：那段是给人看的文本，格式随时会变，而 CLI 的幂等
+	// 判断要靠状态做决定。按显示文本切第一段取值的话，显示格式一改，
+	// 判断就静默失效了。
+	CmdState = "state"
+	// CmdStatus 回报给人看的一行状态。带参数 check 时链路不在 up 就以
+	// 409 应答，给巡检脚本用。
+	CmdStatus = "status"
+	// CmdStart 建立隧道：start <trust=0|1> [口令]。
+	CmdStart = "start"
+	// CmdAuth 提交二次验证码，继续上一次停下来的登录：auth <验证码>。
+	CmdAuth = "auth"
+	// CmdTrust 把本机绑成授信终端：trust [口令]。
+	CmdTrust = "trust"
+	// CmdUntrust 解除授信：untrust <all=0|1> [口令]。
+	CmdUntrust = "untrust"
+	// CmdStop 断开隧道。
+	CmdStop = "stop"
 	// CmdShutdown 让服务进程收尾（含登出）后退出，供 njuvpn restart 使用。
 	CmdShutdown = "shutdown"
-	// CmdSetPeer 更新 WireGuard 接入方的公钥，不重建隧道。
-	CmdSetPeer = "wg-peer"
-	// CmdWGStats 查询 WireGuard 收发统计，用来判断客户端到底通没通。
-	CmdWGStats = "wg-stats"
-	// CmdState 只回报状态名（idle / up / ...）。
-	//
-	// 与 status 分开：那段是给人看的文本，格式随时会变，而 probe 的安全闸
-	// 与 start 的幂等判断要靠状态做决定。以前按 " | " 切第一段来取状态，
-	// 显示格式一改，判断就静默失效了。
-	CmdState = "state"
-	// CmdSetProxy 覆盖出站代理，由 CLI 在拉起服务进程之后立刻发送。
-	//
-	// 走 IPC 而不是子进程命令行：带口令的代理地址进了 argv 就等于对同机
-	// 其他用户公开（/proc/<pid>/cmdline 是人人可读的）。
-	CmdSetProxy = "set-proxy"
 )
 
 // 响应状态码。
@@ -201,4 +203,34 @@ func WriteRequest(w io.Writer, req Request) error {
 	parts := append([]string{req.Command}, req.Args...)
 	_, err := io.WriteString(w, strings.Join(parts, " ")+"\n")
 	return err
+}
+
+// Arg 取出第 i 个位置参数，缺失时返回空串。
+func Arg(args []string, i int) string {
+	if i < 0 || i >= len(args) {
+		return ""
+	}
+	return args[i]
+}
+
+// BoolArg 解析形如 "名字=1" 的布尔参数，缺省（空串）是 false。
+//
+// 解析失败要报错而不是当成 false：把拼错的参数静默理解成默认值，正是
+// "用户以为带了 --all，其实什么都没做"这类事故的来源。
+func BoolArg(arg, name string) (bool, error) {
+	if arg == "" {
+		return false, nil
+	}
+	v, ok := strings.CutPrefix(arg, name+"=")
+	if !ok {
+		return false, fmt.Errorf("参数 %q 不是 %s=0/1", arg, name)
+	}
+	switch v {
+	case "1":
+		return true, nil
+	case "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("参数 %s 只能是 0 或 1，收到 %q", name, v)
+	}
 }

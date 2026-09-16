@@ -16,13 +16,13 @@ import (
 )
 
 const (
-	// serviceStartTimeout 是等待刚拉起的服务进程就绪的上限。启动只做配置加载
-	// 与私钥生成（首次运行时），通常远快于这个值。
+	// serviceStartTimeout 是等待刚拉起的服务进程就绪的上限。启动只做配置
+	// 加载与私钥生成（首次运行时），通常远快于这个值。
 	serviceStartTimeout = 10 * time.Second
 	// serviceStopTimeout 是等待服务进程退出的上限（含一次登出请求）。
 	//
 	// 服务进程是先登出、再关监听（这样"端点不再响应"就等于"会话已释放"），
-	// 所以这个上限要能覆盖一次登出：登出自身有 10 秒超时，加上收尾的等待。
+	// 所以这个上限要能覆盖一次登出：登出自身有超时，加上收尾的等待。
 	serviceStopTimeout = 30 * time.Second
 	// pingTimeout 是单次探活的超时。
 	pingTimeout = 500 * time.Millisecond
@@ -30,9 +30,9 @@ const (
 
 // serviceLogPath 让服务进程的日志落在配置文件旁边。
 //
-// 被 CLI 拉起的服务进程没有控制台，日志必须有地方去；放在配置旁边的好处是
-// "启动失败"时用户知道该看哪个文件。文件名带配置名：同一目录下放多份配置时
-// 不该共用一份日志，多实例的行交错在一起，排查时容易张冠李戴。
+// 被命令行拉起的服务进程没有控制台，日志必须有地方去；放在配置旁边的好处
+// 是"启动失败"时用户知道该看哪个文件。文件名带配置名：同一目录下放多份配置
+// 时不该共用一份日志，多实例的行交错在一起，排查时容易张冠李戴。
 func serviceLogPath(configPath string) string {
 	path := configPath
 	if path == "" {
@@ -40,7 +40,7 @@ func serviceLogPath(configPath string) string {
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		// 建不出目录时落到临时目录的绝对路径：相对路径会跟着 CLI 当时的
+		// 建不出目录时落到临时目录的绝对路径：相对路径会跟着命令行当时的
 		// 工作目录走，下次就找不到这份日志了（多实例还会互相覆盖）。
 		return filepath.Join(os.TempDir(), logFileName(path))
 	}
@@ -49,12 +49,12 @@ func serviceLogPath(configPath string) string {
 
 // logFileName 给日志文件取名：njuvpn-<实例标识>-<配置名>.log。
 //
-// 配置名里只保留可移植的字符，剩下的换成下划线：这个值来自命令行给的
-// 路径，不该把路径分隔符之类的东西带进文件名。
+// 配置名里只保留可移植的字符，剩下的换成下划线：这个值来自命令行给的路径，
+// 不该把路径分隔符之类的东西带进文件名。
 //
-// 光靠清洗过的配置名区分不开实例：a b.yaml 与 a_b.yaml 清洗后同名，
-// 而这两个文件名正是要避免交错的那种情况。实例标识由路径的哈希派生，
-// 加到名字里就唯一了。
+// 光靠清洗过的配置名区分不开实例：a b.yaml 与 a_b.yaml 清洗后同名，而这两
+// 个文件名正是要避免交错的那种情况。实例标识由路径的哈希派生，加到名字里
+// 就唯一了。
 func logFileName(configPath string) string {
 	base := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
 	if base == "" || base == "." {
@@ -88,20 +88,14 @@ func pingService(endpoint string) error {
 
 // ensureService 确保服务进程在运行：连不上就拉起一个。
 //
-// 服务进程由 CLI 按需拉起，而不是装成系统服务——它不需要任何特权，
-// 也只在你要用的时候才有存在意义。
-//
-// proxy 只在本次拉起新进程时生效：服务进程启动时读配置，换代理要重启它。
-func ensureService(configPath, proxy string) error {
+// 服务进程由命令行按需拉起，而不是装成系统服务——它不需要任何特权，也只在
+// 你要用的时候才有存在意义。
+func ensureService(configPath string) error {
 	endpoint, err := endpointFor(configPath)
 	if err != nil {
 		return err
 	}
 	if err := pingService(endpoint); err == nil {
-		if proxy != "" {
-			log.Printf("服务进程已在运行，-proxy 只在拉起时生效；要换代理请用 njuvpn restart -proxy %s",
-				config.RedactProxy(proxy))
-		}
 		return nil
 	}
 
@@ -112,33 +106,7 @@ func ensureService(configPath, proxy string) error {
 	}
 	log.Printf("已拉起服务进程（日志: %s）", logPath)
 
-	if err := waitServiceReady(endpoint, logPath, exited, serviceStartTimeout); err != nil {
-		return err
-	}
-	// 代理经 IPC 送进去，而不是写进子进程的命令行：带口令的地址进了 argv
-	// 就等于对同机其他用户公开（/proc/<pid>/cmdline 是人人可读的）。
-	if proxy != "" {
-		if err := setServiceProxy(endpoint, proxy); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// setServiceProxy 把本次的代理覆盖交给刚拉起的服务进程。
-//
-// 只在拉起时下发：换代理要重启服务进程，语义与 -proxy 的文档一致。
-func setServiceProxy(endpoint, proxy string) error {
-	resp, err := call(endpoint,
-		ipc.Request{Command: ipc.CmdSetProxy, Args: []string{ipc.EncodeSecret(proxy)}},
-		serviceStartTimeout)
-	if err != nil {
-		return err
-	}
-	if resp.Code != ipc.CodeOK {
-		return fmt.Errorf("下发代理失败: 服务进程返回 %d: %s", resp.Code, resp.Message)
-	}
-	return nil
+	return waitServiceReady(endpoint, logPath, exited, serviceStartTimeout)
 }
 
 // waitServiceReady 等到服务进程开始应答，或者在它提前退出时立刻报错。
@@ -193,7 +161,7 @@ func spawnService(configPath, logPath string) (<-chan error, error) {
 		logFile.Close()
 		return nil, fmt.Errorf("启动服务进程: %w", err)
 	}
-	// 不等它：服务进程要在 CLI 退出之后继续跑。
+	// 不等它：服务进程要在命令行退出之后继续跑。
 	exited := make(chan error, 1)
 	go func() {
 		defer logFile.Close()
