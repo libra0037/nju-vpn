@@ -38,16 +38,6 @@ func (e *ErrSessionGone) Error() string {
 	return fmt.Sprintf("会话已失效（%d）: %s", e.Code, e.Message)
 }
 
-// ErrAlreadyOnline 表示账号已在别处登录（服务端限制单会话）。
-type ErrAlreadyOnline struct{ Message string }
-
-func (e *ErrAlreadyOnline) Error() string {
-	if e.Message == "" {
-		return "账号已在其他终端登录"
-	}
-	return "账号已在其他终端登录: " + e.Message
-}
-
 // ProtocolError 表示服务端返回的内容不符合预期（长度不足、字段缺失等）。
 // 协议层任何时候都不 panic，取值失败一律返回它。
 type ProtocolError struct {
@@ -74,15 +64,6 @@ func AsAuthRequired(err error) (*ErrAuthRequired, bool) {
 // AsRejected 判断错误链里是否有"服务端拒绝了这次请求"（口令或验证码错）。
 func AsRejected(err error) (*ErrCodeRejected, bool) {
 	var target *ErrCodeRejected
-	if errors.As(err, &target) {
-		return target, true
-	}
-	return nil, false
-}
-
-// AsAlreadyOnline 判断错误链里是否有"账号已在线"。
-func AsAlreadyOnline(err error) (*ErrAlreadyOnline, bool) {
-	var target *ErrAlreadyOnline
 	if errors.As(err, &target) {
 		return target, true
 	}

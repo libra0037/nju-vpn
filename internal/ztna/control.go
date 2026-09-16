@@ -61,12 +61,19 @@ func withSharedParams(extra url.Values) url.Values {
 }
 
 // 服务端错误码。只列会用到的：其余一律按"被拒绝"处理。
+//
+// 只有 75500002 有依据（五家参考实现里唯一被命名定义的一个：SID 过期后各
+// 接口一律回它、重试无法修复，另有我们自己的实测记录）。其余几个码不能凭
+// 字面猜含义：
+//   - 75500000 是重载码：口令错误（实测）、需要图形验证码、反重放随机数过期
+//     都用它，只能结合接口与 message 解释，所以口令那一步单独走 envelopeDataAuth；
+//   - 75500401"冷却期内重复请求短信、不算失败"被三家参考实现一致采用，沿用；
+//   - 75500001 / 75500005 / 75500006 在参考实现与实机记录里都没有定义或来源，
+//     所以一律按通用拒绝处理：猜成"会话失效"会让用户被登出、猜成"账号已在别处
+//     登录"会指错方向，而服务端自己的 message 已经带在错误里了。
 const (
 	codeOK             = 0
-	codeSessionGone    = 75500001 // 登录过程超时
-	codeSessionGone2   = 75500002 // 会话失效
-	codeSessionExpire  = 75500000 // 会话过期
-	codeAlreadyOnline  = 75500006 // 账号已在其他终端登录
+	codeSessionGone    = 75500002 // 会话失效
 	codeSMSAlreadySent = 75500401 // 冷却期内重复请求短信：不算失败
 )
 
@@ -223,8 +230,9 @@ func envelopeDataAuth(raw []byte) (json.RawMessage, error) {
 	return decodeEnvelope(raw, false)
 }
 
-// decodeEnvelope 是上面两个函数的公共实现。sessionCodes 为真时，会话类
-// 错误码翻成 ErrSessionGone；为假时一律当作"被拒绝"。
+// decodeEnvelope 是上面两个函数的公共实现。sessionCodes 为真时，唯一的
+// 会话失效码（75500002）翻成 ErrSessionGone；其余码一律当作"被拒绝"，
+// 服务端的 message 原样带出去。
 func decodeEnvelope(raw []byte, sessionCodes bool) (json.RawMessage, error) {
 	var e envelope
 	if err := json.Unmarshal(raw, &e); err != nil {
@@ -233,9 +241,7 @@ func decodeEnvelope(raw []byte, sessionCodes bool) (json.RawMessage, error) {
 	switch {
 	case e.Code == codeOK:
 		return e.Data, nil
-	case e.Code == codeAlreadyOnline:
-		return nil, &ErrAlreadyOnline{Message: e.Message}
-	case sessionCodes && (e.Code == codeSessionGone || e.Code == codeSessionGone2 || e.Code == codeSessionExpire):
+	case sessionCodes && e.Code == codeSessionGone:
 		return nil, &ErrSessionGone{Code: e.Code, Message: e.Message}
 	default:
 		return nil, &ErrCodeRejected{Code: e.Code, Message: e.Message}

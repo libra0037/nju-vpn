@@ -275,10 +275,6 @@ func (s *Server) errorResponse(err error) ipc.Response {
 		// 口令或验证码不对：属于用户输入问题，不是服务端故障。
 		return badRequest(err)
 	}
-	if _, ok := ztna.AsAlreadyOnline(err); ok {
-		// 服务端的会话名额被别处占着：当前状态不允许这次操作。
-		return ipc.Response{Code: ipc.CodeRejected, Message: err.Error()}
-	}
 	return ipc.Response{Code: ipc.CodeServerError, Message: err.Error()}
 }
 

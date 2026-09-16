@@ -419,6 +419,10 @@ func (s *Server) routes() *http.ServeMux {
 				return
 			}
 			if code != s.opts.VerifyCode {
+				// 这个码没有实测来源，只是"这次提交被拒"的占位：真实服务端在
+				// 这一步回什么码（75500000？别的？）没有记录，所以客户端按
+				// "通用拒绝"处理它——不能当成会话失效，否则用户打错一次验证码
+				// 就要被登出重来。
 				writeEnvelope(w, 75500005, "验证码错误", nil)
 				return
 			}
