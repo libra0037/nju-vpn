@@ -252,7 +252,7 @@ func (s *Session) prepare(ctx context.Context) error {
 	s.signKey = randomSignKey()
 	s.client.logf("隧道节点: %s", node)
 
-	conn, err := dialTunnel(ctx, s.tunnelOptions())
+	conn, err := dialTunnel(ctx, s.tunnelOptions(s.node))
 	if err != nil {
 		return err
 	}
@@ -262,9 +262,9 @@ func (s *Session) prepare(ctx context.Context) error {
 	return nil
 }
 
-func (s *Session) tunnelOptions() tunnelOptions {
+func (s *Session) tunnelOptions(node string) tunnelOptions {
 	return tunnelOptions{
-		Node:     s.node,
+		Node:     node,
 		Server:   s.client.opts.Server,
 		Dial:     s.client.opts.Dial,
 		Table:    s.table,
@@ -319,6 +319,10 @@ type LinkEvents struct {
 // 上限是必须的：服务端把会话踢掉之后，再怎么重连也连不上，无限重试只会
 // 让"隧道其实已经死了"这件事一直不显形。放弃时把错误交回上层，由它决定
 // 要不要重新登录一次（那可能需要用户再输一次验证码）。
+//
+// 上限是全局的，不是"每个节点各来一遍"：节点列表可能很长，逐个试过去要等
+// 很久，而"会话已死"这种情况在每个节点上都会失败。每次重连换下一个候选
+// 节点，连续失败 maxReconnectFailures 次（含首次尝试当前节点）就放弃。
 const (
 	maxReconnectFailures = 3
 	maxReconnectBackoff  = 30 * time.Second
@@ -328,6 +332,11 @@ const (
 //
 // 重连用的还是本次登录拿到的会话（SID 与资源表都没变），因此不必重新
 // 认证——短信模式下这一点很值钱：重连不花验证码，也不占新的名额。
+//
+// 节点按登录时那份候选列表轮换：失败一次就换下一个地址试。原先只对同一个
+// 地址退避重试，选中的节点重启或维护期间三次失败就把整条隧道判死，用户得
+// 重新登录（短信模式下还要再花一条验证码），而资源表里其他节点可能一直是
+// 好的。
 func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 	backoff := time.Second
 	attempt := 0
@@ -352,14 +361,20 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 
 		var reconnected *tunnelConn
 		var lastErr error
+		nodes := s.reconnectNodes()
+		next := 0
 		for reconnected == nil {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(backoff):
 			}
-			reconnected, lastErr = dialTunnel(ctx, s.tunnelOptions())
+			node := nodes[next%len(nodes)]
+			next++
+			reconnected, lastErr = dialTunnel(ctx, s.tunnelOptions(node))
 			if reconnected != nil {
+				// 记住这次真正连上的节点，下次断线优先回到它。
+				s.node = node
 				break
 			}
 			if ctx.Err() != nil {
@@ -387,6 +402,24 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 			events.Restored()
 		}
 	}
+}
+
+// reconnectNodes 返回重连时依次尝试的节点：当前节点优先，其余按资源表里
+// 的候选顺序排后面。列表非空（prepare 里至少选中过一个节点）。
+func (s *Session) reconnectNodes() []string {
+	out := []string{s.node}
+	if s.table == nil {
+		return out
+	}
+	seen := map[string]bool{s.node: true}
+	for _, addr := range s.table.candidateNodes(s.table.major) {
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	return out
 }
 
 // connectLoginOnly 只做登录（用于授信终端操作），不取资源也不建隧道。

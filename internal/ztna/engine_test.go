@@ -3,7 +3,10 @@ package ztna
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -271,6 +274,80 @@ func TestConnectRejectsAlreadyOnline(t *testing.T) {
 	}
 	if _, err := client.Connect(ctx, ConnectOptions{}); err != nil {
 		t.Logf("第二次登录的错误（假服务端不限制在线数）: %v", err)
+	}
+}
+
+// TestReconnectRotatesNodes 验证重连会换节点：当前节点连不上时，资源表里
+// 的下一个候选节点把隧道接起来，不必重新登录（短信模式下重登要再花一条
+// 验证码，还要抢服务端那条唯一的名额）。
+func TestReconnectRotatesNodes(t *testing.T) {
+	const (
+		nodeA = "10.9.9.1:441"
+		nodeB = "10.9.9.2:441"
+	)
+	srv := newFake(t, ztnatest.Options{Nodes: []string{nodeA, nodeB}})
+
+	// 登录时只有 A 可达，选中的必然是 A；登录之后把 A 关掉、把 B 打开，
+	// 模拟"A 重启/维护，别的节点还好着"。
+	var mu sync.Mutex
+	reachable := map[string]bool{nodeA: true}
+	dial := func(network, addr string) (net.Conn, error) {
+		if addr == srv.Addr() {
+			// 控制面走的是服务端自己的地址，不受节点开关影响。
+			return srv.Dial(network, addr)
+		}
+		mu.Lock()
+		up := reachable[addr]
+		mu.Unlock()
+		if !up {
+			return nil, fmt.Errorf("节点 %s 不可达", addr)
+		}
+		return srv.Dial(network, srv.Addr())
+	}
+	setReachable := func(a, b bool) {
+		mu.Lock()
+		reachable = map[string]bool{nodeA: a, nodeB: b}
+		mu.Unlock()
+	}
+
+	client := newTestClient(t, srv, testPass)
+	client.opts.Dial = dial // newTestClient 用的是 srv.Dial，这里换成受控的
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sess, err := client.Connect(ctx, ConnectOptions{})
+	if err != nil {
+		t.Fatalf("登录应成功: %v", err)
+	}
+	defer sess.Close(context.Background())
+	if sess.node != nodeA {
+		t.Fatalf("登录选中的节点 = %s，期望 %s", sess.node, nodeA)
+	}
+
+	restored := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- sess.Run(ctx, LinkEvents{Restored: func() { restored <- struct{}{} }})
+	}()
+
+	setReachable(false, true)
+	srv.CloseTunnel()
+
+	select {
+	case <-restored:
+	case err := <-done:
+		t.Fatalf("重连应换到下一个节点，却以失败收场: %v", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("重连没有换节点，等不到链路恢复")
+	}
+	if sess.node != nodeB {
+		t.Errorf("重连之后的节点 = %s，期望 %s", sess.node, nodeB)
+	}
+	if n := srv.LogoutCount(); n != 0 {
+		t.Errorf("重连不该登出，登出次数 = %d", n)
+	}
+	if n := srv.Tunnels(); n < 2 {
+		t.Errorf("服务端上的隧道连接数 = %d，期望至少 2", n)
 	}
 }
 
