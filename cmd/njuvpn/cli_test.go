@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,38 @@ func TestParseInterleavedKeepsOrderAndFlags(t *testing.T) {
 	fs2 := flag.NewFlagSet("test2", flag.ContinueOnError)
 	if _, err := parseInterleaved(fs2, []string{"-nope"}); err == nil {
 		t.Error("未知 flag 应报错")
+	}
+}
+
+// TestCommandsRejectPositionalArgs 验证多写的位置参数会被当成用法错误。
+//
+// 这些命令都不接受位置参数，静默丢掉的话 `untrust all` 会降级成"只解绑本机"，
+// 提示语却跟真做了全量一样——一个安全操作被悄悄降级。
+func TestCommandsRejectPositionalArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func([]string) error
+		args []string
+	}{
+		{"untrust", cmdUntrust, []string{"all"}},
+		{"trust", cmdTrust, []string{"self"}},
+		{"status", cmdStatus, []string{"extra"}},
+		{"stop", cmdStop, []string{"foo"}},
+		{"start", cmdStart, []string{"extra"}},
+		{"restart", cmdRestart, []string{"extra"}},
+		{"run", cmdRun, []string{"extra"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := c.run(c.args)
+			var ue *usageError
+			if !errors.As(err, &ue) {
+				t.Fatalf("多余的位置参数应报用法错误，得到 %v", err)
+			}
+			if want := c.args[0]; !strings.Contains(err.Error(), want) {
+				t.Errorf("错误里应指出多写的参数 %q，得到 %q", want, err)
+			}
+		})
 	}
 }
 

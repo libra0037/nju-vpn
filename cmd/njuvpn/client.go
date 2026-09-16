@@ -113,7 +113,7 @@ func serviceState(endpoint string) (string, error) {
 func runCommand(name string, args []string, req ipc.Request, timeout time.Duration) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 	endpoint, err := endpointFor(*configPath)

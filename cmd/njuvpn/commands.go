@@ -18,7 +18,7 @@ import (
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 
@@ -118,7 +118,7 @@ func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	trust := fs.Bool("trust", false, "把本机绑成授信终端（之后登录免二次验证）")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 
@@ -153,7 +153,7 @@ func cmdStart(args []string) error {
 func cmdTrust(args []string) error {
 	fs := flag.NewFlagSet("trust", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 	return deviceCommand(*configPath, ipc.CmdTrust, nil)
@@ -164,7 +164,7 @@ func cmdUntrust(args []string) error {
 	fs := flag.NewFlagSet("untrust", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	all := fs.Bool("all", false, "解除该账号下全部授信终端，不只是本机")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 	return deviceCommand(*configPath, ipc.CmdUntrust, []string{boolArg("all", *all)})
@@ -205,7 +205,7 @@ func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	check := fs.Bool("check", false, "链路不在 up 状态时以非 0 退出（给巡检脚本用）")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 	endpoint, err := endpointFor(*configPath)
@@ -234,7 +234,7 @@ func cmdStatus(args []string) error {
 func cmdRestart(args []string) error {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	if _, err := parseInterleaved(fs, args); err != nil {
+	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
 

@@ -10,6 +10,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -88,9 +89,20 @@ func main() {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", prog, err)
+		var ue *usageError
+		if errors.As(err, &ue) {
+			usage()
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
+
+// usageError 表示命令行写法不对（比如多写了位置参数）。退出码 2 与"未知
+// 命令"一致：脚本可以据此区分"这条命令根本没执行"与"执行了但失败"。
+type usageError struct{ msg string }
+
+func (e *usageError) Error() string { return e.msg }
 
 // parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。
 //
@@ -110,4 +122,20 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 		positional = append(positional, args[0])
 		args = args[1:]
 	}
+}
+
+// parseNoPositional 是各命令的入口：解析出 flag，并拒绝多余的位置参数。
+//
+// 这些命令都不接受位置参数，而"解析出位置参数再丢掉"会把 `untrust all` 降级
+// 成"只解绑本机"——提示语还跟真做了全量一样，一个安全操作被悄悄降级；
+// `status extra`、`stop foo` 同理。宁可报用法错误并打印用法。
+func parseNoPositional(fs *flag.FlagSet, args []string) error {
+	rest, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) > 0 {
+		return &usageError{fmt.Sprintf("%s: 不接受位置参数，多写了 %q", fs.Name(), rest[0])}
+	}
+	return nil
 }
