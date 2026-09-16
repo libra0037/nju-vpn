@@ -160,6 +160,9 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 		}
 		binary.BigEndian.PutUint16(buf[off:], c)
 
+	case protocolICMP:
+		m.rewriteICMPInner(buf, hdr, old, new)
+
 	default:
 		// 还有别的协议把地址算进校验和（SCTP 132、DCCP 33、UDP-Lite 136）。
 		// 不白名单化：ICMP 这类没有伪头校验和的协议会被误伤，而校园网里
@@ -170,6 +173,90 @@ func (m *Mapper) rewriteAddr(buf []byte, hdr ipv4Header, at int, old, new [4]byt
 				protocolName(hdr.protocol))
 		}
 	}
+}
+
+// icmpCarriesOriginal 报告这种 ICMP 类型是否把"触发差错的原始报文"附在消息里。
+//
+// 3 目的不可达、4 源抑制（已废弃）、5 重定向、11 超时、12 参数问题。
+// 回显请求/应答（8/0）也带 4 字节"其余部分"，但那是标识与序号，不是报文。
+func icmpCarriesOriginal(typ byte) bool {
+	switch typ {
+	case 3, 4, 5, 11, 12:
+		return true
+	}
+	return false
+}
+
+// rewriteICMPInner 改写 ICMP 差错报文里内嵌的原始 IPv4 头。
+//
+// 差错报文把触发它的原始报文的前若干字节附在消息里，多数协议栈按内层的
+// 四元组把差错关联回套接字：内层地址与它们发出的那个包对不上，差错就被
+// 丢掉。路径 MTU 发现（需要分片那条也算在内）因此失效，大包路径黑掉，
+// 表现是"发出去了没回应"。
+//
+// 内层头不完整（差错只带了一小段，或根本不是 IPv4）就原样放过：那种报文
+// 解析不了，动了只会更糟。外层 ICMP 校验和覆盖整条消息，内层改完必须重算。
+func (m *Mapper) rewriteICMPInner(buf []byte, hdr ipv4Header, old, new [4]byte) {
+	icmp := hdr.headerLen
+	if len(buf) < icmp+icmpMinLen+ipv4MinHeader {
+		return
+	}
+	if !icmpCarriesOriginal(buf[icmp]) {
+		return
+	}
+
+	inner := icmp + icmpEmbeddedOff
+	innerHdr, err := parseIPv4(buf[inner:])
+	if err != nil {
+		return
+	}
+	// 内层两个地址里最多有一个是我们的：上行方向它是源（客户端报的是它
+	// 收到的包），下行方向它是目的。两个都查一遍就不必区分方向。
+	changed := false
+	if equal4(buf[inner+ipv4SrcOffset:], old) {
+		copy(buf[inner+ipv4SrcOffset:], new[:])
+		changed = true
+	}
+	if equal4(buf[inner+ipv4DstOffset:], old) {
+		copy(buf[inner+ipv4DstOffset:], new[:])
+		changed = true
+	}
+	if !changed {
+		return
+	}
+
+	// 内层 IP 头校验和只覆盖内层头部（最多 60 字节），重算比增量省心。
+	binary.BigEndian.PutUint16(buf[inner+ipv4ChecksumOff:], 0)
+	binary.BigEndian.PutUint16(buf[inner+ipv4ChecksumOff:],
+		checksum16(buf[inner:inner+innerHdr.headerLen]))
+
+	// 外层 ICMP 校验和覆盖整条 ICMP 消息，含内嵌报文。
+	end := icmp + (hdr.totalLen - hdr.headerLen)
+	if end > len(buf) {
+		end = len(buf)
+	}
+	binary.BigEndian.PutUint16(buf[icmp+icmpChecksumOff:], 0)
+	sum := checksum16(buf[icmp:end])
+	if sum == 0 {
+		// RFC 1071：算出来是 0 时写全 1。
+		sum = 0xffff
+	}
+	binary.BigEndian.PutUint16(buf[icmp+icmpChecksumOff:], sum)
+}
+
+// checksum16 返回 b 的 16 位反码校验和。调用方要先把 b 里的校验和字段置 0。
+func checksum16(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[i:]))
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }
 
 // hasPseudoHeaderChecksum 报告该协议是否把地址算进校验和。
@@ -218,6 +305,7 @@ const (
 	fragmentMask    = 0x1fff
 	protocolTCP     = 6
 	protocolUDP     = 17
+	protocolICMP    = 1
 	// 同样把地址算进校验和的协议：改写地址后它们的校验和会失效，
 	// 只提示一次（见 rewriteAddr 的 default 分支）。
 	protocolDCCP    = 33
@@ -226,6 +314,11 @@ const (
 	tcpChecksumOff  = 16
 	udpChecksumOff  = 6
 	udpChecksumZero = 0
+	// ICMP：8 字节头（类型、代码、校验和、其余部分），差错报文在这之后
+	// 内嵌触发它的原始报文。
+	icmpMinLen      = 8
+	icmpChecksumOff = 2
+	icmpEmbeddedOff = 8
 )
 
 func parseIPv4(buf []byte) (ipv4Header, error) {

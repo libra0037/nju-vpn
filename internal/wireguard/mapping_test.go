@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -200,4 +201,134 @@ func mustPublic(t *testing.T, m *Mapper) [4]byte {
 		t.Fatalf("取隧道地址: %v", err)
 	}
 	return addr
+}
+
+// buildICMPError 造一个携带内嵌原始报文的 ICMP 差错报文。
+func buildICMPError(src, dst [4]byte, typ, code byte, inner []byte) []byte {
+	pkt := make([]byte, ipv4MinHeader+icmpMinLen+len(inner))
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	pkt[9] = protocolICMP
+	copy(pkt[ipv4SrcOffset:], src[:])
+	copy(pkt[ipv4DstOffset:], dst[:])
+	binary.BigEndian.PutUint16(pkt[ipv4ChecksumOff:], ipChecksum(pkt[:ipv4MinHeader]))
+
+	icmp := pkt[ipv4MinHeader:]
+	icmp[0] = typ
+	icmp[1] = code
+	copy(icmp[icmpEmbeddedOff:], inner)
+	binary.BigEndian.PutUint16(icmp[icmpChecksumOff:], ipChecksum(icmp))
+	return pkt
+}
+
+// checksumOK 验证从 off 开始的 addend 长度区域（含校验和字段）校验通过。
+func checksumOK(pkt []byte, at int, length int) bool {
+	var sum uint32
+	for i := at; i+1 < at+length; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(pkt[i:]))
+	}
+	if (length)%2 == 1 {
+		sum += uint32(pkt[at+length-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return uint16(sum) == 0xffff
+}
+
+// TestMapperRewritesICMPErrorInner 验证 ICMP 差错报文里内嵌的原始报文头也跟着
+// 改写地址与校验和。
+//
+// 路径 MTU 发现靠"需要分片"这类差错把触发它的原始报文头带回来，协议栈按
+// 内层的四元组把差错关联回套接字：内层地址仍是我们改写前的地址时，差错对不
+// 上号被丢掉，大包路径就此黑掉，表现是"发出去了没回应"。
+func TestMapperRewritesICMPErrorInner(t *testing.T) {
+	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer4 := m.peerIP
+	public4 := mustPublic(t, m)
+	remote := [4]byte{202, 119, 32, 69}
+	const innerAt = ipv4MinHeader + icmpEmbeddedOff
+
+	t.Run("下行差错改内层源地址", func(t *testing.T) {
+		// 校园网路由器回给"客户端发出的那个包"的差错：外层目的地址是隧道
+		// 地址，内层原始报文的源地址也是隧道地址（改写过之后就是这个）。
+		// 真差错只带原始报文的前 28 字节，这里照做。
+		inner := buildUDP(public4, remote, []byte("big"))[:28]
+		pkt := buildICMPError(remote, public4, 3, 4, inner)
+		if _, err := m.Downlink(pkt); err != nil {
+			t.Fatalf("downlink: %v", err)
+		}
+		if got := pkt[ipv4DstOffset : ipv4DstOffset+4]; !equal4(got, peer4) {
+			t.Errorf("外层目的地址 = %v，期望 %v", net.IP(got), net.IP(peer4[:]))
+		}
+		if got := pkt[innerAt+ipv4SrcOffset : innerAt+ipv4SrcOffset+4]; !equal4(got, peer4) {
+			t.Errorf("内层源地址 = %v，期望 %v", net.IP(got), net.IP(peer4[:]))
+		}
+		if got := pkt[innerAt+ipv4DstOffset : innerAt+ipv4DstOffset+4]; !equal4(got, remote) {
+			t.Errorf("内层目的地址被改坏了: %v", net.IP(got))
+		}
+		if !checksumOK(pkt, 0, ipv4MinHeader) {
+			t.Error("外层 IP 头校验和没过")
+		}
+		if !checksumOK(pkt, innerAt, ipv4MinHeader) {
+			t.Error("内层 IP 头校验和没过")
+		}
+		if !checksumOK(pkt, ipv4MinHeader, len(pkt)-ipv4MinHeader) {
+			t.Error("ICMP 校验和没过（它覆盖内嵌报文）")
+		}
+	})
+
+	t.Run("上行差错改内层目的地址", func(t *testing.T) {
+		// 客户端协议栈对"收到的包"回差错：外层源地址是 peer，内层原始
+		// 报文的目的是 peer（它看到的就是这个地址）。
+		inner := buildUDP(remote, peer4, []byte("hi"))[:28]
+		pkt := buildICMPError(peer4, remote, 3, 3, inner)
+		if _, err := m.Uplink(pkt); err != nil {
+			t.Fatalf("uplink: %v", err)
+		}
+		if got := pkt[ipv4SrcOffset : ipv4SrcOffset+4]; !equal4(got, public4) {
+			t.Errorf("外层源地址 = %v，期望 %v", net.IP(got), net.IP(public4[:]))
+		}
+		if got := pkt[innerAt+ipv4DstOffset : innerAt+ipv4DstOffset+4]; !equal4(got, public4) {
+			t.Errorf("内层目的地址 = %v，期望 %v", net.IP(got), net.IP(public4[:]))
+		}
+		if got := pkt[innerAt+ipv4SrcOffset : innerAt+ipv4SrcOffset+4]; !equal4(got, remote) {
+			t.Errorf("内层源地址被改坏了: %v", net.IP(got))
+		}
+		if !checksumOK(pkt, ipv4MinHeader, len(pkt)-ipv4MinHeader) {
+			t.Error("ICMP 校验和没过（它覆盖内嵌报文）")
+		}
+	})
+
+	t.Run("回显报文不碰载荷", func(t *testing.T) {
+		// 回显请求（类型 8）的"其余部分"是标识与序号，后面跟的是数据，
+		// 不是内嵌报文：即使看着像 IP 头也不能动。
+		inner := buildUDP(public4, remote, []byte("x"))
+		pkt := buildICMPError(peer4, remote, 8, 0, inner)
+		want := append([]byte(nil), pkt...)
+		if _, err := m.Uplink(pkt); err != nil {
+			t.Fatalf("uplink: %v", err)
+		}
+		if got := pkt[ipv4SrcOffset : ipv4SrcOffset+4]; !equal4(got, public4) {
+			t.Errorf("外层源地址 = %v，期望 %v", net.IP(got), net.IP(public4[:]))
+		}
+		if got := pkt[ipv4MinHeader:]; !bytes.Equal(got, want[ipv4MinHeader:]) {
+			t.Error("回显报文的载荷被改动了")
+		}
+	})
+
+	t.Run("内层被截断就原样放过", func(t *testing.T) {
+		inner := buildUDP(public4, remote, []byte("big"))[:ipv4MinHeader-4]
+		pkt := buildICMPError(remote, public4, 11, 0, inner)
+		if _, err := m.Downlink(pkt); err != nil {
+			t.Fatalf("downlink: %v", err)
+		}
+		// 外层照常改写；不完整的"内层"不动，也不该崩。
+		if got := pkt[ipv4DstOffset : ipv4DstOffset+4]; !equal4(got, peer4) {
+			t.Errorf("外层目的地址 = %v，期望 %v", net.IP(got), net.IP(peer4[:]))
+		}
+	})
 }
