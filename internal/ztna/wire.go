@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strings"
 )
 
@@ -58,6 +59,9 @@ const (
 // {"data":{"vip":…,"vip6":…}}，也见过地址数组。这里不猜结构，直接把 JSON
 // 里所有字符串值递归收集起来，能解析成 IP 的就算地址。取不到就当这一帧没
 // 发生——服务端将来换形态也不会把连接搞坏。
+//
+// 对象里的键按字典序走：Go 的 map 迭代顺序是随机的，不排的话同一份载荷可能
+// 给出不同的顺序，而调用方取的是"第一个 IPv4"。
 func parseVIPListPayload(payload []byte) []net.IP {
 	var value any
 	if err := json.Unmarshal(payload, &value); err != nil {
@@ -76,8 +80,13 @@ func parseVIPListPayload(payload []byte) []net.IP {
 				walk(child)
 			}
 		case map[string]any:
-			for _, child := range typed {
-				walk(child)
+			keys := make([]string, 0, len(typed))
+			for k := range typed {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				walk(typed[k])
 			}
 		}
 	}
