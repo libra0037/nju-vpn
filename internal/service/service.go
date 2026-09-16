@@ -719,10 +719,14 @@ func (s *Service) stop() error {
 
 // finishConnect 用一次成功的连接建立承载。
 func (s *Service) finishConnect(sess *ztna.Session) error {
+	// 先接管会话再挂承载：挂载失败（没分配到地址、地址映射建不起来、装
+	// 接入方公钥失败）时这条会话已经在 s.session 上，fail → teardown 才会
+	// 发出登出。顺序反过来会让服务端的单客户端名额被一条没人持有的会话
+	// 占着，用户下一次 start 直接被拒。
+	s.attach(sess)
 	if err := s.br.attach(sess); err != nil {
 		return s.fail(err)
 	}
-	s.attach(sess)
 	s.status.setAddresses(sess.ClientIP().String(), s.br.peerAddr.String())
 	s.status.setRetrying(false)
 	// 先进入 up 再启动隧道协程：如果协程立刻就失败，tunnelDown 必须能

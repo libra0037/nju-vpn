@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"net"
 	"path/filepath"
@@ -387,4 +388,33 @@ func TestServerMapsAuthRequiredToPrompt(t *testing.T) {
 	}
 }
 
-var _ = ztna.AsRejected
+// TestConnectFailureStillLogsOut 验证承载层挂载失败时，已经登录成功的会话也会
+// 被登出。放不掉的话，控制面的“同一账号一个客户端”名额被一条没人持有的会话
+// 占住，用户下一次 start 会被拒（映射成 409），直到服务端自己超时。
+func TestConnectFailureStillLogsOut(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
+
+	client, err := svc.clientFor()
+	if err != nil {
+		t.Fatalf("构造协议客户端: %v", err)
+	}
+	sess, err := client.Connect(context.Background(), ztna.ConnectOptions{Password: testPass})
+	if err != nil {
+		t.Fatalf("登录应当成功: %v", err)
+	}
+
+	// 让承载层挂载失败：对端地址没了，地址映射建不起来。这是真实的失败
+	// 路径之一（配置写坏、设备被关掉），不必打桩。
+	svc.br.peerAddr = nil
+
+	if err := svc.finishConnect(sess); err == nil {
+		t.Fatal("承载层挂载失败时 finishConnect 应当报错")
+	}
+	if got := srv.LogoutCount(); got != 1 {
+		t.Errorf("登出 %d 次，期望 1 次（会话必须放掉，否则服务端名额被占）", got)
+	}
+	if st := svc.Status(); st.State != StateError {
+		t.Errorf("状态 = %s，期望 error", st.State)
+	}
+}
