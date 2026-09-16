@@ -160,6 +160,10 @@ func (s *Session) beginLogin(ctx context.Context) error {
 }
 
 // continueAuth 按服务端给的服务名往下走。目前只有短信需要用户参与。
+//
+// 走到需要用户参与的那一步不算错误：置好 s.step 就返回 nil，调用方看
+// s.step.Service 就知道该等验证码。把"需要验证码"表达成错误会让 Connect 在
+// 把它交给调用方之前先 Close——而 Close 内含登出，半完成的会话就此作废。
 func (s *Session) continueAuth(ctx context.Context) error {
 	for i := 0; i < 8; i++ {
 		switch s.step.Service {
@@ -173,7 +177,7 @@ func (s *Session) continueAuth(ctx context.Context) error {
 			s.step = step
 		case "auth/sms":
 			s.withAuthID = s.step.AuthID != ""
-			return &ErrAuthRequired{Kind: "sms", Hint: s.smsHint(ctx)}
+			return nil
 		default:
 			return &ProtocolError{What: "不支持的二次验证方式", Got: s.step.Service}
 		}
@@ -193,6 +197,11 @@ func (s *Session) Auth(ctx context.Context, code string) error {
 	s.step = step
 	if err := s.continueAuth(ctx); err != nil {
 		return err
+	}
+	// 服务端既没报错也没放行（例如把这次的码当成过期）：会话还活着，让用户
+	// 再输一次，别把它拆掉。
+	if s.step.Service != "" {
+		return &ErrAuthRequired{Kind: s.step.Service, Hint: s.smsHint(ctx)}
 	}
 	if s.devicesOnly {
 		return nil

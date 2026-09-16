@@ -69,6 +69,12 @@ func TestConnectWithSMSTrustAndData(t *testing.T) {
 	if !strings.Contains(authErr.Hint, "138****0000") {
 		t.Errorf("提示里应带上脱敏手机号，得到 %q", authErr.Hint)
 	}
+	// 半完成的会话必须原样留着：提前登出会把它作废，验证码就再也提交不上
+	// （假服务端按"登出即作废"建模，这里发出过登出就会在下面提交验证码时
+	// 拿到 75500002）。
+	if n := srv.LogoutCount(); n != 0 {
+		t.Fatalf("拿到验证码提示之前不该登出，已登出 %d 次", n)
+	}
 
 	hint, err := sess.SMSPrompt(ctx)
 	if err != nil {

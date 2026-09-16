@@ -83,6 +83,11 @@ type Server struct {
 
 	mu          sync.Mutex
 	smsVerified bool
+	// loggedIn 模拟服务端的会话状态：口令登录成功或验证码通过之后为真，
+	// 收到登出请求之后为假。登出之后所有需要会话的接口一律回 75500002
+	// （唯一被实测定义过的"会话失效"码），这样"提前登出"这种缺陷在离线
+	// 用例里就会立刻失败，而不是像真实服务端那样接受半完成会话的验证码。
+	loggedIn    bool
 	trusted     []string
 	tunnel      net.Conn
 	uplink      [][]byte
@@ -363,6 +368,9 @@ func (s *Server) routes() *http.ServeMux {
 			writeEnvelope(w, 400, "用户名错误: "+body.Username, nil)
 			return
 		}
+		s.mu.Lock()
+		s.loggedIn = true
+		s.mu.Unlock()
 		next := "auth/authCheck"
 		if s.opts.LegacySMSForm {
 			next = "auth/sms"
@@ -373,6 +381,9 @@ func (s *Server) routes() *http.ServeMux {
 		writeEnvelope(w, 0, "", map[string]any{})
 	})
 	mux.HandleFunc("/passport/v1/auth/authCheck", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		s.mu.Lock()
 		done := s.smsVerified
 		s.mu.Unlock()
@@ -388,9 +399,15 @@ func (s *Server) routes() *http.ServeMux {
 		writeEnvelope(w, 0, "", map[string]any{})
 	})
 	mux.HandleFunc("/passport/v1/public/phoneNumber", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		writeEnvelope(w, 0, "", map[string]any{"phoneNumber": s.opts.Phone})
 	})
 	mux.HandleFunc("/passport/v1/auth/sms", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		switch r.URL.Query().Get("action") {
 		case "sendsms":
 			s.smsSends.Add(1)
@@ -407,6 +424,7 @@ func (s *Server) routes() *http.ServeMux {
 			}
 			s.mu.Lock()
 			s.smsVerified = true
+			s.loggedIn = true
 			s.mu.Unlock()
 			writeEnvelope(w, 0, "", map[string]any{})
 		default:
@@ -414,12 +432,21 @@ func (s *Server) routes() *http.ServeMux {
 		}
 	})
 	mux.HandleFunc("/passport/v1/user/onlineInfo", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		writeEnvelope(w, 0, "", map[string]any{"username": s.opts.Username, "isOnline": true})
 	})
 	mux.HandleFunc("/controller/v1/user/clientResource", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		writeEnvelope(w, 0, "", s.resourceTable())
 	})
 	mux.HandleFunc("/passport/v1/security/queryDevice", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		s.mu.Lock()
 		trusted := append([]string(nil), s.trusted...)
 		s.mu.Unlock()
@@ -441,21 +468,47 @@ func (s *Server) routes() *http.ServeMux {
 		})
 	})
 	mux.HandleFunc("/passport/v1/security/trustDevice", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		s.trust(w, r, true)
 	})
 	mux.HandleFunc("/passport/v1/security/untrustDevice", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		s.trust(w, r, false)
 	})
 	mux.HandleFunc("/passport/v1/security/logoutDevice", func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireLogin(w) {
+			return
+		}
 		writeEnvelope(w, 0, "", map[string]any{})
 	})
 	mux.HandleFunc("/passport/v1/user/logout", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.logoutCount++
+		s.loggedIn = false
 		s.mu.Unlock()
 		writeEnvelope(w, 0, "", map[string]any{})
 	})
 	return mux
+}
+
+// requireLogin 是"这条接口要求活着的会话"的守门人：会话没了就回 75500002。
+//
+// 与真实服务端的差别只在一点：实测里真实服务端会把"只走完口令登录、还没过
+// 二次验证"的会话视作未登录，对它发登出是空操作——所以那边的提前登出不会
+// 立刻坏事。假服务端按"登出即作废"建模，正是为了让这类缺陷在离线用例里
+// 立刻暴露——回归用例否则永远绿。
+func (s *Server) requireLogin(w http.ResponseWriter) bool {
+	s.mu.Lock()
+	ok := s.loggedIn
+	s.mu.Unlock()
+	if !ok {
+		writeEnvelope(w, 75500002, "会话已失效", nil)
+	}
+	return ok
 }
 
 // trust 处理授信终端的增删。服务端只接受 idList：用别的字段名会被拒。
