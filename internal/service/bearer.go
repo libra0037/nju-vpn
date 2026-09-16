@@ -19,6 +19,13 @@ type bearer struct {
 	dev      *wireguard.Device
 	peerKey  wireguard.Key
 	peerAddr net.IP
+
+	// installedKey / installedAddr 记录设备上现在装的是哪一对。两者都没变
+	// 时 applyPeer 什么都不做：上游对 replace_peers 的语义是“清掉全部 peer
+	// 再装”，重建会作废客户端已经握好的会话密钥（它拿旧密钥发的包我们解不开，
+	// 要等它自己的密钥对到期才重新握手），表现是隧道 up 却长时间不通。
+	installedKey  wireguard.Key
+	installedAddr net.IP
 }
 
 func newBearer(cfg *config.Config) (*bearer, error) {
@@ -65,7 +72,9 @@ func (b *bearer) attach(sess *ztna.Session) error {
 	if vip == nil {
 		return fmt.Errorf("服务端没有分配校园网地址，无法建立地址映射")
 	}
-	mapper, err := wireguard.NewMapper(b.peerAddr, vip)
+	// 隧道地址可能在会话中途变（服务端下发地址列表）：映射按端点上的当前
+	// 值现取，换了地址之后上下行自动跟着走，不必重建会话或重装 peer。
+	mapper, err := wireguard.NewDynamicMapper(b.peerAddr, sess.Endpoint().LocalAddr)
 	if err != nil {
 		return fmt.Errorf("地址映射: %w", err)
 	}
@@ -81,6 +90,8 @@ func (b *bearer) detach() {
 	if err := b.dev.ClearPeer(); err != nil {
 		log.Printf("摘除 WireGuard peer 时出错: %v", err)
 	}
+	b.installedKey = wireguard.Key{}
+	b.installedAddr = nil
 	b.dev.ClearSession()
 }
 
@@ -91,9 +102,16 @@ func (b *bearer) applyPeer() error {
 	if b.peerKey.IsZero() {
 		return nil
 	}
+	// 默认按“公钥不变”处理：设备上已经是这一对就一个字节都不下发，客户端
+	// 那边的密钥对、端点与下行闸门都原样保留。
+	if !b.installedKey.IsZero() && b.installedKey == b.peerKey && b.installedAddr.Equal(b.peerAddr) {
+		return nil
+	}
 	if err := b.dev.SetPeer(b.peerKey, b.peerAddr); err != nil {
 		return fmt.Errorf("配置接入公钥: %w", err)
 	}
+	b.installedKey = b.peerKey
+	b.installedAddr = append(net.IP(nil), b.peerAddr...)
 	return nil
 }
 

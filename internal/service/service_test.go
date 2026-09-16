@@ -421,3 +421,60 @@ func TestConnectFailureStillLogsOut(t *testing.T) {
 		t.Errorf("状态 = %s，期望 error", st.State)
 	}
 }
+
+// TestAttachKeepsExistingPeer 验证公钥与地址都没变时不重装 peer。
+//
+// 重装（replace_peers）会清掉客户端已经握好的会话密钥：它拿旧密钥发的包我们
+// 解不开，要等自己的密钥对到期才重新握手，表现是隧道 up 却长时间不通。
+//
+// 判据是设备上的重装计数：公钥与地址都没变时它不该增长，真的换了
+// 公钥则必须增长（否则客户端接不进来）。
+func TestAttachKeepsExistingPeer(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	cfg := newTestConfig(t, srv)
+	// 配了 peer 公钥才会走到“装 peer”这一步。
+	peer, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.WireGuard.PeerPublicKey = peer.String()
+	svc := newTestService(t, srv, cfg)
+
+	client, err := svc.clientFor()
+	if err != nil {
+		t.Fatalf("构造协议客户端: %v", err)
+	}
+	sess, err := client.Connect(context.Background(), ztna.ConnectOptions{Password: testPass})
+	if err != nil {
+		t.Fatalf("登录应当成功: %v", err)
+	}
+	defer func() { _ = sess.Close(context.Background()) }()
+
+	if err := svc.br.attach(sess); err != nil {
+		t.Fatalf("第一次挂载: %v", err)
+	}
+	if got := svc.br.dev.PeerInstalls(); got != 1 {
+		t.Fatalf("第一次挂载应当装一次 peer，累计 %d 次", got)
+	}
+
+	// 公钥与地址都没变：不该再动设备。
+	if err := svc.br.attach(sess); err != nil {
+		t.Fatalf("重复挂载: %v", err)
+	}
+	if got := svc.br.dev.PeerInstalls(); got != 1 {
+		t.Fatalf("公钥与地址都没变却重装了 peer（累计 %d 次）——重装会作废客户端已经握好的会话密钥", got)
+	}
+
+	// 真的换了公钥仍然要重装，否则客户端接不进来。
+	other, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.br.peerKey = other
+	if err := svc.br.attach(sess); err != nil {
+		t.Fatalf("换公钥后挂载: %v", err)
+	}
+	if got := svc.br.dev.PeerInstalls(); got != 2 {
+		t.Fatalf("换了公钥应当重装 peer，累计 %d 次", got)
+	}
+}

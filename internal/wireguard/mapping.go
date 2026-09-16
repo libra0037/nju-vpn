@@ -18,24 +18,39 @@ import (
 // 分片报文的非首片没有传输层头部，整包重算无从下手，增量更新则只需知道
 // 变了哪两个 16 位字。
 type Mapper struct {
-	peerIP   [4]byte // 客户端 peer 的地址，例如 10.66.66.2
-	publicIP [4]byte // 隧道分配的地址，例如 172.29.56.18
+	peerIP [4]byte // 客户端 peer 的地址，例如 10.66.66.2
+	// public 现取隧道分配的地址，例如 172.29.56.18。
+	//
+	// 用回调而不是固定值：服务端会在会话中途下发地址（0x96，载荷是地址
+	// 列表），地址一变映射就得跟着走，否则下行每个包都因“目的地址不是隧道
+	// 地址”被丢、上行被改写成旧源地址，表现是 up 却一个包都不通。
+	public func() net.IP
 
 	// 未支持的传输层协议只提示一次，避免每包都打日志。
 	unsupportedLogged atomic.Bool
 }
 
-// NewMapper 构造地址映射。两个地址都必须是 IPv4。
+// NewMapper 构造地址映射，隧道地址固定。两个地址都必须是 IPv4。
 func NewMapper(peer, public net.IP) (*Mapper, error) {
+	return NewDynamicMapper(peer, func() net.IP { return public })
+}
+
+// NewDynamicMapper 与 NewMapper 一样，只是隧道地址由回调现取：地址在会话
+// 中途变化时映射要跟着走，不能把构造时的值冻住。回调可能被上下行两个协程
+// 并发调用，必须自己保证安全。
+func NewDynamicMapper(peer net.IP, public func() net.IP) (*Mapper, error) {
+	if public == nil {
+		return nil, fmt.Errorf("隧道地址回调为空")
+	}
 	p4, err := to4(peer)
 	if err != nil {
 		return nil, fmt.Errorf("peer 地址: %w", err)
 	}
-	q4, err := to4(public)
-	if err != nil {
+	// 构造时先要一个值，配置写错要在启动时就暴露，而不是等第一个包。
+	if _, err := to4(public()); err != nil {
 		return nil, fmt.Errorf("隧道地址: %w", err)
 	}
-	return &Mapper{peerIP: p4, publicIP: q4}, nil
+	return &Mapper{peerIP: p4, public: public}, nil
 }
 
 func to4(ip net.IP) ([4]byte, error) {
@@ -57,7 +72,11 @@ func (m *Mapper) Uplink(buf []byte) ([]byte, error) {
 	if !equal4(buf[ipv4SrcOffset:], m.peerIP) {
 		return nil, fmt.Errorf("上行包源地址不是 peer 地址 %s", net.IP(m.peerIP[:]))
 	}
-	m.rewriteAddr(buf, hdr, ipv4SrcOffset, m.peerIP, m.publicIP)
+	public, err := m.currentPublic()
+	if err != nil {
+		return nil, err
+	}
+	m.rewriteAddr(buf, hdr, ipv4SrcOffset, m.peerIP, public)
 	return buf, nil
 }
 
@@ -67,11 +86,28 @@ func (m *Mapper) Downlink(buf []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !equal4(buf[ipv4DstOffset:], m.publicIP) {
-		return nil, fmt.Errorf("下行包目的地址不是隧道地址 %s", net.IP(m.publicIP[:]))
+	public, err := m.currentPublic()
+	if err != nil {
+		return nil, err
 	}
-	m.rewriteAddr(buf, hdr, ipv4DstOffset, m.publicIP, m.peerIP)
+	if !equal4(buf[ipv4DstOffset:], public) {
+		return nil, fmt.Errorf("下行包目的地址不是隧道地址 %s", net.IP(public[:]))
+	}
+	m.rewriteAddr(buf, hdr, ipv4DstOffset, public, m.peerIP)
 	return buf, nil
+}
+
+// currentPublic 取当前隧道地址。取不到时报错：调用方会按丢包计数，比拿一个
+// 过期地址去改写安全得多。
+func (m *Mapper) currentPublic() ([4]byte, error) {
+	var out [4]byte
+	ip := m.public()
+	v4 := ip.To4()
+	if v4 == nil {
+		return out, fmt.Errorf("隧道地址不可用: %v", ip)
+	}
+	copy(out[:], v4)
+	return out, nil
 }
 
 // rewriteAddr 改掉 at 处的 4 字节地址，并同步修正 IP 头与传输层校验和。

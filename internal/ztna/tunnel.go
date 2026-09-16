@@ -165,6 +165,7 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 
 	t.r = br
 	t.setVIP(res.VIP)
+	t.ep.SetLocalAddr(res.VIP)
 
 	t.ep.SetUplink(t.Send)
 	go t.readLoop()
@@ -218,9 +219,6 @@ func (t *tunnelConn) write(buf []byte) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	_, err := t.conn.Write(buf)
-	if err == nil {
-		t.heartbeatGap.Store(0)
-	}
 	return err
 }
 
@@ -271,6 +269,10 @@ func (t *tunnelConn) readLoop() {
 			t.close(fmt.Errorf("隧道读取: %w", err))
 			return
 		}
+		// 收到任何服务端帧都算对端还活着。本地写成功不算：对端静默消失
+		// （NAT、防火墙、断电）时写入照样成功，只有“收到过东西”才说明
+		// 链路真的还在，否则有上行流量时判死形同虚设。
+		t.heartbeatGap.Store(0)
 		switch fr.cmd {
 		case cmdDataResp:
 			stream = append(stream, fr.payload...)
@@ -285,8 +287,6 @@ func (t *tunnelConn) readLoop() {
 			}
 		case cmdAuthResp:
 			t.handleAuthResp(fr.status, fr.payload)
-		case cmdHeartbeatResp:
-			t.heartbeatGap.Store(0)
 		case cmdVIPUpdate:
 			t.handleVIPUpdate(fr.status, fr.payload)
 		}
@@ -332,17 +332,21 @@ func (t *tunnelConn) handleVIPUpdate(status byte, payload []byte) {
 	if status != 0 {
 		return
 	}
-	var resp struct {
-		Data struct {
-			VIP string `json:"vip"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(payload, &resp); err != nil || resp.Data.VIP == "" {
+	// 载荷是地址列表；承载层只改写 IPv4，取第一个 IPv4 就是它要的那个。
+	for _, ip := range parseVIPListPayload(payload) {
+		v4 := ip.To4()
+		if v4 == nil {
+			continue
+		}
+		if cur := t.VIP(); cur != nil && cur.Equal(v4) {
+			return
+		}
+		t.setVIP(v4)
+		// 先让承载层跟着切，再记自己的值：顺序反了会出现“映射还在用旧地址”
+		// 的窗口，那段时间上下行都会被丢。
+		t.ep.SetLocalAddr(v4)
+		t.logf("服务端下发地址: %s（数据面已跟着切）", v4)
 		return
-	}
-	if ip := net.ParseIP(resp.Data.VIP); ip != nil && ip.To4() != nil {
-		t.setVIP(ip)
-		t.logf("服务端更新了地址: %s", ip)
 	}
 }
 

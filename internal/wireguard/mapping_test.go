@@ -90,8 +90,9 @@ func TestMapperUplinkDownlink(t *testing.T) {
 	if _, err := m.Uplink(pkt); err != nil {
 		t.Fatalf("uplink: %v", err)
 	}
-	if got := pkt[ipv4SrcOffset : ipv4SrcOffset+4]; !equal4(got, m.publicIP) {
-		t.Fatalf("上行源地址 = %v, 期望 %v", net.IP(got), net.IP(m.publicIP[:]))
+	public4 := mustPublic(t, m)
+	if got := pkt[ipv4SrcOffset : ipv4SrcOffset+4]; !equal4(got, public4) {
+		t.Fatalf("上行源地址 = %v, 期望 %v", net.IP(got), net.IP(public4[:]))
 	}
 	if got := pkt[ipv4DstOffset : ipv4DstOffset+4]; !equal4(got, dst) {
 		t.Fatalf("上行目的地址被改坏了: %v", net.IP(got))
@@ -101,13 +102,13 @@ func TestMapperUplinkDownlink(t *testing.T) {
 	}
 	// 校验和字段本身参与求和：校验和正确时，伪头部加整包之和应为 0xffff。
 	udp := pkt[20:]
-	if got := fold(pseudoHeaderSum(m.publicIP, dst, protocolUDP, len(udp)) + sumBytes(udp)); got != 0 {
+	if got := fold(pseudoHeaderSum(public4, dst, protocolUDP, len(udp)) + sumBytes(udp)); got != 0 {
 		t.Errorf("上行后 UDP 校验和校验失败，残差 = 0x%04x", got)
 	}
 
 	// 下行：目的应该是 peer，改完源仍是 public
 	remote := [4]byte{202, 119, 32, 69}
-	back := buildUDP(remote, m.publicIP, payload)
+	back := buildUDP(remote, public4, payload)
 	if _, err := m.Downlink(back); err != nil {
 		t.Fatalf("downlink: %v", err)
 	}
@@ -131,7 +132,7 @@ func TestMapperRejectsWrongDirection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pkt := buildUDP(m.publicIP, [4]byte{1, 1, 1, 1}, []byte("x"))
+	pkt := buildUDP(mustPublic(t, m), [4]byte{1, 1, 1, 1}, []byte("x"))
 	if _, err := m.Uplink(pkt); err == nil {
 		t.Error("源地址不是 peer 的包不应被上行改写")
 	}
@@ -148,14 +149,15 @@ func TestUDPChecksumZeroBecomesAllOnes(t *testing.T) {
 	}
 	src := m.peerIP
 	dst := [4]byte{202, 119, 32, 69}
+	public4 := mustPublic(t, m)
 
 	// 找一个"改写后恰好是 0"的原始校验和：16 位上的变换是双射，必然存在。
 	chosen := -1
 	for c := 0; c <= 0xffff; c++ {
 		v := updateChecksum(uint16(c),
-			binary.BigEndian.Uint16(src[0:2]), binary.BigEndian.Uint16(m.publicIP[0:2]))
+			binary.BigEndian.Uint16(src[0:2]), binary.BigEndian.Uint16(public4[0:2]))
 		v = updateChecksum(v,
-			binary.BigEndian.Uint16(src[2:4]), binary.BigEndian.Uint16(m.publicIP[2:4]))
+			binary.BigEndian.Uint16(src[2:4]), binary.BigEndian.Uint16(public4[2:4]))
 		if v == 0 {
 			chosen = c
 			break
@@ -188,4 +190,14 @@ func TestUDPZeroChecksumUntouched(t *testing.T) {
 	if got := binary.BigEndian.Uint16(pkt[20+udpChecksumOff:]); got != 0 {
 		t.Errorf("UDP 校验和本为 0，被改成了 0x%04x", got)
 	}
+}
+
+// mustPublic 取映射当前使用的隧道地址，供测试断言用。
+func mustPublic(t *testing.T, m *Mapper) [4]byte {
+	t.Helper()
+	addr, err := m.currentPublic()
+	if err != nil {
+		t.Fatalf("取隧道地址: %v", err)
+	}
+	return addr
 }

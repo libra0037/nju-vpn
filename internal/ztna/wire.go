@@ -3,9 +3,11 @@ package ztna
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 )
 
 // 线上格式。这些常量是与服务端的契约，改动前先看 wire_format_test.go：
@@ -31,7 +33,9 @@ const (
 	cmdHeartbeatReq  byte = 0x15
 	cmdHeartbeatResp byte = 0x95
 
-	// 服务端主动下发的虚拟地址变更。
+	// 服务端下发地址（三家参考实现都命名为 second VIP）：载荷是一份地址
+	// 列表，可能同时含 IPv4 与 IPv6。真正的主地址异步变更（0x97）本实现
+	// 不认识，遇到未知命令按协议错误处理并重连。
 	cmdVIPUpdate byte = 0x96
 
 	// 握手请求里携带的地址类型：1 = IPv4（虚拟地址体 6 字节）。
@@ -47,6 +51,39 @@ const (
 	// 就按协议错误收场。
 	handshakeFrameLimit = 32
 )
+
+// parseVIPListPayload 从 0x96 的载荷里尽力取出地址列表。
+//
+// 三家参考实现都把它命名为 second VIP，但载荷形态并不统一：见过
+// {"data":{"vip":…,"vip6":…}}，也见过地址数组。这里不猜结构，直接把 JSON
+// 里所有字符串值递归收集起来，能解析成 IP 的就算地址。取不到就当这一帧没
+// 发生——服务端将来换形态也不会把连接搞坏。
+func parseVIPListPayload(payload []byte) []net.IP {
+	var value any
+	if err := json.Unmarshal(payload, &value); err != nil {
+		return nil
+	}
+	var out []net.IP
+	var walk func(v any)
+	walk = func(v any) {
+		switch typed := v.(type) {
+		case string:
+			if ip := net.ParseIP(strings.TrimSpace(typed)); ip != nil {
+				out = append(out, ip)
+			}
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
+		case map[string]any:
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(value)
+	return out
+}
 
 // vipBodyLen 返回给定地址类型的虚拟地址体长度。
 //

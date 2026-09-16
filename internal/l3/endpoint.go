@@ -6,6 +6,7 @@ package l3
 
 import (
 	"errors"
+	"net"
 	"sync/atomic"
 )
 
@@ -30,10 +31,38 @@ type binding struct {
 // 并被丢掉，不影响正确性。
 type Endpoint struct {
 	binding atomic.Pointer[binding]
+
+	// local 是当前隧道地址（IPv4）。服务端会在会话中途下发地址
+	// （0x96 的载荷是地址列表），承载层按它改写地址，所以这里只是
+	// “最新值是多少”，不参与回调的原子替换。
+	local atomic.Pointer[[4]byte]
 }
 
 // New 构造一个端点。
 func New() *Endpoint { return &Endpoint{} }
+
+// SetLocalAddr 记录当前隧道地址。非 IPv4（或 nil）会被忽略：承载层只改写
+// IPv4，收到 IPv6 地址时保留原来的。
+func (ep *Endpoint) SetLocalAddr(ip net.IP) {
+	v4 := ip.To4()
+	if v4 == nil {
+		return
+	}
+	var addr [4]byte
+	copy(addr[:], v4)
+	ep.local.Store(&addr)
+}
+
+// LocalAddr 返回当前隧道地址；还没定下来时返回 nil。
+func (ep *Endpoint) LocalAddr() net.IP {
+	addr := ep.local.Load()
+	if addr == nil {
+		return nil
+	}
+	out := make(net.IP, net.IPv4len)
+	copy(out, addr[:])
+	return out
+}
 
 func (ep *Endpoint) update(change func(*binding)) {
 	for {

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.zx2c4.com/wireguard/device"
 
@@ -49,6 +51,14 @@ type Device struct {
 	listenHost ListenHost
 
 	closeOnce sync.Once
+	closed    chan struct{}
+
+	// peerInstalls 统计 SetPeer 成功下发的次数。
+	//
+	// 每次重装都会清掉设备上的 peer（replace_peers），客户端已经握好的会话
+	// 密钥随之作废，表现是隧道 up 却长时间不通。这个计数是排查时唯一能直接
+	// 看出“有没有发生重装”的证据，服务层据此判断要不要动设备。
+	peerInstalls atomic.Int64
 }
 
 // NewDevice 创建并启动承载设备。
@@ -79,12 +89,15 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		return nil, fmt.Errorf("启动 WireGuard 设备: %w", err)
 	}
 
-	return &Device{
+	d := &Device{
 		dev:        dev,
 		relay:      relay,
 		listenPort: opts.ListenPort,
 		listenHost: opts.ListenHost,
-	}, nil
+		closed:     make(chan struct{}),
+	}
+	go d.watchPeerHandshake()
+	return d, nil
 }
 
 // uapiConfig 组装设备级配置：私钥与监听端口。
@@ -136,10 +149,16 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	if err := d.dev.IpcSet(conf); err != nil {
 		return fmt.Errorf("更新 peer: %w", err)
 	}
+	d.peerInstalls.Add(1)
 	// 换了 key 就等于重新开始：客户端得重新握手，下行方向才再次放行。
 	d.relay.HoldDownlink(true)
 	return nil
 }
+
+// PeerInstalls 返回 peer 被成功下发（重装）的累计次数。
+//
+// 公钥没变时不该增长：每增长一次都意味着客户端的会话密钥被作废。
+func (d *Device) PeerInstalls() int64 { return d.peerInstalls.Load() }
 
 // ClearPeer 摘掉接入方。
 //
@@ -162,6 +181,9 @@ func (d *Device) ClearPeer() error {
 // 端口。
 type deviceConfig struct {
 	listenPort int
+	// lastHandshakeSec 是 peer 最近一次完成握手的时间（UAPI 的
+	// last_handshake_time_sec）；0 表示从没握过手。
+	lastHandshakeSec int64
 }
 
 // parseUAPI 解析 UAPI 的 key=value 文本。
@@ -174,6 +196,11 @@ func parseUAPI(out string) deviceConfig {
 		}
 		if key == "listen_port" {
 			cfg.listenPort, _ = strconv.Atoi(strings.TrimSpace(value))
+			continue
+		}
+		// 设备上只有一个 peer，所以这两行就是“客户端接进来了没有”。
+		if key == "last_handshake_time_sec" {
+			cfg.lastHandshakeSec, _ = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 		}
 	}
 	return cfg
@@ -219,8 +246,45 @@ func (d *Device) ListenHost() ListenHost { return d.listenHost }
 // Close 停止设备。可安全重复调用。
 func (d *Device) Close() error {
 	d.closeOnce.Do(func() {
+		close(d.closed)
 		// device.Close 会顺带关闭 tun（也就是 Relay），不用再关一次。
 		d.dev.Close()
 	})
 	return nil
+}
+
+// handshakeSettleInterval 是“下行闩锁松开”的探测间隔。
+//
+// 只在闩锁闭合且客户端还没露面时探测；握手一完成就不再回读设备。
+const handshakeSettleInterval = 200 * time.Millisecond
+
+// watchPeerHandshake 在闩锁闭合期间盯着设备，客户端握手一完成就放行下行。
+//
+// 为什么不问“客户端发来的数据包”：保活包与握手都不进 TUN，纯下行的客户端
+// （下载已经在跑、自己没有待发数据）永远等不到那一步，下行会一直扣着——
+// 表现就是“隧道 up 但什么都不通”。设备自己知道握手有没有完成（UAPI 的
+// last_handshake_time_sec），这是最直接的证据。
+//
+// 这里读 UAPI 是安全的：早期版本在 Relay.Read（TUN 读取协程）里读，会和
+// wireguard-go 的状态机抢锁把设备锁死，所以探测必须跑在自己的协程里。
+func (d *Device) watchPeerHandshake() {
+	ticker := time.NewTicker(handshakeSettleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.closed:
+			return
+		case <-ticker.C:
+		}
+		if !d.relay.hold.Load() || d.relay.peerSeen.Load() {
+			continue
+		}
+		cfg, err := d.config()
+		if err != nil {
+			continue
+		}
+		if cfg.lastHandshakeSec > 0 {
+			d.relay.peerSeen.Store(true)
+		}
+	}
 }
