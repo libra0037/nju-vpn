@@ -2,6 +2,7 @@ package ztna
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"net"
@@ -22,14 +23,27 @@ type Options struct {
 	LoginDomain string
 	DeviceID    string
 	Logf        func(format string, args ...any)
+	// InsecureSkipVerify 关闭控制面的证书校验。默认（false）走系统信任链：
+	// 门户证书是公共 CA 签发的，口令与验证码因此不再暴露给中间人。
+	InsecureSkipVerify bool
+	// NodePins 是隧道节点证书的 SHA-256 指纹（叶子证书）。
+	NodePins [][sha256.Size]byte
+	// PinsPath 是“首次记录”下来的节点指纹的落盘位置；空表示只记在内存里。
+	PinsPath string
+	// StrictNodePins 为真时只认 NodePins 给的指纹，不再对陌生节点做首次记录。
+	// 用户在配置里明确写了指纹就按他写的来。
+	StrictNodePins bool
 }
 
 // Client 是协议层门面：一次"连接"= 登录 + 取资源 + 建隧道。
 type Client struct {
 	opts Options
+	pins *nodePins
 }
 
-func New(opts Options) *Client { return &Client{opts: opts} }
+func New(opts Options) *Client {
+	return &Client{opts: opts, pins: newNodePins(opts.NodePins, opts.PinsPath, opts.StrictNodePins, opts.Logf)}
+}
 
 func (c *Client) logf(format string, args ...any) {
 	if c.opts.Logf != nil {
@@ -41,11 +55,12 @@ func (c *Client) logf(format string, args ...any) {
 
 func (c *Client) newControl(deviceID string) (*control, error) {
 	return newControl(controlOptions{
-		Server:   c.opts.Server,
-		DialAddr: c.opts.DialAddr,
-		Dial:     c.opts.Dial,
-		DeviceID: deviceID,
-		Debug:    func(s string) { c.logf("%s", s) },
+		Server:             c.opts.Server,
+		DialAddr:           c.opts.DialAddr,
+		Dial:               c.opts.Dial,
+		DeviceID:           deviceID,
+		Debug:              func(s string) { c.logf("%s", s) },
+		InsecureSkipVerify: c.opts.InsecureSkipVerify,
 	})
 }
 
@@ -249,6 +264,7 @@ func (s *Session) tunnelOptions() tunnelOptions {
 		DeviceID: s.client.opts.DeviceID,
 		SignKey:  s.signKey,
 		Logf:     s.client.logf,
+		Pins:     s.client.pins,
 	}
 }
 

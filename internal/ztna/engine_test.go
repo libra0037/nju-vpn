@@ -49,6 +49,9 @@ func newTestClient(t *testing.T, srv *ztnatest.Server, password string) *Client 
 		Password: password,
 		DeviceID: "device-test-1",
 		Logf:     t.Logf,
+		// 假服务端用自签证书，控制面的系统信任链校验在这里必然失败——
+		// 这条通道的校验由 internal/ztna/control_test.go 单独覆盖。
+		InsecureSkipVerify: true,
 	})
 }
 

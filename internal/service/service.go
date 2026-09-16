@@ -943,14 +943,36 @@ func (s *Service) clientFor() (*ztna.Client, error) {
 		return nil, errors.New("缺少 device_id：它决定授信终端绑的是哪台设备，" +
 			"应由服务进程首次启动时生成并写回配置文件")
 	}
+	// 指纹在加载时就校验过了，这里再解析一次拿到定长数组。
+	pins, err := s.cfg.NodePinHashes()
+	if err != nil {
+		return nil, err
+	}
 	return ztna.New(ztna.Options{
-		Server:      s.cfg.Server,
-		DialAddr:    s.cfg.ConnectAddr(),
-		Dial:        dialFn,
-		Username:    s.cred.username,
-		Password:    s.cred.password,
-		LoginDomain: s.cfg.LoginDomain,
-		DeviceID:    s.cfg.DeviceID,
-		Logf:        log.Printf,
+		Server:             s.cfg.Server,
+		DialAddr:           s.cfg.ConnectAddr(),
+		Dial:               dialFn,
+		Username:           s.cred.username,
+		Password:           s.cred.password,
+		LoginDomain:        s.cfg.LoginDomain,
+		DeviceID:           s.cfg.DeviceID,
+		Logf:               log.Printf,
+		InsecureSkipVerify: s.cfg.TLS.InsecureSkipVerify,
+		NodePins:           pins,
+		PinsPath:           pinsPath(s.cfg),
+		// 用户自己写了指纹就严格按他写的来；留空时用内置值，并对其他节点
+		// 按“首次记录、之后比对”处理（资源表里可能有好几台节点）。
+		StrictNodePins: len(s.cfg.TLS.PinnedNodeSHA256) > 0,
 	}), nil
+}
+
+// pinsPath 是“首次记录”下来的节点证书指纹的落盘位置。
+//
+// 放在配置文件旁边：它属于这份配置（同一台机器上不同配置可以连不同部署），
+// 而配置文件本身已经是 0600。没有来源路径时（手工构造的配置）不落盘。
+func pinsPath(cfg *config.Config) string {
+	if cfg == nil || cfg.SourcePath() == "" {
+		return ""
+	}
+	return cfg.SourcePath() + ".node-pins"
 }

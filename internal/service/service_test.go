@@ -65,6 +65,9 @@ func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 		Password: testPass,
 		DeviceID: "device-test-1",
 		MTU:      1320,
+		// 假服务端用自签证书：控制面的系统信任链校验在这里必然失败，
+		// 这条通道的校验由 internal/ztna 的用例单独覆盖。
+		TLS: config.TLS{InsecureSkipVerify: true},
 		WireGuard: config.WireGuard{
 			ListenPort:  0,
 			PrivateKey:  key.String(),

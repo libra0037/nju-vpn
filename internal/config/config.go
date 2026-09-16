@@ -3,6 +3,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -37,9 +39,27 @@ type Config struct {
 	DeviceID  string    `yaml:"device_id"`
 	Proxy     string    `yaml:"proxy"`
 	WireGuard WireGuard `yaml:"wireguard"`
+	TLS       TLS       `yaml:"tls"`
 	IPC       IPC       `yaml:"ipc"`
 	MTU       int       `yaml:"mtu"`
 	Log       Log       `yaml:"log"`
+}
+
+// TLS 是两条 TLS 通道的校验策略。
+//
+// 控制面（登录、验证码、资源表）走系统信任链：实测门户证书是公共 CA 签发的
+// （DigiCert，CN=*.nju.edu.cn），校验能直接通过，口令与验证码因此不再暴露给
+// 路上的中间人。数据面节点是自签证书（CN=sdp，与节点地址无关），链与名称都
+// 不可能校验，只能按指纹认身份。
+type TLS struct {
+	// InsecureSkipVerify 关闭控制面的证书校验。默认关闭校验=false，也就是
+	// 正常校验；只有网关换成系统不认的证书（自签、内网 CA）时才需要打开。
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	// PinnedNodeSHA256 是隧道节点证书的 SHA-256 指纹（叶子证书），可写多个。
+	// 分隔符（冒号、空格）与大小写都不敏感。留空时用内置的已知值，其余节点
+	// 按“首次记录、之后比对”处理；一旦在这里写了指纹，就只认这些值——
+	// 陌生节点会被拒绝并打印观测到的指纹，由你确认后加进来。
+	PinnedNodeSHA256 []string `yaml:"pinned_node_sha256"`
 }
 
 type WireGuard struct {
@@ -65,6 +85,59 @@ const (
 	MinMTU = 576
 	MaxMTU = 1400
 )
+
+// defaultPinnedNodeSHA256 是本部署实测过的隧道节点证书指纹。
+//
+// 节点用自签证书（CN=sdp，与节点地址无关），链与名称都校验不了，指纹是唯一
+// 可行的判据。内置已知值的好处是第一次连接就不必依赖“首次记录”，代价是换
+// 证书后要更新一次：失败信息会打印观测到的指纹与改法。
+//
+// 这里放了两条：同一个节点地址背后不止一台设备，两次实测拿到的是不同设备
+// 的证书（自签证书的 notBefore 相差 71 秒，都是出厂模板、密钥各自生成）。
+// 多写一条不会削弱校验，只是多认一台；遇到列表外的设备会按“首次记录”处理
+// （配置里显式写了指纹则改为严格模式，见 TLS.PinnedNodeSHA256）。
+var defaultPinnedNodeSHA256 = []string{
+	"53:BE:18:61:F1:94:D0:CB:2A:96:54:70:F8:B8:7E:4D:99:9D:82:B8:7C:78:29:28:5F:60:63:B4:D1:28:53:A4",
+	"21:54:05:9D:C8:84:4C:72:D8:F9:32:95:2C:D2:2E:04:9A:37:15:46:C4:E6:D1:DE:EB:5E:D1:BB:47:D1:57:54",
+}
+
+// ParseSHA256Fingerprints 把配置里的证书指纹文本解析成 32 字节。
+//
+// 允许 "AA:BB:…"、"AA BB …" 与不带分隔符三种写法，大小写不敏感。指纹不是
+// 秘密（它随每次握手发出去），但写错一个字符就永远连不上，所以错误里带上
+// 原值，让用户看得出是哪一条写坏了。
+func ParseSHA256Fingerprints(list []string) ([][sha256.Size]byte, error) {
+	out := make([][sha256.Size]byte, 0, len(list))
+	for _, raw := range list {
+		cleaned := strings.Map(func(r rune) rune {
+			switch r {
+			case ':', ' ', '\t', '-':
+				return -1
+			default:
+				return r
+			}
+		}, raw)
+		decoded, err := hex.DecodeString(cleaned)
+		if err != nil || len(decoded) != sha256.Size {
+			return nil, fmt.Errorf("证书指纹 %q 不是合法的 SHA-256（形如 AA:BB:…，共 32 字节）", raw)
+		}
+		var sum [sha256.Size]byte
+		copy(sum[:], decoded)
+		out = append(out, sum)
+	}
+	return out, nil
+}
+
+// NodePinHashes 返回该信任的节点证书指纹。
+//
+// 配置留空时用内置的已知值：那是本部署实测的指纹，装上就能直接连。
+func (c *Config) NodePinHashes() ([][sha256.Size]byte, error) {
+	list := c.TLS.PinnedNodeSHA256
+	if len(list) == 0 {
+		list = defaultPinnedNodeSHA256
+	}
+	return ParseSHA256Fingerprints(list)
+}
 
 // SourcePath 返回这份配置的来源文件路径。
 func (c *Config) SourcePath() string { return c.sourcePath }
@@ -237,6 +310,10 @@ func (c *Config) validate() error {
 	}
 	if err := validateListenHost(c.WireGuard.ListenHost); err != nil {
 		return err
+	}
+	// 指纹写错一个字符就永远连不上，必须在加载时就报出来，而不是等建隧道。
+	if _, err := ParseSHA256Fingerprints(c.TLS.PinnedNodeSHA256); err != nil {
+		return fmt.Errorf("tls.pinned_node_sha256: %w", err)
 	}
 	if ip := net.ParseIP(c.WireGuard.PeerAddress); ip == nil || ip.To4() == nil {
 		return fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址: %q", c.WireGuard.PeerAddress)

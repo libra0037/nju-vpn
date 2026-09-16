@@ -7,6 +7,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -81,6 +82,9 @@ type tunnelOptions struct {
 	// HandshakeTimeout 覆盖握手阶段的默认上限；0 表示用 defaultHandshakeTimeout。
 	// 生产调用不设它，只有测试会传一个很短的值。
 	HandshakeTimeout time.Duration
+	// Pins 认节点证书的身份；nil 表示不校验（只有直接构造 tunnelOptions 的
+	// 测试会这样）。
+	Pins *nodePins
 }
 
 // dialTunnel 建立一条隧道连接并完成握手。返回时两个后台协程已经在跑。
@@ -89,10 +93,19 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("连接隧道节点 %s: %w", opts.Node, err)
 	}
-	tlsConn := tls.Client(raw, &tls.Config{
+	tlsConfig := &tls.Config{
 		ServerName:         opts.Server,
-		InsecureSkipVerify: true,
-	})
+		InsecureSkipVerify: true, // 链与名称都不可用（自签、CN=sdp），身份由指纹认
+	}
+	if opts.Pins != nil {
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("节点 %s 没有出示证书", opts.Node)
+			}
+			return opts.Pins.verify(opts.Node, rawCerts[0])
+		}
+	}
+	tlsConn := tls.Client(raw, tlsConfig)
 
 	// 握手阶段整体带期限：TLS 与协议握手都算在内，成功后再清掉，否则会把
 	// 之后的数据面读写一起拖死。

@@ -92,6 +92,8 @@ type controlOptions struct {
 	Timeout  time.Duration
 	DeviceID string
 	Debug    func(string)
+	// InsecureSkipVerify 关闭证书校验；默认 false，也就是走系统信任链。
+	InsecureSkipVerify bool
 }
 
 func newControl(opts controlOptions) (*control, error) {
@@ -119,8 +121,10 @@ func newControl(opts controlOptions) (*control, error) {
 		Jar:     jar,
 		Timeout: opts.Timeout,
 		Transport: &http.Transport{
-			// 自签证书；与隧道方向一样只靠 TLS 传输，不做证书校验。
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			// 默认走系统信任链：门户证书由公共 CA 签发，链与名称都能校验，
+			// 口令与验证码因此不会交给路上的中间人（ServerName 由 URL 的主机名
+			// 推导，即使实际连的是 server_ip 也按门户域名校验）。
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkipVerify},
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return dialWithContext(ctx, opts.Dial, network, opts.DialAddr)
 			},
