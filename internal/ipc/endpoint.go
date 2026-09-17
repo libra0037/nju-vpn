@@ -3,9 +3,10 @@ package ipc
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/libra0037/nju-vpn/internal/config"
 )
 
 // EndpointFor 按配置文件的身份派生 IPC 端点。
@@ -39,20 +40,14 @@ func ResolveEndpoint(explicit, configPath string) string {
 // 实例的本地痕迹都从这一个标识派生（IPC 端点、日志文件名、状态输出），
 // 多实例时对得上号。它由路径决定，与配置内容无关。
 //
-// 规范化是为了让同一份配置总得到同一个标识：相对路径按当前工作目录
-// 确定下来，符号链接归一到真实路径。EvalSymlinks 失败时回落到 Abs 的结果
-// ——配置文件还不存在时也要能算出端点。
+// 规范化规则只有一份，见 config.CanonicalPath：相对路径按当前工作目录
+// 定下来、符号链接归一到真实路径——写回也用同一个口径，两处不一致会让
+// 命令打到别的实例上，或者让写回落在链接而不是用户编辑的文件上。
 func InstanceTag(configPath string) string {
 	if configPath == "" {
 		return "default"
 	}
-	p := configPath
-	if abs, err := filepath.Abs(p); err == nil {
-		p = abs
-	}
-	if real, err := filepath.EvalSymlinks(p); err == nil {
-		p = real
-	}
+	p := config.CanonicalPath(configPath)
 	// Windows 的文件系统不区分大小写，同一份配置写成 Config.yaml 与
 	// config.yaml 会派生出两个端点，所以哈希输入统一小写。
 	if runtime.GOOS == "windows" {

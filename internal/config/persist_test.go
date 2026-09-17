@@ -2,9 +2,64 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// TestPersistThroughSymlinkWritesTarget 回归：写回必须落在链接的目标上。
+//
+// 写回是“写临时文件 + rename”，rename 替换的是目录项本身：配置路径是
+// 符号链接时，链接会被换成一份新的普通文件，用户真正在编辑的那份永远
+// 收不到 device_id / private_key（曾用 njuvpn restart -config link.yaml
+// 复现过）。实例身份按真实路径算，所以两边还会分叉。
+func TestPersistThroughSymlinkWritesTarget(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.yaml")
+	if err := os.WriteFile(real, []byte("server: vpn.example.edu\nusername: u\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("本平台建不了符号链接: %v", err)
+	}
+
+	cfg, err := Load(link)
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	realInfo, err := os.Stat(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotInfo, err := os.Stat(cfg.SourcePath())
+	if err != nil {
+		t.Fatalf("SourcePath 指向的文件不存在: %v", err)
+	}
+	if !os.SameFile(realInfo, gotInfo) {
+		t.Fatalf("SourcePath 没有解析到链接目标: %q", cfg.SourcePath())
+	}
+
+	if err := PersistDeviceID(cfg.SourcePath(), "dev-1"); err != nil {
+		t.Fatalf("写回失败: %v", err)
+	}
+
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("链接被换成了普通文件，真实配置永远收不到写回内容")
+	}
+	// 通过链接读：链的两端必须在同一份内容上。
+	body, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "device_id: dev-1") {
+		t.Fatalf("真实文件没有收到写回内容:\n%s", body)
+	}
+}
 
 // TestPersistPrivateKeyKeepsExistingValue 验证已有私钥不会被覆盖。
 //

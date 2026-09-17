@@ -230,6 +230,25 @@ func LoadForClient(path string) (*Config, error) {
 	return load(path)
 }
 
+// CanonicalPath 把用户给的配置路径规范成真实路径：先绝对化，再解开符号链接。
+//
+// 规范形式是实例身份（IPC 端点、日志名）与写回目标的共同口径。写回是
+// “写临时文件 + rename”，rename 替换的是目录项本身：路径不解析链接时，
+// 用户配置的那条链接会被换成一份新的普通文件，他真正在编辑的文件永远
+// 收不到生成的内容，而实例身份却按真实路径算——两边就此分叉。
+//
+// 解析失败（例如文件还不存在）时退回绝对路径：端点必须能算出来。
+func CanonicalPath(path string) string {
+	p := path
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		p = real
+	}
+	return p
+}
+
 func load(path string) (*Config, error) {
 	if path == "" {
 		path = DefaultPath()
@@ -241,7 +260,9 @@ func load(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	cfg.sourcePath = path
+	// 读的还是用户给的路径（会穿透链接），记下来的必须是真实路径，
+	// 否则写回落在链接上，与实例身份的口径分叉。
+	cfg.sourcePath = CanonicalPath(path)
 	// KnownFields 让键名写错时直接报错，而不是静默回落默认值。
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
