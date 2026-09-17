@@ -535,6 +535,7 @@ func (c *control) sendSMS(ctx context.Context, authID string, withAuthID bool) (
 func (c *control) submitSMS(ctx context.Context, authID string, withAuthID bool, code string) (authStep, error) {
 	params := withSharedParams(url.Values{"action": {"checkcode"}})
 	var body []byte
+	var headers map[string]string
 	var err error
 	if withAuthID {
 		body, err = json.Marshal(map[string]any{
@@ -545,13 +546,16 @@ func (c *control) submitSMS(ctx context.Context, authID string, withAuthID bool,
 			"authId":            authID,
 		})
 	} else {
+		// 旧形态（服务端不给 authId）提交的是表单，Content-Type 必须跟着改：
+		// do() 默认给带体的请求设 JSON，按 Content-Type 分派的网关会直接拒收。
 		form := url.Values{"code": {code}, "skipSecondaryAuth": {"0"}}
 		body = []byte(form.Encode())
+		headers = map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
 	}
 	if err != nil {
 		return authStep{}, err
 	}
-	raw, err := c.do(ctx, http.MethodPost, pathSMS, params, body, nil)
+	raw, err := c.do(ctx, http.MethodPost, pathSMS, params, body, headers)
 	if err != nil {
 		return authStep{}, err
 	}

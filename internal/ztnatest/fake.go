@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -649,20 +650,29 @@ func requestCode(r *http.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var parsed struct {
-		Code string `json:"code"`
-	}
-	if err := json.Unmarshal(body, &parsed); err == nil {
+	// 严格按 Content-Type 解析：以前"先按 JSON 解、失败再按表单解"把客户端
+	// 写错 Content-Type 的问题盖住了（网关按 Content-Type 分派时会直接拒收）。
+	switch ctype := r.Header.Get("Content-Type"); {
+	case strings.HasPrefix(ctype, "application/json"):
+		var parsed struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return "", fmt.Errorf("JSON 体解析失败: %w", err)
+		}
 		return parsed.Code, nil
+	case strings.HasPrefix(ctype, "application/x-www-form-urlencoded"):
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return "", fmt.Errorf("表单体解析失败: %w", err)
+		}
+		if code := form.Get("code"); code != "" {
+			return code, nil
+		}
+		return "", fmt.Errorf("表单体里没有验证码")
+	default:
+		return "", fmt.Errorf("不认识的 Content-Type: %q", ctype)
 	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		return "", err
-	}
-	if code := form.Get("code"); code != "" {
-		return code, nil
-	}
-	return "", fmt.Errorf("请求体里没有验证码")
 }
 
 func readJSON(r *http.Request, v any) error {

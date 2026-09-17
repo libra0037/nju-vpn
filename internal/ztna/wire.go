@@ -180,6 +180,11 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 			}
 			if code, msg, ok := parseEnvelopeCode(payload); ok && code != 0 {
 				// 状态字节为 0 也可能是失败：会话失效时服务端正是这么回的。
+				// 会话失效码按"需要重新登录"归类，别包成协议错误——那会让调用方
+				// 按通用失败重试三次，而不是直接告诉用户重新登录。
+				if code == codeSessionGone {
+					return res, &ErrSessionGone{Code: code, Message: msg}
+				}
 				return res, &ProtocolError{What: fmt.Sprintf("握手被拒（%d）", code), Got: msg}
 			}
 			res.DeviceID = parseEnvelopeDeviceID(payload)

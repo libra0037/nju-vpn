@@ -151,6 +151,33 @@ func TestConnectWithSMSTrustAndData(t *testing.T) {
 	}
 }
 
+// TestConnectLegacySMSForm 回归：旧形态的短信提交用表单体，Content-Type 必须
+// 跟着改。
+//
+// 服务端不给 authId 时它要的是表单（application/x-www-form-urlencoded），而
+// do() 默认给带体的请求设 JSON 类型：按 Content-Type 分派的网关会直接拒收。
+// 假服务端现在严格按 Content-Type 解析，写错就提交不上。
+func TestConnectLegacySMSForm(t *testing.T) {
+	srv := newFake(t, ztnatest.Options{RequireSMS: true, VerifyCode: testCode, LegacySMSForm: true})
+	client := newTestClient(t, srv, testPass)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	sess, err := client.Connect(ctx, ConnectOptions{})
+	if _, ok := AsAuthRequired(err); !ok {
+		t.Fatalf("旧形态也应停在等验证码这一步，得到 %v", err)
+	}
+	if _, err := sess.SMSPrompt(ctx); err != nil {
+		t.Fatalf("发送验证码失败: %v", err)
+	}
+	if err := sess.Auth(ctx, testCode); err != nil {
+		t.Fatalf("表单提交验证码失败: %v", err)
+	}
+	if got := sess.ClientIP().String(); got != "172.16.0.9" {
+		t.Errorf("分配的地址 = %s，期望 172.16.0.9", got)
+	}
+}
+
 func TestConnectWithoutSecondFactor(t *testing.T) {
 	srv := newFake(t, ztnatest.Options{})
 	client := newTestClient(t, srv, testPass)

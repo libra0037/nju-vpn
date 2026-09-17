@@ -359,15 +359,17 @@ func (t *tunnelConn) heartbeatLoop() {
 		select {
 		case <-ticker.C:
 			t.flows.expire(time.Now())
-			if t.heartbeatGap.Load() >= heartbeatMissLimit {
-				t.close(fmt.Errorf("心跳连续 %d 次没有回应", heartbeatMissLimit))
-				return
-			}
 			if err := t.write(encodeHeartbeat()); err != nil {
 				t.close(err)
 				return
 			}
+			// 判死放在自增之后：计数才等于"已经连续几次没回应"。放在前面
+			// 会让实际判死周期变成 4 个 tick，与常量注释里的 15×3=45 秒对不上。
 			t.heartbeatGap.Add(1)
+			if t.heartbeatGap.Load() >= heartbeatMissLimit {
+				t.close(fmt.Errorf("心跳连续 %d 次没有回应", heartbeatMissLimit))
+				return
+			}
 		case <-t.closeCh:
 			return
 		}

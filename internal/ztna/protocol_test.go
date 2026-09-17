@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -77,6 +78,29 @@ func TestHandshakeRejectsBadMethod(t *testing.T) {
 	buf.Write([]byte{0x05, 0x01})
 	if _, err := readHandshake(bufio.NewReader(&buf)); err == nil {
 		t.Fatal("非预期的方法响应应被拒绝")
+	}
+}
+
+// TestHandshakeSessionGoneIsClassified 回归：握手信封里的会话失效码要翻成
+// ErrSessionGone，而不是包成协议错误。
+//
+// 归错类会让调用方把它当通用失败重试三次，而不是直接提示"会话已失效，
+// 请重新登录"。
+func TestHandshakeSessionGoneIsClassified(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write([]byte{0x05, 0xD0})
+	envelope := []byte(`{"code":75500002,"message":"sid expired"}`)
+	buf.Write([]byte{0x53, 0x00})
+	_ = binary.Write(&buf, binary.BigEndian, uint16(len(envelope)))
+	buf.Write(envelope)
+
+	_, err := readHandshake(bufio.NewReader(&buf))
+	var gone *ErrSessionGone
+	if !errors.As(err, &gone) {
+		t.Fatalf("应归类为会话失效，得到 %v", err)
+	}
+	if gone.Code != codeSessionGone {
+		t.Errorf("码 = %d，期望 %d", gone.Code, codeSessionGone)
 	}
 }
 
