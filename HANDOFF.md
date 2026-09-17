@@ -211,7 +211,7 @@ TLS 有两处，校验方式不同：控制面走系统信任链（门户证书�
 
 ### 9.2 检查清单
 
-提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l .`、`go vet ./...`、`go build ./...`、六个发布平台的交叉编译、`go test ./... -race`、`go mod tidy -diff`、`staticcheck ./...`、`deadcode -test ./...`，加上"README 里的子命令都能在 usage 里找到"这一条——都应当无输出或全绿。工具装在 `$(go env GOPATH)/bin` 下也会被找到（不必先进 PATH）。`scripts/build-release.sh <版本>` 生成各平台产物（产物目录不进 git）。
+提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l .`、`go vet ./...`、`go build ./...`、六个发布平台的交叉编译、`go test ./... -race`、`go mod tidy -diff`、`staticcheck ./...`、`deadcode -test ./...`，加上"README 的子命令与选项跟 usage 双向对齐"这一条（`start --trust` 漏写过一次）——都应当无输出或全绿。工具装在 `$(go env GOPATH)/bin` 下也会被找到（不必先进 PATH）。`scripts/build-release.sh <版本>` 生成各平台产物（产物目录不进 git）。
 
 `govulncheck` 已于 2026-09-17 重测：本代码 0 命中（依赖模块里有 30 条，但都不被调用）。`deadcode -test ./...` 已接进 `check.sh` 与 CI，当前无输出。
 

@@ -9,9 +9,9 @@
 ## 特性
 
 - **不需管理员权限**：承载层是用户态 WireGuard，不强制安装 TUN 驱动或虚拟网卡，装了 Clash 就能用。
-- **一条命令启动**：`njuvpn start` 会按需拉起服务进程并建立隧道，不必配置为系统服务，口令与短信验证码只在需要时问你要。
+- **一条命令启动**：`njuvpn start` 会按需拉起服务进程，不必配置为系统服务，只在登录密码或短信验证码必需时才向用户索要。
+- **二次验证可免**：把本机绑成授信终端之后，登录不再需要短信验证码。
 - **同机可跑多个实例**：每份配置文件各自一个实例，端点与日志互不打扰。
-- **二次验证可免**：登录要短信验证码，把本机绑成授信终端（`njuvpn trust`）之后，同一台设备再登录不必再要码。
 
 ## 安装
 
@@ -31,21 +31,21 @@ go build -o njuvpn ./cmd/njuvpn
 
 | 平台 | 路径 |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/njuvpn/config.yaml`（未设置时 `~/.config/njuvpn/config.yaml`） |
+| Linux | `$XDG_CONFIG_HOME/njuvpn/config.yaml`（不存在时回退到 `~/.config/njuvpn/config.yaml`） |
 | Windows | `%LOCALAPPDATA%\njuvpn\config.yaml` |
 
 模板里 `server` 已经填好，只需要填账号（`username`）；本机 DNS 解析不了 `vpn.nju.edu.cn` 时再填 `server_ip`。
 
-- `password` 留空就每次启动时问你要，只留在服务进程内存里。
-- 一般直连即可；本机到服务端要另择出口时再写 `proxy`（服务端把会话绑到源 IP，代理的出口必须是稳定的单一地址）。
+- `password` 留空则需要在每次建立隧道时手动输入登录密码。
+- 通常不需填写 `proxy`，除非本机到服务端需要另择出口（服务端把会话绑到源 IP，代理的出口必须是稳定的单一地址）。
 - 首次启动会生成 `device_id` 并写回配置：授信终端绑的就是它，删掉或换掉等于换了一台设备，登录又要走一次二次验证。
 - 首次启动会自动生成 WireGuard 私钥并写回配置文件，启动日志里打印服务端公钥。
 - 配置文件里有凭据，服务进程启动时会把它收紧到 `0600`。
 
-### 2. 建立隧道
+### 2. 命令行
 
 ```
-njuvpn start            建立隧道（必要时拉起服务进程，需要时提示输入口令与验证码）
+njuvpn start [--trust]  建立隧道（加 --trust 时在这次登录成功后把本机绑成授信终端）
 njuvpn status           查看状态（加 -check 时隧道不在 up 就以非 0 退出，便于脚本巡检）
 njuvpn stop             断开隧道（本来就没在跑也按成功处理）
 njuvpn restart          重启服务进程（改完配置后用它）

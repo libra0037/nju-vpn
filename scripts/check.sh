@@ -30,6 +30,14 @@ tool() {
   fi
 }
 
+# flag_set 从文件（或 - 表示的标准输入）里提取选项，归一化后排序去重。
+# 归一化是因为 Go 的 flag 包把 -x 与 --x 当同一个：只比字面量会把
+# README 的 -check 与 usage 的 --check 误判成两个不同的选项。
+flag_set() {
+  grep -oE -- '(^|[^[:alnum:]-])--?[a-z][a-z0-9-]*' "$@" |
+    grep -oE -- '--?[a-z][a-z0-9-]*' | sed -E 's/^--/-/' | sort -u
+}
+
 # gofmt -l 有输出就算失败（它列出的是没格式化的文件）。
 fmt_out=$(gofmt -l . 2>&1)
 if [ -n "$fmt_out" ]; then
@@ -51,9 +59,10 @@ run go mod tidy -diff
 
 # 文档里的示例命令要真的存在。跑一遍示例要连服务端，离线能验的是这一半：
 # README 提到的每个子命令都必须出现在 usage 里（原则 10：文档里写着而代码里
-# 没有的东西是一个会误导人的缺陷）。
+# 没有的东西是一个会误导人的缺陷）。选项同样双向对齐——曾经漏写过 start 的
+# --trust：只查子命令时它照样全绿，用户看到 README 却不知道有这个开关。
 doc_check() {
-  local tmp bin helps
+  local tmp bin helps missing
   tmp=$(mktemp -d)
   bin="$tmp/njuvpn"
   helps="$tmp/help.txt"
@@ -70,6 +79,21 @@ doc_check() {
       rc=1
     fi
   done
+  flag_set README.md >"$tmp/readme.flags"
+  flag_set "$helps" >"$tmp/help.flags"
+  # README 里只有以 njuvpn 开头的行才算命令行：正文里写别的工具的选项
+  # （比如 go build -o njuvpn）不该被要求出现在 usage 里。
+  grep -E '^[[:space:]]*njuvpn ' README.md | flag_set - >"$tmp/readme.cmd.flags"
+  missing=$(comm -23 "$tmp/help.flags" "$tmp/readme.flags")
+  if [ -n "$missing" ]; then
+    echo "usage 里的选项没有写进 README：$(echo "$missing" | paste -sd' ' -)"
+    rc=1
+  fi
+  missing=$(comm -23 "$tmp/readme.cmd.flags" "$tmp/help.flags")
+  if [ -n "$missing" ]; then
+    echo "README 提到了 usage 里没有的选项：$(echo "$missing" | paste -sd' ' -)"
+    rc=1
+  fi
   rm -rf "$tmp"
   return $rc
 }
