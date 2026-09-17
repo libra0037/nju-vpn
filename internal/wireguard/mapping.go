@@ -197,6 +197,11 @@ func icmpCarriesOriginal(typ byte) bool {
 // 内层头不完整（差错只带了一小段，或根本不是 IPv4）就原样放过：那种报文
 // 解析不了，动了只会更糟。外层 ICMP 校验和覆盖整条消息，内层改完必须重算。
 func (m *Mapper) rewriteICMPInner(buf []byte, hdr ipv4Header, old, new [4]byte) {
+	// 非首片里没有 ICMP 头：这些字节是消息的中间部分，按 ICMP 头解析会
+	// 把载荷当内嵌报文改。内嵌报文只出现在首片的开头。
+	if hdr.fragmentOffset() != 0 {
+		return
+	}
 	icmp := hdr.headerLen
 	if len(buf) < icmp+icmpMinLen+ipv4MinHeader {
 		return
@@ -212,35 +217,42 @@ func (m *Mapper) rewriteICMPInner(buf []byte, hdr ipv4Header, old, new [4]byte) 
 	}
 	// 内层两个地址里最多有一个是我们的：上行方向它是源（客户端报的是它
 	// 收到的包），下行方向它是目的。两个都查一遍就不必区分方向。
-	changed := false
+	var srcChanged, dstChanged bool
 	if equal4(buf[inner+ipv4SrcOffset:], old) {
 		copy(buf[inner+ipv4SrcOffset:], new[:])
-		changed = true
+		srcChanged = true
 	}
 	if equal4(buf[inner+ipv4DstOffset:], old) {
 		copy(buf[inner+ipv4DstOffset:], new[:])
-		changed = true
+		dstChanged = true
 	}
-	if !changed {
+	if !srcChanged && !dstChanged {
 		return
 	}
 
 	// 内层 IP 头校验和只覆盖内层头部（最多 60 字节），重算比增量省心。
+	oldInner := binary.BigEndian.Uint16(buf[inner+ipv4ChecksumOff:])
 	binary.BigEndian.PutUint16(buf[inner+ipv4ChecksumOff:], 0)
-	binary.BigEndian.PutUint16(buf[inner+ipv4ChecksumOff:],
-		checksum16(buf[inner:inner+innerHdr.headerLen]))
+	newInner := checksum16(buf[inner : inner+innerHdr.headerLen])
+	binary.BigEndian.PutUint16(buf[inner+ipv4ChecksumOff:], newInner)
 
-	// 外层 ICMP 校验和覆盖整条 ICMP 消息，含内嵌报文。
-	end := icmp + (hdr.totalLen - hdr.headerLen)
-	if end > len(buf) {
-		end = len(buf)
+	// 外层 ICMP 校验和覆盖整条 ICMP 消息，而这条消息可能被分片：我们手上
+	// 也许只有首片，按可见范围重算就把整条消息的校验和写坏了，收端重组后
+	// 整条差错作废（路径 MTU 发现因此失效）。改成增量更新：只把改动过的
+	// 16 位字折进去，看不看得到整条消息都成立。
+	//
+	// 不做 0 → 0xFFFF 的规范化：那条规则属于 UDP（0 表示"发送端没算"），
+	// ICMP 里 0 是合法校验和，增量结果与整条重算在反码算术下等价。
+	sum := binary.BigEndian.Uint16(buf[icmp+icmpChecksumOff:])
+	if srcChanged {
+		sum = updateChecksum(sum, binary.BigEndian.Uint16(old[0:2]), binary.BigEndian.Uint16(new[0:2]))
+		sum = updateChecksum(sum, binary.BigEndian.Uint16(old[2:4]), binary.BigEndian.Uint16(new[2:4]))
 	}
-	binary.BigEndian.PutUint16(buf[icmp+icmpChecksumOff:], 0)
-	sum := checksum16(buf[icmp:end])
-	if sum == 0 {
-		// RFC 1071：算出来是 0 时写全 1。
-		sum = 0xffff
+	if dstChanged {
+		sum = updateChecksum(sum, binary.BigEndian.Uint16(old[0:2]), binary.BigEndian.Uint16(new[0:2]))
+		sum = updateChecksum(sum, binary.BigEndian.Uint16(old[2:4]), binary.BigEndian.Uint16(new[2:4]))
 	}
+	sum = updateChecksum(sum, oldInner, newInner)
 	binary.BigEndian.PutUint16(buf[icmp+icmpChecksumOff:], sum)
 }
 

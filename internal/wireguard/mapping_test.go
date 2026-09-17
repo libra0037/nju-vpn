@@ -332,3 +332,64 @@ func TestMapperRewritesICMPErrorInner(t *testing.T) {
 		}
 	})
 }
+
+// TestMapperICMPErrorFragmentChecksum 回归：ICMP 差错报文被分片时，外层校验和
+// 必须按整条消息更新。
+//
+// ICMP 校验和覆盖整条 ICMP 消息，而分片之后手上可能只有首片：按可见范围
+// 重算会把校验和写坏，收端重组后整条差错作废，路径 MTU 发现跟着失效。
+// 这里把整条消息拆成两片、只改首片，再按重组后的字节验证校验和——退回
+// 重算的写法即失败（已经反向验证过）。
+func TestMapperICMPErrorFragmentChecksum(t *testing.T) {
+	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer4 := m.peerIP
+	public4 := mustPublic(t, m)
+	remote := [4]byte{202, 119, 32, 69}
+
+	// 内嵌一整个大包，让差错报文（20 头 + 8 ICMP 头 + 内层）越过分片点。
+	inner := buildUDP(public4, remote, bytes.Repeat([]byte("x"), 976))
+	full := buildICMPError(remote, public4, 3, 4, inner)
+
+	// 分片按 8 字节对齐：首片携带前 960 字节载荷，其余进后续片。
+	const firstPayload = 960
+	frag1 := append([]byte(nil), full[:ipv4MinHeader+firstPayload]...)
+	frag2 := append([]byte(nil), full[:ipv4MinHeader]...)
+	frag2 = append(frag2, full[ipv4MinHeader+firstPayload:]...)
+	// 首片：MF=1、偏移 0，总长改成本片长度，IP 头校验和重算。
+	binary.BigEndian.PutUint16(frag1[2:], uint16(len(frag1)))
+	binary.BigEndian.PutUint16(frag1[fragmentFieldAt:], 0x2000)
+	binary.BigEndian.PutUint16(frag1[ipv4ChecksumOff:], 0)
+	binary.BigEndian.PutUint16(frag1[ipv4ChecksumOff:], ipChecksum(frag1[:ipv4MinHeader]))
+	// 后续片：只带偏移。
+	binary.BigEndian.PutUint16(frag2[2:], uint16(len(frag2)))
+	binary.BigEndian.PutUint16(frag2[fragmentFieldAt:], uint16(firstPayload/8))
+	binary.BigEndian.PutUint16(frag2[ipv4ChecksumOff:], 0)
+	binary.BigEndian.PutUint16(frag2[ipv4ChecksumOff:], ipChecksum(frag2[:ipv4MinHeader]))
+
+	frag2Before := append([]byte(nil), frag2[ipv4MinHeader:]...)
+	if _, err := m.Downlink(frag1); err != nil {
+		t.Fatalf("downlink 首片: %v", err)
+	}
+	if _, err := m.Downlink(frag2); err != nil {
+		t.Fatalf("downlink 后续片: %v", err)
+	}
+
+	// 后续片里没有 ICMP 头：载荷一个字节都不能动。
+	if !bytes.Equal(frag2[ipv4MinHeader:], frag2Before) {
+		t.Error("非首片的载荷被改动了")
+	}
+	// 首片里的内层地址确实改写了，否则这条用例什么也没验证。
+	innerAt := ipv4MinHeader + icmpEmbeddedOff
+	if got := frag1[innerAt+ipv4SrcOffset : innerAt+ipv4SrcOffset+4]; !equal4(got, peer4) {
+		t.Fatalf("首片里的内层源地址 = %v，期望 %v", net.IP(got), net.IP(peer4[:]))
+	}
+
+	// 收端看到的是重组后的消息：按它验证 ICMP 校验和。
+	reassembled := append(append([]byte(nil), frag1[ipv4MinHeader:]...), frag2[ipv4MinHeader:]...)
+	if !checksumOK(reassembled, 0, len(reassembled)) {
+		t.Fatal("重组后的 ICMP 校验和不对：必须按整条消息增量更新，不能按可见范围重算")
+	}
+}
