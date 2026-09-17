@@ -3,12 +3,13 @@ package ztna
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -125,6 +126,12 @@ func newControl(opts controlOptions) (*control, error) {
 	c.hc = &http.Client{
 		Jar:     jar,
 		Timeout: controlTimeout,
+		// 不给跳转留空间：这条通道带着口令密文与 x-sdp-env、x-csrf-token
+		// 这些自定义头，而 Go 只对 Authorization/Cookie 一类做跨主机剥离，
+		// 307/308 连 body 一起重放。非 2xx 一律交给 do() 当失败。
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 		Transport: &http.Transport{
 			// 默认走系统信任链：门户证书由公共 CA 签发，链与名称都能校验，
 			// 口令与验证码因此不会交给路上的中间人（ServerName 由 URL 的主机名
@@ -189,7 +196,11 @@ func (c *control) do(ctx context.Context, method, path string, params url.Values
 		req.Header.Set("x-csrf-token", c.csrf)
 	}
 	req.Header.Set("x-sdp-rid", base64.StdEncoding.EncodeToString([]byte(c.server)))
-	req.Header.Set("x-sdp-traceid", randHex(8))
+	traceID, err := randHex(8)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-sdp-traceid", traceID)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -609,11 +620,14 @@ func (c *control) logout(ctx context.Context) error {
 	return err
 }
 
-func randHex(n int) string {
-	const digits = "0123456789abcdef"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = digits[rand.Intn(len(digits))]
+// randHex 生成 n 个十六进制字符的请求追踪 id。
+//
+// 用 crypto/rand：同一个包里已经有它（randomSignKey），而 math/rand 的默认源
+// 在并发下还要抢锁。熵源读不出来就报错——这个值没有可用的降级替代。
+func randHex(n int) (string, error) {
+	buf := make([]byte, (n+1)/2)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("生成请求追踪 id: %w", err)
 	}
-	return string(b)
+	return hex.EncodeToString(buf)[:n], nil
 }
