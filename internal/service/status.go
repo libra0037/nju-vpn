@@ -38,7 +38,9 @@ type Status struct {
 	// 这时状态仍是 up（登录会话、隧道对象与承载层都还在，重连成功后不必
 	// 重建它们），但链路是断的——只看 State 的话，巡检脚本会把断了的链路
 	// 报成正常，因此它必须能单独看见。
-	Retrying bool   `json:"retrying,omitempty"`
+	Retrying bool `json:"retrying,omitempty"`
+	// ClientIP / PeerIP 不在这份快照里：会话挂着时由 Service.Status 现取
+	// （端点上的当前地址加配置里的 peer 地址），会话摘掉后为空。
 	ClientIP string `json:"client_ip,omitempty"` // 校园网分配的地址
 	PeerIP   string `json:"peer_ip,omitempty"`   // 客户端 peer 的地址
 	// Since 是进入当前状态的时间，便于判断"卡了多久"。
@@ -119,22 +121,6 @@ func (s *statusStore) setRetrying(retrying bool) {
 	s.status.Retrying = retrying
 }
 
-// setAddresses 记录隧道地址与 peer 地址。
-func (s *statusStore) setAddresses(clientIP, peerIP string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.status.ClientIP = clientIP
-	s.status.PeerIP = peerIP
-}
-
-// clearAddresses 清空地址信息。
-func (s *statusStore) clearAddresses() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.status.ClientIP = ""
-	s.status.PeerIP = ""
-}
-
 // applyLocked 写入新状态。调用方需持有写锁。
 func (s *statusStore) applyLocked(next State, detail string) {
 	if s.status.State != next {
@@ -142,11 +128,9 @@ func (s *statusStore) applyLocked(next State, detail string) {
 	}
 	s.status.State = next
 	s.status.Detail = detail
-	// 离开运行态时地址信息必须一起清掉，否则 status 会显示
-	// "idle | 已断开 | peer 10.66.66.2" 这种自相矛盾的内容。
+	// 离开运行态时不再显示“正在重连”。地址不在这里清：它由 Service.Status
+	// 现取，会话摘掉后自然为空（见那里的注释）。
 	if next == StateIdle || next == StateError {
-		s.status.ClientIP = ""
-		s.status.PeerIP = ""
 		s.status.Retrying = false
 	}
 }

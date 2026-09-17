@@ -545,3 +545,41 @@ func TestLateTunnelReportIgnoredAfterTeardown(t *testing.T) {
 		t.Errorf("过期代次的汇报改掉了状态说明: %q", svc.Status().Detail)
 	}
 }
+
+// TestStatusAddressFollowsServerUpdate 回归：服务端在会话中途换地址后，
+// status 里的校园网地址必须跟着变。
+//
+// 数据面一直是现取的（承载映射按端点上的当前值改写），而 status 曾经是
+// 一份写一次的快照：换地址后隧道照常工作，`njuvpn status` 却一直报旧地址，
+// 按它排障或写脚本核对地址的人会被带偏。
+func TestStatusAddressFollowsServerUpdate(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
+
+	if err := svc.Start(false, testPass); err != nil {
+		t.Fatalf("建立隧道失败: %v", err)
+	}
+	if st := svc.Status(); st.ClientIP != testVIP || st.PeerIP != "10.66.66.2" {
+		t.Fatalf("地址 = %s / %s，期望 %s / 10.66.66.2", st.ClientIP, st.PeerIP, testVIP)
+	}
+
+	const newer = "172.16.0.10"
+	if err := srv.SendVIPUpdate(newer); err != nil {
+		t.Fatalf("下发地址变更: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for svc.Status().ClientIP != newer {
+		if time.Now().After(deadline) {
+			t.Fatalf("地址变更后 status 仍是 %q，期望 %q", svc.Status().ClientIP, newer)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 会话摘掉之后两个地址都不再显示（不是靠状态迁移时逐处清）。
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("断开失败: %v", err)
+	}
+	if st := svc.Status(); st.ClientIP != "" || st.PeerIP != "" {
+		t.Fatalf("断开后仍显示地址: %q / %q", st.ClientIP, st.PeerIP)
+	}
+}

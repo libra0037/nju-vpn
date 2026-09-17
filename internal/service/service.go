@@ -15,6 +15,7 @@ import (
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/dial"
 	"github.com/libra0037/nju-vpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/l3"
 	"github.com/libra0037/nju-vpn/internal/ztna"
 )
 
@@ -183,6 +184,15 @@ type Service struct {
 	status *statusStore
 	br     *bearer
 
+	// ep 指向当前会话的隧道端点。status 里的校园网地址现取（承载层改写用的
+	// 就是端点上的当前值），所以不留第二份快照——服务端在会话中途换地址时，
+	// status 跟着变，而不是停在旧值上。
+	//
+	// 写者只有 actor 协程（挂载时存、teardown 时清），读者可以是任何协程。
+	ep atomic.Pointer[l3.Endpoint]
+	// peerIP 来自配置，启动时定下，不再变。
+	peerIP string
+
 	// cred 只在 actor 协程里读写，不需要加锁。
 	cred credentials
 
@@ -228,6 +238,7 @@ func New(cfg *config.Config) (*Service, error) {
 		cfg:       cfg,
 		status:    newStatusStore(identityOf(cfg)),
 		br:        br,
+		peerIP:    br.peerAddr.String(),
 		cred:      credentials{username: cfg.Username, password: cfg.Password},
 		cmds:      make(chan *command),
 		closed:    make(chan struct{}),
@@ -251,7 +262,20 @@ func identityOf(cfg *config.Config) Identity {
 }
 
 // Status 返回当前状态快照。它不经过 actor，永远立即可用。
-func (s *Service) Status() Status { return s.status.Get() }
+//
+// 两个地址是现取的：会话挂着时读端点上的当前地址与配置里的 peer 地址，
+// 会话摘掉（teardown）后两个都为空。写成快照既会留下一份服务端换地址后
+// 的旧值，又要在每次状态迁移时记得清。
+func (s *Service) Status() Status {
+	st := s.status.Get()
+	if ep := s.ep.Load(); ep != nil {
+		st.PeerIP = s.peerIP
+		if ip := ep.LocalAddr(); ip != nil {
+			st.ClientIP = ip.String()
+		}
+	}
+	return st
+}
 
 // Identity 返回实例身份。
 func (s *Service) Identity() Identity { return s.status.Get().Identity }
@@ -731,7 +755,6 @@ func (s *Service) finishConnect(sess *ztna.Session) error {
 	if err := s.br.attach(sess); err != nil {
 		return s.fail(err)
 	}
-	s.status.setAddresses(sess.ClientIP().String(), s.br.peerAddr.String())
 	s.status.setRetrying(false)
 	// 先进入 up 再启动隧道协程：如果协程立刻就失败，tunnelDown 必须能
 	// 看到 up 才能正确收敛，否则这次失败会被忽略掉。
@@ -756,6 +779,7 @@ func (s *Service) attach(sess *ztna.Session) {
 	}
 	prev := s.session
 	s.session = sess
+	s.ep.Store(sess.Endpoint())
 	if prev == nil || prev == sess {
 		return
 	}
@@ -905,7 +929,7 @@ func (s *Service) teardown(detail string) {
 	if logoutErr != nil {
 		log.Printf("释放会话时出错: %v", logoutErr)
 	}
-	s.status.clearAddresses()
+	s.ep.Store(nil)
 
 	if s.status.Get().State != StateIdle {
 		if detail == "" {

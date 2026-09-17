@@ -214,6 +214,27 @@ func (s *Server) SendDownlink(pkt []byte) error {
 	return err
 }
 
+// SendVIPUpdate 往当前隧道连接里塞一条地址变更帧（0x96）。
+//
+// 服务端会在会话中途下发新地址。客户端要跟着切的不只是数据面：status 也
+// 得报同一个地址，否则排障时会看到"隧道通着、地址却是旧的"。
+func (s *Server) SendVIPUpdate(vip string) error {
+	s.mu.Lock()
+	conn := s.tunnel
+	s.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("还没有隧道连接")
+	}
+	body, err := json.Marshal(map[string]any{"code": 0, "data": map[string]any{"vip": vip}})
+	if err != nil {
+		return err
+	}
+	frame := []byte{0x05, verVIPUpdate, 0x00}
+	frame = binary.BigEndian.AppendUint16(frame, uint16(len(body)))
+	_, err = conn.Write(append(frame, body...))
+	return err
+}
+
 // CloseTunnel 掐断当前隧道连接，用来测重连。
 func (s *Server) CloseTunnel() {
 	s.mu.Lock()
@@ -674,6 +695,7 @@ const (
 	verDataResp     = 0x94
 	verHeartbeatReq = 0x15
 	verHeartbeatRes = 0x95
+	verVIPUpdate    = 0x96
 )
 
 // handleTunnel 处理一条隧道连接。
