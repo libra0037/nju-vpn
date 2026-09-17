@@ -17,15 +17,3 @@ func parseEnvelopeCode(payload []byte) (int, string, bool) {
 	}
 	return e.Code, e.Message, true
 }
-
-func parseEnvelopeDeviceID(payload []byte) string {
-	var e struct {
-		Data struct {
-			DeviceID string `json:"deviceID"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(payload, &e); err != nil {
-		return ""
-	}
-	return e.Data.DeviceID
-}

@@ -474,7 +474,6 @@ func (t *tunnelConn) buildAuthRequest(f *flow) ([]byte, error) {
 	case protoICMP:
 		ipProto = protoICMP
 	}
-	vip := t.VIP()
 	procPath := "/usr/bin/njuvpn"
 	sum := sha256.Sum256([]byte(procPath))
 
@@ -499,7 +498,6 @@ func (t *tunnelConn) buildAuthRequest(f *flow) ([]byte, error) {
 		Path: procPath, Version: "TrustAppClosed", SecurityEnv: "normal",
 	}
 	req.Env.Application.Runtime.ProcessTrusted = "TRUSTED"
-	_ = vip
 
 	unsigned, err := json.Marshal(req)
 	if err != nil {

@@ -112,9 +112,6 @@ func (d *DeviceSession) Auth(ctx context.Context, code string) error {
 // OwnsSession 报告这次授信终端操作是否自带一次登录（而不是复用隧道会话）。
 func (d *DeviceSession) OwnsSession() bool { return d != nil && d.own }
 
-// NeedsAuth 报告这次登录是否还等着验证码。
-func (d *DeviceSession) NeedsAuth() bool { return d.sess != nil && d.sess.step.Service != "" }
-
 // SMSPrompt 让服务端把验证码发出去，并返回给用户看的提示。
 //
 // 只调用 Hint 是不够的：验证码要到这里才真的发出来。

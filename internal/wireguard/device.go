@@ -155,7 +155,8 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	return nil
 }
 
-// PeerInstalls 返回 peer 被成功下发（重装）的累计次数。
+// PeerInstalls 返回 peer 被成功下发（重装）的累计次数，供测试断言
+// "密钥没变就不再重装"（重装会作废客户端已经握好的会话密钥）。
 //
 // 公钥没变时不该增长：每增长一次都意味着客户端的会话密钥被作废。
 func (d *Device) PeerInstalls() int64 { return d.peerInstalls.Load() }

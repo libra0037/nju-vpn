@@ -189,8 +189,8 @@ func TestConnectWithoutSecondFactor(t *testing.T) {
 		t.Fatalf("不需要二次验证时 Connect 应直接成功: %v", err)
 	}
 	defer sess.Close(ctx)
-	if sess.Username() != testUser {
-		t.Errorf("账号 = %q，期望 %q", sess.Username(), testUser)
+	if sess.username != testUser {
+		t.Errorf("账号 = %q，期望 %q", sess.username, testUser)
 	}
 	if srv.SMSSends() != 0 {
 		t.Errorf("不该发短信，收到 %d 次请求", srv.SMSSends())
@@ -257,9 +257,6 @@ func TestDeviceSessionWithoutLoginDoesNotPanic(t *testing.T) {
 	}
 	if err := d.Close(ctx); err != nil {
 		t.Errorf("关掉空会话应当无害: %v", err)
-	}
-	if d.NeedsAuth() {
-		t.Error("空会话不该等着验证码")
 	}
 }
 

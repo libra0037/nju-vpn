@@ -162,7 +162,7 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 		return nil
 	})
 
-	mapper, err := NewMapper(net.ParseIP(peerIP), net.ParseIP(campusIP))
+	mapper, err := fixedMapper(net.ParseIP(peerIP), net.ParseIP(campusIP))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 		}
 		return nil
 	})
-	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	mapper, err := fixedMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestDeviceCloseStopsForwarding(t *testing.T) {
 		}
 		return nil
 	})
-	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	mapper, err := fixedMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
 	}
 
 	ep := l3.New()
-	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	mapper, err := fixedMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
 	}

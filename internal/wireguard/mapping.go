@@ -30,11 +30,6 @@ type Mapper struct {
 	unsupportedLogged atomic.Bool
 }
 
-// NewMapper 构造地址映射，隧道地址固定。两个地址都必须是 IPv4。
-func NewMapper(peer, public net.IP) (*Mapper, error) {
-	return NewDynamicMapper(peer, func() net.IP { return public })
-}
-
 // NewDynamicMapper 与 NewMapper 一样，只是隧道地址由回调现取：地址在会话
 // 中途变化时映射要跟着走，不能把构造时的值冻住。回调可能被上下行两个协程
 // 并发调用，必须自己保证安全。

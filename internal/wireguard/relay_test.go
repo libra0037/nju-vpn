@@ -236,7 +236,7 @@ func TestRelayWriteWithoutSession(t *testing.T) {
 // 上行包必须经过地址改写：客户端用 peer 地址，隧道里必须用隧道地址。
 func TestRelayAppliesMapperOnUplink(t *testing.T) {
 	ep := l3.New()
-	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	mapper, err := fixedMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestRelayAppliesMapperOnUplink(t *testing.T) {
 // 下行包必须改回 peer 地址，否则客户端认不出这个包是自己的。
 func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 	ep := l3.New()
-	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	mapper, err := fixedMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 // "隧道是 up 的，但一个包都过不去"，日志里没有任何线索。
 func TestDropReasonsAreDistinguished(t *testing.T) {
 	ep := l3.New()
-	mapper, err := NewMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
+	mapper, err := fixedMapper(net.ParseIP("10.66.66.2"), net.ParseIP("172.29.56.18"))
 	if err != nil {
 		t.Fatal(err)
 	}

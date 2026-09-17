@@ -78,7 +78,7 @@ func buildUDP(src, dst [4]byte, payload []byte) []byte {
 func TestMapperUplinkDownlink(t *testing.T) {
 	peer := net.IPv4(10, 66, 66, 2)
 	public := net.IPv4(172, 29, 32, 160)
-	m, err := NewMapper(peer, public)
+	m, err := fixedMapper(peer, public)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestMapperUplinkDownlink(t *testing.T) {
 }
 
 func TestMapperRejectsWrongDirection(t *testing.T) {
-	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
+	m, err := fixedMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestMapperRejectsWrongDirection(t *testing.T) {
 // 0x0000 的含义是"发送端没算校验和"，接收端会跳过校验——等于给对方一个
 // 可能已损坏的包（实测 100 万个随机样本里约 24 次会踩到）。
 func TestUDPChecksumZeroBecomesAllOnes(t *testing.T) {
-	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 56, 18))
+	m, err := fixedMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 56, 18))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestUDPChecksumZeroBecomesAllOnes(t *testing.T) {
 }
 
 func TestUDPZeroChecksumUntouched(t *testing.T) {
-	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
+	m, err := fixedMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func checksumOK(pkt []byte, at int, length int) bool {
 // 内层的四元组把差错关联回套接字：内层地址仍是我们改写前的地址时，差错对不
 // 上号被丢掉，大包路径就此黑掉，表现是"发出去了没回应"。
 func TestMapperRewritesICMPErrorInner(t *testing.T) {
-	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
+	m, err := fixedMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestMapperRewritesICMPErrorInner(t *testing.T) {
 // 这里把整条消息拆成两片、只改首片，再按重组后的字节验证校验和——退回
 // 重算的写法即失败（已经反向验证过）。
 func TestMapperICMPErrorFragmentChecksum(t *testing.T) {
-	m, err := NewMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
+	m, err := fixedMapper(net.IPv4(10, 66, 66, 2), net.IPv4(172, 29, 32, 160))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,4 +392,12 @@ func TestMapperICMPErrorFragmentChecksum(t *testing.T) {
 	if !checksumOK(reassembled, 0, len(reassembled)) {
 		t.Fatal("重组后的 ICMP 校验和不对：必须按整条消息增量更新，不能按可见范围重算")
 	}
+}
+
+// fixedMapper 造一个隧道地址固定的映射。
+//
+// 生产路径用的是动态映射（NewDynamicMapper）：服务端可能在会话中途换地址。
+// 固定地址只在用例里用，所以它是测试助手而不是生产 API。
+func fixedMapper(peer, public net.IP) (*Mapper, error) {
+	return NewDynamicMapper(peer, func() net.IP { return public })
 }

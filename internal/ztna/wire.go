@@ -187,7 +187,6 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 				}
 				return res, &ProtocolError{What: fmt.Sprintf("握手被拒（%d）", code), Got: msg}
 			}
-			res.DeviceID = parseEnvelopeDeviceID(payload)
 		case Version:
 			// 05 <status> <reserved> <addrType> <body>：虚拟地址。
 			addrType := head[3]

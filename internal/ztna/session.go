@@ -145,7 +145,7 @@ func (c *Client) newSession(ctx context.Context, password string, devicesOnly bo
 
 // beginLogin 走到认证链这一步：口令登录 + 上报环境 + 按服务名往下走。
 func (s *Session) beginLogin(ctx context.Context) error {
-	if _, err := s.ctrl.manifest(ctx); err != nil {
+	if err := s.ctrl.manifest(ctx); err != nil {
 		// manifest 只用来取服务端版本，失败不致命。
 		s.client.logf("读取服务端信息失败（继续）: %v", err)
 	}
@@ -321,9 +321,6 @@ func (s *Session) ClientIP() net.IP {
 
 // Endpoint 返回承载层要用的上下行通道。
 func (s *Session) Endpoint() *l3.Endpoint { return s.ep }
-
-// Username 返回服务端确认过的账号名。
-func (s *Session) Username() string { return s.username }
 
 // LinkEvents 报告运行期的链路事件。两个回调都可能从隧道自己的协程里
 // 被调用，实现必须立刻返回：服务进程在这里只是往命令通道投一条消息，

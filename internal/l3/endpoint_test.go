@@ -8,9 +8,6 @@ import (
 
 func TestSendWithoutUplink(t *testing.T) {
 	ep := New()
-	if ep.HasUplink() {
-		t.Error("新端点不该有上行通道")
-	}
 	if err := ep.Send([]byte("x")); !errors.Is(err, ErrNoUplink) {
 		t.Errorf("没有上行通道时 Send 应报 ErrNoUplink，得到 %v", err)
 	}
@@ -34,9 +31,6 @@ func TestUplinkAndDownlink(t *testing.T) {
 		got = append(got, append([]byte(nil), b...))
 	})
 
-	if !ep.HasUplink() {
-		t.Error("注册之后应报告上行就绪")
-	}
 	if err := ep.Send([]byte("up")); err != nil {
 		t.Fatalf("Send: %v", err)
 	}

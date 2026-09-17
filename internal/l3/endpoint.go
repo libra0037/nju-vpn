@@ -98,12 +98,6 @@ func (ep *Endpoint) ClearDownlink() {
 	ep.update(func(b *binding) { b.downlink = nil })
 }
 
-// HasUplink 报告上行通道是否就绪。
-func (ep *Endpoint) HasUplink() bool {
-	b := ep.binding.Load()
-	return b != nil && b.uplink != nil
-}
-
 // Send 把上行的裸 IP 包交给隧道。不在锁里调用回调，理由见类型注释。
 func (ep *Endpoint) Send(buf []byte) error {
 	b := ep.binding.Load()

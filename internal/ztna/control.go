@@ -33,7 +33,6 @@ const (
 	pathQueryDevice   = "/passport/v1/security/queryDevice"
 	pathTrustDevice   = "/passport/v1/security/trustDevice"
 	pathUntrustDevice = "/passport/v1/security/untrustDevice"
-	pathLogoutDevice  = "/passport/v1/security/logoutDevice"
 )
 
 // clientIdentity 是发给服务端的客户端标识。
@@ -248,32 +247,21 @@ func decodeEnvelope(raw []byte, sessionCodes bool) (json.RawMessage, error) {
 	}
 }
 
-// manifestInfo 是服务端版本与关键能力。
-type manifestInfo struct {
-	ServerVersion string
-	TrustDevice   bool
-}
-
-func (c *control) manifest(ctx context.Context) (manifestInfo, error) {
-	var out manifestInfo
+// manifest 读服务端信息，当前只用作"控制面是否可达"的一次试探。
+//
+// 返回的版本与能力字段没有消费者——以前把它们解析进一个结构体再丢掉，
+// 只留下一份"看起来有人在读"的假象。这里只校验它确实是 JSON 外壳：
+// 网关的登录页与错误页也会回 200。
+func (c *control) manifest(ctx context.Context) error {
 	raw, err := c.do(ctx, http.MethodGet, pathManifest, nil, nil, nil)
 	if err != nil {
-		return out, err
+		return err
 	}
-	var m struct {
-		Data struct {
-			Server      string `json:"server"`
-			TrustDevice struct {
-				Enable bool `json:"enable"`
-			} `json:"trustDevice"`
-		} `json:"data"`
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return &ProtocolError{What: "manifest 解析失败", Got: truncateForError(raw)}
 	}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return out, &ProtocolError{What: "manifest 解析失败", Got: truncateForError(raw)}
-	}
-	out.ServerVersion = m.Data.Server
-	out.TrustDevice = m.Data.TrustDevice.Enable
-	return out, nil
+	return nil
 }
 
 // authMethod 是服务端下发的一种可用登录方式。
@@ -567,9 +555,7 @@ func (c *control) submitSMS(ctx context.Context, authID string, withAuthID bool,
 }
 
 type onlineInfo struct {
-	Username  string
-	IsOnline  bool
-	LoginTime string
+	Username string
 }
 
 func (c *control) onlineInfo(ctx context.Context) (onlineInfo, error) {
@@ -584,15 +570,11 @@ func (c *control) onlineInfo(ctx context.Context) (onlineInfo, error) {
 	}
 	var d struct {
 		Username string `json:"username"`
-		IsOnline bool   `json:"isOnline"`
-		AuthTime string `json:"authTime"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
 		return out, &ProtocolError{What: "在线信息解析失败", Got: truncateForError(data)}
 	}
 	out.Username = d.Username
-	out.IsOnline = d.IsOnline
-	out.LoginTime = d.AuthTime
 	return out, nil
 }
 

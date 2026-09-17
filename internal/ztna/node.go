@@ -3,7 +3,6 @@ package ztna
 import (
 	"context"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/dial"
@@ -60,5 +59,3 @@ func probeNodes(ctx context.Context, dialFn dial.DialFunc, addrs []string, timeo
 	}
 	return "", fmt.Errorf("隧道节点均不可达: %w", lastErr)
 }
-
-var _ = net.Dial
