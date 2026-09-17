@@ -85,3 +85,33 @@ func TestNodePinsRejectsMissingCertificate(t *testing.T) {
 		t.Fatal("没有证书应当拒绝")
 	}
 }
+
+// TestNodePinsSaveIgnoresPreplacedTempFile 验证写回不会被同目录里预置的临时
+// 文件牵着走。
+//
+// 旧实现用固定名 <path>.tmp 且不带 O_EXCL，别人预先放一个同名文件或符号链接
+// 就能让这次写落到他挑的目标上；这条用例把预置文件摆在那里，写回之后它必须
+// 一个字都没变。
+func TestNodePinsSaveIgnoresPreplacedTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml.node-pins")
+	squat := path + ".tmp"
+	const planted = "别人预置的内容\n"
+	if err := os.WriteFile(squat, []byte(planted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pins := newNodePins(nil, path, false, t.Logf)
+	if err := pins.verify("10.0.0.1:441", derOf("node-a")); err != nil {
+		t.Fatalf("首次记录应当接受: %v", err)
+	}
+
+	got, err := os.ReadFile(squat)
+	if err != nil || string(got) != planted {
+		t.Fatalf("预置文件被改动了（内容 %q，错误 %v）——写回必须落在自己新建的文件上", got, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), "10.0.0.1:441") {
+		t.Fatalf("指纹记录没有写进 %s: %v", path, err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -118,12 +119,31 @@ func (p *nodePins) save() error {
 	for _, addr := range addrs {
 		fmt.Fprintf(&b, "%s %s\n", addr, p.learned[addr])
 	}
-	tmp := p.path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
+	// 临时文件走 CreateTemp：它自带 O_EXCL 与随机名，同目录里预置的同名文件或
+	// 符号链接不会被跟随，这次写只可能落在自己刚建出来的那个文件上。
+	f, err := os.CreateTemp(filepath.Dir(p.path), filepath.Base(p.path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	// 先落盘再改名：rename 之后才崩溃的话，留下的是一个"看起来成功、内容没
+	// 落盘"的记录，而它的作用正是挡住中间人。
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, p.path); err != nil {
-		_ = os.Remove(tmp)
+		os.Remove(tmp)
 		return err
 	}
 	return nil
