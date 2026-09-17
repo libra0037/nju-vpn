@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+
+	"github.com/libra0037/nju-vpn/internal/l3"
 )
 
 // ipChecksum 按 RFC 1071 整包重算 IP 头校验和，用来验证增量更新是否正确。
@@ -399,5 +401,44 @@ func TestMapperICMPErrorFragmentChecksum(t *testing.T) {
 // 生产路径用的是动态映射（NewDynamicMapper）：服务端可能在会话中途换地址。
 // 固定地址只在用例里用，所以它是测试助手而不是生产 API。
 func fixedMapper(peer, public net.IP) (*Mapper, error) {
-	return NewDynamicMapper(peer, func() net.IP { return public })
+	pub, err := to4(public)
+	if err != nil {
+		return nil, err
+	}
+	return NewDynamicMapper(peer, func() ([4]byte, bool) { return pub, true })
+}
+
+// TestMapperAllocationsPerPacket 钉住映射层热路径的分配预算。
+//
+// 隧道地址每个包都现取一次，但那必须是端点上的一次原子读（LocalAddr4），
+// 不能是 net.IP 那种每次 make 一个切片的形式；错误文案也不能让局部数组
+// 逃逸（addrString 就是为此存在的）。这两条合起来是"每包 0 分配"。
+func TestMapperAllocationsPerPacket(t *testing.T) {
+	ep := l3.New()
+	ep.SetLocalAddr(net.IPv4(172, 29, 56, 18))
+	m, err := NewDynamicMapper(net.IPv4(10, 66, 66, 2), ep.LocalAddr4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(2000, func() { _, _ = m.currentPublic() }); n != 0 {
+		t.Errorf("每包取一次地址分配了 %.1f 次，期望 0", n)
+	}
+
+	dst := [4]byte{202, 119, 32, 69}
+	pub := [4]byte{172, 29, 56, 18}
+	pkt := buildUDP(m.peerIP, dst, []byte("x"))
+	failed := false
+	n := testing.AllocsPerRun(2000, func() {
+		// 改写是原地的：每次先把目的地址复位回隧道地址。
+		copy(pkt[ipv4DstOffset:], pub[:])
+		if _, err := m.Downlink(pkt); err != nil {
+			failed = true
+		}
+	})
+	if failed {
+		t.Fatal("下行改写失败")
+	}
+	if n != 0 {
+		t.Errorf("下行每包分配 %.1f 次，期望 0", n)
+	}
 }

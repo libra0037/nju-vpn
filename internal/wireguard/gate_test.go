@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libra0037/nju-vpn/internal/l3"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 )
@@ -85,15 +86,18 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 // TestMapperFollowsAddressChange 验证映射用的是“当前”隧道地址：服务端中途下发
 // 新地址之后，上行改写与新地址匹配、下行按新地址放行、旧地址不再被认。
 func TestMapperFollowsAddressChange(t *testing.T) {
-	current := net.IPv4(172, 16, 0, 9)
-	m, err := NewDynamicMapper(net.IPv4(10, 66, 66, 2), func() net.IP { return current })
+	// 地址来源就是生产上的那一个（端点的原子量），不是测试自己搓的回调。
+	ep := l3.New()
+	ep.SetLocalAddr(net.IPv4(172, 16, 0, 9))
+	m, err := NewDynamicMapper(net.IPv4(10, 66, 66, 2), ep.LocalAddr4)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	dst := [4]byte{202, 119, 32, 69}
 	newAddr := net.IPv4(172, 16, 9, 9)
-	current = newAddr
+	// 服务端中途下发新地址。
+	ep.SetLocalAddr(newAddr)
 
 	pkt := buildUDP(m.peerIP, dst, []byte("x"))
 	if _, err := m.Uplink(pkt); err != nil {

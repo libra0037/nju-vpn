@@ -64,6 +64,18 @@ func (ep *Endpoint) LocalAddr() net.IP {
 	return out
 }
 
+// LocalAddr4 返回当前隧道地址的 4 字节形式。
+//
+// 第二个返回值为 false 表示还没有地址。它不分配：承载层的地址映射每个包
+// 都要读一次，而 LocalAddr 会 make 一个切片。
+func (ep *Endpoint) LocalAddr4() ([4]byte, bool) {
+	addr := ep.local.Load()
+	if addr == nil {
+		return [4]byte{}, false
+	}
+	return *addr, true
+}
+
 func (ep *Endpoint) update(change func(*binding)) {
 	for {
 		cur := ep.binding.Load()

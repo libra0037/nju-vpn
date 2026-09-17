@@ -74,7 +74,7 @@ func (b *bearer) attach(sess *ztna.Session) error {
 	}
 	// 隧道地址可能在会话中途变（服务端下发地址列表）：映射按端点上的当前
 	// 值现取，换了地址之后上下行自动跟着走，不必重建会话或重装 peer。
-	mapper, err := wireguard.NewDynamicMapper(b.peerAddr, sess.Endpoint().LocalAddr)
+	mapper, err := wireguard.NewDynamicMapper(b.peerAddr, sess.Endpoint().LocalAddr4)
 	if err != nil {
 		return fmt.Errorf("地址映射: %w", err)
 	}
