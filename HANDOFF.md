@@ -213,7 +213,17 @@ TLS 有两处，校验方式不同：控制面走系统信任链（门户证书�
 
 提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l .`、`go vet ./...`、`go build ./...`、六个发布平台的交叉编译、`go test ./... -race`、`go mod tidy -diff`、`staticcheck ./...`、`deadcode -test ./...`，加上"README 里的子命令都能在 usage 里找到"这一条——都应当无输出或全绿。工具装在 `$(go env GOPATH)/bin` 下也会被找到（不必先进 PATH）。`scripts/build-release.sh <版本>` 生成各平台产物（产物目录不进 git）。
 
-`govulncheck` 已于 2026-09-17 重测：本代码 0 命中（依赖模块里有 30 条，但都不被调用）。`deadcode -test ./...` 已接进 `check.sh`，当前无输出。`gosec` 仍是协议更换之前测的，重测之前不要按旧数字判断"新出现的条目"。
+`govulncheck` 已于 2026-09-17 重测：本代码 0 命中（依赖模块里有 30 条，但都不被调用）。`deadcode -test ./...` 已接进 `check.sh` 与 CI，当前无输出。
+
+`gosec` 也于 2026-09-17 重测：63 条，全部可解释，重跑时按类别比对而不是按条数——31 条 G104（`Close`/`Remove` 的返回值没处理，都在收尾路径上）、15 条 G115（`int` 转 `uint16`/`byte`，转换前都有范围校验或调用点契约，见 REVIEW 的 L21）、G402/G123/G101 是设计如此（自签节点按指纹认、控制面留的 `insecure_skip_verify` 开关、API 路径常量被当成凭据），G304/G204 是"路径来自用户配置"与"自启动子进程"，其余落在 `internal/ztnatest` 测试替身里。
+
+### 9.6 发布流程
+
+1. 确认工作区干净、`scripts/check.sh` 全绿，再把分支推到 `origin/main`（CI 会在 push 时跑同一个脚本）。
+2. `scripts/build-release.sh v0.1.0`：生成 `dist/` 下六个平台的产物与 `SHA256SUMS`。
+3. 自检产物：`dist/njuvpn-linux-amd64 version` 要打印注入的版本号；`cd dist && sha256sum -c SHA256SUMS`；抽查二进制里没有本机路径（`strings dist/njuvpn-linux-amd64 | grep "$HOME"` 应当没有输出）。
+4. `git tag v0.1.0 && git push origin v0.1.0`，再 `gh release create v0.1.0 dist/* --notes-file <说明>`。
+5. 发布说明写清已知限制：Windows 产物未签名（SmartScreen 会拦一次）、macOS 只保证能编译（未实测）、同一账号同一时刻只允许一条隧道会话、新设备首次登录要短信验证码、能访问哪些校内地址由服务端资源表决定。
 
 ### 9.3 调试时踩过的坑
 

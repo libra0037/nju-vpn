@@ -60,9 +60,12 @@ njuvpn version          查看版本
 
 ### 3. 客户端接入
 
-客户端是任意支持 WireGuard 的程序，服务进程这边只认配置里 `wireguard.peer_public_key` 写的那一个公钥。顺序是**先写公钥、再启动**：承载层在服务进程启动时就建好了，之后再改这个键要 `njuvpn restart`（重启会重新登录一次）。
+客户端是任意支持 WireGuard 的程序。两边的公钥是分开的，按这个顺序来：
 
-服务端公钥在启动日志里，客户端配置要用它——首次启动会生成承载层私钥并写回配置文件，同时打印 `WireGuard 服务端公钥: ...`。
+1. 客户端先生成自己的密钥对（Clash Verge 会自动生成；内核 WireGuard 用 `wg genkey | wg pubkey`），把**客户端公钥**填进配置的 `wireguard.peer_public_key`。
+   （承载层在服务进程启动时就建好了，之后改这个键要 `njuvpn restart`，重启会重新登录一次。）
+2. 启动 `njuvpn start`。首次启动会生成承载层私钥并写回配置文件，日志里有一行 `WireGuard 服务端公钥: ...`——**服务端公钥是启动之后才有的**。
+3. 把**服务端公钥**填进客户端。这一步不影响服务进程，不必重启。
 
 **Clash Verge**：添加一个 WireGuard 节点即可（客户端私钥由它自己生成，把对应的公钥填进 `wireguard.peer_public_key`；`ip` 必须与服务端的 `peer_address` 一致，通常是 10.66.66.2）：
 
