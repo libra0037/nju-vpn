@@ -2,7 +2,6 @@ package ztna
 
 import (
 	"context"
-	"fmt"
 )
 
 // 授信终端：把当前设备绑到账号上，之后这台设备登录不再要求二次验证。
@@ -158,11 +157,4 @@ func (s *Session) EnsureTrusted(ctx context.Context) error {
 	}
 	s.client.logf("已绑定为授信终端（%d/%d），之后登录免二次验证", st.Count, st.Max)
 	return nil
-}
-
-func (d *DeviceSession) String() string {
-	if d == nil || d.sess == nil {
-		return "device session (nil)"
-	}
-	return fmt.Sprintf("device session (own=%v)", d.own)
 }

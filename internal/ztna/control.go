@@ -95,12 +95,14 @@ type controlOptions struct {
 	Server   string
 	DialAddr string
 	Dial     dial.DialFunc
-	Timeout  time.Duration
 	DeviceID string
 	Debug    func(string)
 	// InsecureSkipVerify 关闭证书校验；默认 false，也就是走系统信任链。
 	InsecureSkipVerify bool
 }
+
+// controlTimeout 是控制面单次请求的整体上限（连接、TLS 与响应都算在内）。
+const controlTimeout = 20 * time.Second
 
 func newControl(opts controlOptions) (*control, error) {
 	if opts.Dial == nil {
@@ -108,9 +110,6 @@ func newControl(opts controlOptions) (*control, error) {
 	}
 	if opts.Server == "" || opts.DialAddr == "" {
 		return nil, fmt.Errorf("缺少服务端地址")
-	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 20 * time.Second
 	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -125,7 +124,7 @@ func newControl(opts controlOptions) (*control, error) {
 	}
 	c.hc = &http.Client{
 		Jar:     jar,
-		Timeout: opts.Timeout,
+		Timeout: controlTimeout,
 		Transport: &http.Transport{
 			// 默认走系统信任链：门户证书由公共 CA 签发，链与名称都能校验，
 			// 口令与验证码因此不会交给路上的中间人（ServerName 由 URL 的主机名

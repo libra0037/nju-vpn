@@ -42,9 +42,6 @@ const (
 	// 握手请求里携带的地址类型：1 = IPv4（虚拟地址体 6 字节）。
 	addrTypeIPv4 byte = 0x01
 
-	// 单个数据帧里允许的最大包数，服务端不会一次给更多。
-	maxFramesPerFrame = 0xFF
-
 	// handshakeFrameLimit 是握手阶段的信封帧数上限。
 	//
 	// 握手正常只有一两帧（一个鉴权结果加一个虚拟地址），而读循环本身没有尽头：
@@ -215,12 +212,12 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 // encodeDataFrame 构造数据帧：
 //
 //	05 14 <u8 tokenLen> <token> 00 00 <u8 count> (<u16 len> <包>)*
+//
+// 前提：count 是单字节，调用方每次最多传 authBatchSize（32）个包；在调用点
+// 提高批量之前先改这里，否则计数会被截断。
 func encodeDataFrame(token string, pkts ...[]byte) ([]byte, error) {
 	if len(token) > 0xFF {
 		return nil, &ProtocolError{What: "会话令牌过长", Got: fmt.Sprintf("%d", len(token))}
-	}
-	if len(pkts) > maxFramesPerFrame {
-		return nil, &ProtocolError{What: "单帧包数过多"}
 	}
 	size := 3 + len(token) + 2 + 1
 	for _, p := range pkts {

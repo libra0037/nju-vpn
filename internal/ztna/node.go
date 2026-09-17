@@ -22,9 +22,6 @@ func probeNodes(ctx context.Context, dialFn dial.DialFunc, addrs []string, timeo
 	if len(addrs) == 0 {
 		return "", &ProtocolError{What: "资源表里没有可用的隧道节点"}
 	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
