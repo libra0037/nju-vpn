@@ -451,16 +451,24 @@ func validateHost(field, host string) error {
 // 已经有了就不覆盖：两个进程同时首启同一份配置时，后写的那个会让盘上的
 // 私钥与正在跑的那个进程内存里的不一致——之后所有客户端配置都会失效。
 func PersistPrivateKey(path, key string) error {
-	return persistWireGuardField(path, "private_key", key, false)
+	return persistField(path, "wireguard", "private_key", key)
 }
 
 // PersistDeviceID 把设备标识写回配置文件（顶层字段）。
 func PersistDeviceID(path, id string) error {
-	return persistTopLevelField(path, "device_id", id, false)
+	return persistField(path, "", "device_id", id)
 }
 
-// persistTopLevelField 就地替换顶层字段，保留注释；没有该行时追加。
-func persistTopLevelField(path, field, value string, overwrite bool) error {
+// persistField 就地替换配置里的一个字段，保留原有注释与文件权限。
+//
+// section 为空表示顶层字段，否则是段名（目前只有 wireguard）。两条入口只差
+// "在哪一段里找、找不到时往哪插"，机制共用一份——分成两个函数时漏改一处，
+// 就会出现"某个字段的写回不保注释"或"漏掉块写法校验"这类只在一条路径上
+// 出现的故障。
+//
+// 只在字段为空时写入：私钥与设备标识都是首次启动自举出来的，已有值必须保留
+// （两个进程同时首启同一份配置时，先写的那份才算数）。
+func persistField(path, section, field, value string) error {
 	if path == "" {
 		return fmt.Errorf("没有配置文件路径")
 	}
@@ -473,113 +481,107 @@ func persistTopLevelField(path, field, value string, overwrite bool) error {
 		return err
 	}
 	lines := strings.Split(string(data), "\n")
-	insertAt := -1
-	for i, line := range lines {
+
+	start, end := 0, len(lines)
+	if section != "" {
+		if start, end, err = sectionRange(lines, section, path); err != nil {
+			return err
+		}
+	}
+
+	for i := start; i < end; i++ {
+		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			if insertAt < 0 {
-				insertAt = i
-			}
 			continue
 		}
-		if len(line)-len(strings.TrimLeft(line, " 	")) != 0 {
+		// 顶层字段必须顶格，段里的字段必须缩进。不按缩进区分，就会把别的
+		// 段里的同名字段当成目标。
+		if (section == "") != (indentOf(line) == 0) {
 			continue
 		}
-		if strings.HasPrefix(trimmed, field+":") {
-			if !overwrite && existingValue(line) != "" {
-				return nil
-			}
-			lines[i] = field + ": " + value + commentOf(line)
-			return writePreservingMode(path, fi, lines)
+		if !strings.HasPrefix(trimmed, field+":") {
+			continue
 		}
-		if insertAt < 0 {
-			insertAt = i + 1
+		if existingValue(line) != "" {
+			return nil
 		}
+		// 保留行尾注释：样例文件里 private_key 那行就带着说明，写回时丢掉它
+		// 等于破坏用户手写的配置。
+		lines[i] = line[:indentOf(line)] + field + ": " + value + commentOf(line)
+		return writePreservingMode(path, fi, lines)
 	}
-	if insertAt < 0 {
-		insertAt = len(lines)
+
+	if section == "" {
+		at := topLevelInsertAt(lines)
+		return writePreservingMode(path, fi, insertLine(lines, at, field+": "+value))
 	}
-	lines = append(lines[:insertAt], append([]string{field + ": " + value}, lines[insertAt:]...)...)
-	return writePreservingMode(path, fi, lines)
+	if start < 0 {
+		// 完全没有这一段：追加一段。
+		return writePreservingMode(path, fi, append(lines, section+":", "  "+field+": "+value))
+	}
+	// 有这一段但没有该字段：插到段尾，跳过段末的空行。
+	at := end
+	for at > start+1 && strings.TrimSpace(lines[at-1]) == "" {
+		at--
+	}
+	return writePreservingMode(path, fi, insertLine(lines, at, "  "+field+": "+value))
 }
 
-// PersistPeerPublicKey 把客户端公钥写回配置文件。
-//
-// 这一条是用户显式发起的操作，要覆盖旧值。
-func PersistPeerPublicKey(path, key string) error {
-	return persistWireGuardField(path, "peer_public_key", key, true)
-}
-
-// persistWireGuardField 就地替换 wireguard 段里的某个字段，保留原有注释——
-// 用 YAML 序列化整份配置会把注释全部丢掉，而那份文件是给人看的。
-// 找不到对应行时按情况插入或追加一段。
-//
-// overwrite 为 false 时，字段已经有非空值就原样保留（私钥自举用得上：
-// 两个进程同时首启同一份配置时，先写的那把才算数）。
-func persistWireGuardField(path, field, value string, overwrite bool) error {
-	if path == "" {
-		return fmt.Errorf("没有配置文件路径")
-	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(data), "\n")
-	sectionAt := -1  // wireguard: 所在行
-	sectionEnd := -1 // wireguard 段的最后一行
-	inSection := false
+// topLevelInsertAt 返回顶层字段插在哪一行：开头是注释或空行时插在它们之后，
+// 否则插在第一条顶格键之后。
+func topLevelInsertAt(lines []string) int {
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		if indent == 0 {
-			if inSection {
-				sectionEnd = i - 1
-				inSection = false
-			}
-			if strings.HasPrefix(trimmed, "wireguard:") {
-				if !isBlockMapping(trimmed, "wireguard:") {
-					return fmt.Errorf("%s 的 wireguard 段不是块写法（%q）：把那一行展开成\n"+
-						"wireguard:\n  private_key: ...\n再启动，或手工填好要写回的字段", path, trimmed)
-				}
-				sectionAt = i
-				sectionEnd = i
-				inSection = true
-			}
-			continue
-		}
-		if !inSection {
-			continue
-		}
-		sectionEnd = i
-		if strings.HasPrefix(trimmed, field+":") {
-			if !overwrite && existingValue(line) != "" {
-				return nil
-			}
-			// 保留行尾注释：样例文件里 private_key 那行就带着说明，
-			// 写回私钥时丢掉它等于破坏用户手写的配置。
-			lines[i] = line[:indent] + field + ": " + value + commentOf(line)
-			return writePreservingMode(path, fi, lines)
+		if indentOf(line) == 0 {
+			return i + 1
 		}
 	}
+	return len(lines)
+}
 
-	switch {
-	case sectionAt >= 0:
-		// 有 wireguard 段但没有 private_key 行，插到段尾。
-		insertAt := sectionEnd + 1
-		lines = append(lines[:insertAt], append([]string{"  " + field + ": " + value}, lines[insertAt:]...)...)
-	default:
-		// 完全没有 wireguard 段，追加一段。
-		lines = append(lines, "wireguard:", "  "+field+": "+value)
+// sectionRange 返回某一段的行区间 [start, end)：段头那行到下一个顶格键之前。
+//
+// 段不存在时返回 (-1, -1, nil)，由调用方决定怎么补。段头写成流式
+// （wireguard: {peer_address: ...}）时返回错误：往它后面插一行缩进两格的字段
+// 会让整份文件解析不过，那种写法必须拒绝写回（调用方按警告处理）。
+func sectionRange(lines []string, section, path string) (int, int, error) {
+	start := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || indentOf(line) != 0 {
+			continue
+		}
+		if start < 0 {
+			if !strings.HasPrefix(trimmed, section+":") {
+				continue
+			}
+			if !isBlockMapping(trimmed, section+":") {
+				return -1, -1, fmt.Errorf("%s 的 %s 段不是块写法（%q）：把那一行展开成\n%s:\n  字段: 值\n再启动，或手工填好要写回的字段", path, section, trimmed, section)
+			}
+			start = i
+			continue
+		}
+		return start, i, nil
 	}
-	return writePreservingMode(path, fi, lines)
+	if start < 0 {
+		return -1, -1, nil
+	}
+	return start, len(lines), nil
+}
+
+// indentOf 返回行首缩进宽度（空格与制表符各算一个字符）。
+func indentOf(line string) int { return len(line) - len(strings.TrimLeft(line, " \t")) }
+
+// insertLine 在 at 处插入一行。
+func insertLine(lines []string, at int, line string) []string {
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:at]...)
+	out = append(out, line)
+	return append(out, lines[at:]...)
 }
 
 // isBlockMapping 判断一行 "key:" 是不是块映射的开头。

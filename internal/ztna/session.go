@@ -103,7 +103,24 @@ type Session struct {
 
 // Connect 完成登录并建立隧道。需要验证码时返回 (session, ErrAuthRequired)。
 func (c *Client) Connect(ctx context.Context, co ConnectOptions) (*Session, error) {
-	password := co.Password
+	s, err := c.newSession(ctx, co.Password, false)
+	if err != nil {
+		return s, err
+	}
+	if err := s.prepare(ctx); err != nil {
+		_ = s.Close(context.Background())
+		return s, err
+	}
+	return s, nil
+}
+
+// newSession 完成到"认证链走完"为止的登录：口令登录、上报环境、按服务名往
+// 下走。devicesOnly 表示这次登录只为授信终端操作服务，不取资源也不建隧道。
+//
+// 两条入口（建隧道 / 只做授信终端）的差别只有这一处，其余必须逐字一致：
+// 以前它们是两份拷贝，改漏一处就会出现"某条路径忘了保留会话"这种只在一个
+// 入口上出现的故障。
+func (c *Client) newSession(ctx context.Context, password string, devicesOnly bool) (*Session, error) {
 	if password == "" {
 		password = c.opts.Password
 	}
@@ -114,7 +131,7 @@ func (c *Client) Connect(ctx context.Context, co ConnectOptions) (*Session, erro
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New()}
+	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New(), devicesOnly: devicesOnly}
 
 	if err := s.beginLogin(ctx); err != nil {
 		_ = s.Close(context.Background())
@@ -122,10 +139,6 @@ func (c *Client) Connect(ctx context.Context, co ConnectOptions) (*Session, erro
 	}
 	if s.step.Service != "" {
 		return s, &ErrAuthRequired{Kind: s.step.Service, Hint: s.smsHint(ctx)}
-	}
-	if err := s.prepare(ctx); err != nil {
-		_ = s.Close(context.Background())
-		return s, err
 	}
 	return s, nil
 }
@@ -432,25 +445,7 @@ func (s *Session) reconnectNodes() []string {
 
 // connectLoginOnly 只做登录（用于授信终端操作），不取资源也不建隧道。
 func (c *Client) connectLoginOnly(ctx context.Context, password string) (*Session, error) {
-	if password == "" {
-		password = c.opts.Password
-	}
-	if c.opts.DeviceID == "" {
-		return nil, &ProtocolError{What: "缺少设备标识"}
-	}
-	ctrl, err := c.newControl(c.opts.DeviceID)
-	if err != nil {
-		return nil, err
-	}
-	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New(), devicesOnly: true}
-	if err := s.beginLogin(ctx); err != nil {
-		_ = s.Close(context.Background())
-		return s, err
-	}
-	if s.step.Service != "" {
-		return s, &ErrAuthRequired{Kind: s.step.Service, Hint: s.smsHint(ctx)}
-	}
-	return s, nil
+	return c.newSession(ctx, password, true)
 }
 
 // Close 登出并释放本地资源。可重复调用。
