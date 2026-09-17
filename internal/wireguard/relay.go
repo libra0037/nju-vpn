@@ -78,10 +78,6 @@ type Relay struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
-	// 上行是字节流，需要按 IPv4 总长度重新切包。
-	frameMu  sync.Mutex
-	frameBuf []byte
-
 	// 丢包按原因分开计数：混成一个数字时，"隧道 up 却一个包都过不去"
 	// 这种最常见的问题在日志里没有任何线索。
 	drops [dropReasonCount]dropCounter
@@ -112,10 +108,15 @@ func NewRelay(opts RelayOptions) *Relay {
 
 // InstallSession 把承载层接到一次校园网会话上。
 //
-// 可以反复调用。换绑之后旧会话的回调立刻失效；旧会话残留的下行包即使
-// 挤进来，也会因为目的地址不等于新会话分配到的地址而被 Mapper 丢掉。
+// 可以反复调用。换绑之后旧会话的回调立刻失效；队列里属于旧会话的下行包
+// 一并排空（它们的地址是按旧会话改写好的，交出去就是一批孤儿包）。
+//
+// 回调的输入约定：投递的必须是**完整**的 IPv4 包，不是字节流。生产路径上
+// 唯一的调用方是隧道读循环，它先用 splitPackets 切好边界再逐包投递。切包
+// 缓冲因此不存在——它防的是永远不会到达的半包，而且让"读者要记得它还留着
+// 半截字节"变成一个跨会话的状态。
 func (r *Relay) InstallSession(ep *l3.Endpoint, mapper *Mapper) {
-	r.dropPartialFrame()
+	r.dropStaleQueue()
 	r.session.Store(&relaySession{ep: ep, mapper: mapper})
 	ep.SetDownlink(r.deliver)
 }
@@ -133,36 +134,37 @@ func (r *Relay) HoldDownlink(hold bool) {
 
 // ClearSession 摘掉当前会话。设备继续监听，但不再有任何包进出隧道。
 func (r *Relay) ClearSession() {
-	r.dropPartialFrame()
+	r.dropStaleQueue()
 	if old := r.session.Swap(nil); old != nil {
 		old.ep.ClearDownlink()
 	}
 }
 
-// dropPartialFrame 丢掉切包缓冲里残留的半包。
+// dropStaleQueue 丢掉队列里属于上一个会话的下行包。
 //
-// 缓冲是跨会话共用的：旧会话断开时若正好只送来半个包，那半截会被当成新会话
-// 第一个包的前半段，接下来的字节全部错位，表现是"重连成功之后一段时间下行
-// 没有反应"。会话换绑是唯一知道"这条字节流到此为止"的时刻，在这里清最省事，
-// 也让这件事在丢包统计里留下一条记录。
-func (r *Relay) dropPartialFrame() {
-	r.frameMu.Lock()
-	pending := len(r.frameBuf)
-	r.frameBuf = nil
-	r.frameMu.Unlock()
-	if pending > 0 {
-		r.countDrop(dropSessionSwap)
+// 队列里存的是已经按旧会话地址改写好的包：换绑之后新会话的映射认不出它们
+// （下行包的目的地址对不上），交给客户端就是一批孤儿包，而且不会有任何
+// 记录。会话换绑是唯一知道"这些包已经没用了"的时刻。
+func (r *Relay) dropStaleQueue() {
+	for {
+		select {
+		case <-r.queue:
+			r.countDrop(dropStaleQueue)
+		default:
+			return
+		}
 	}
 }
 
-// deliver 接收隧道下行的字节流，按 IP 总长度切包后放进队列。
+// deliver 接收隧道下行的一个完整 IPv4 包，改写地址后放进队列。
 //
-// 调用方（隧道读循环）复用读缓冲，所以这里必须拷贝；
-// 而且不能假设"一次读 = 一个包"——粘包与半包都会出现。
+// 输入约定见 InstallSession：调用方投递的是完整包。这里只做一次边界校验
+// （长度必须正好等于 IPv4 头里声明的总长度）：不满足就整段丢掉并计数——
+// 宁可丢一个包，也不能把错位的字节当成包交给 WireGuard。
 //
-// 缓冲区不会无限涨：切不出包时会把整段丢弃等下一个包同步，
-// 而单个包的长度受 IPv4 总长度（16 位）限制。
-func (r *Relay) deliver(chunk []byte) {
+// 调用方（隧道读循环）复用读缓冲，切出来的包是同一块内存的视图，所以入队
+// 前必须拷贝。
+func (r *Relay) deliver(pkt []byte) {
 	select {
 	case <-r.closed:
 		return
@@ -171,73 +173,33 @@ func (r *Relay) deliver(chunk []byte) {
 	sess := r.session.Load()
 	if sess == nil {
 		// 会话刚被摘掉，这是最后一瞬间漂进来的包。
+		r.countDrop(dropDownlinkNoSession)
 		return
 	}
 
-	r.frameMu.Lock()
-	// 会话可能在切包过程中被换掉：这段字节属于旧会话，丢掉。没有这道判断
-	// 的话，旧会话的尾巴会接在新会话的第一个包前面（见 dropPartialFrame）。
-	if r.session.Load() != sess {
-		r.frameMu.Unlock()
+	total, err := ipv4TotalLength(pkt)
+	if err != nil || total != len(pkt) {
+		r.countDrop(dropDownlinkInvalid)
 		return
 	}
-	r.frameBuf = append(r.frameBuf, chunk...)
-	var packets [][]byte
-	for {
-		pkt, rest, err := splitPacket(r.frameBuf)
+	out := make([]byte, len(pkt))
+	copy(out, pkt)
+	if sess.mapper != nil {
+		rewritten, err := sess.mapper.Downlink(out)
 		if err != nil {
-			// 对端给了不符合 IPv4 的字节，丢掉整段缓冲等下一个包同步。
-			// 走统一的计数与限速：以前这里是裸日志，下行一旦失步就按
-			// chunk 刷屏，而丢包统计里一条记录都没有。
-			r.countDrop(dropDownlinkInvalid)
-			r.frameBuf = nil
-			break
-		}
-		if pkt == nil {
-			break
-		}
-		packets = append(packets, pkt)
-		r.frameBuf = rest
-	}
-	r.frameMu.Unlock()
-
-	for _, pkt := range packets {
-		if sess.mapper != nil {
-			rewritten, err := sess.mapper.Downlink(pkt)
-			if err != nil {
-				r.countDrop(dropDownlinkAddr)
-				continue
-			}
-			pkt = rewritten
-		}
-		select {
-		case r.queue <- pkt:
-		case <-r.closed:
+			r.countDrop(dropDownlinkAddr)
 			return
-		default:
-			// 队列满，丢弃。隧道里的 TCP 会重传，UDP 本来就允许丢。
-			r.countDrop(dropDownlinkFull)
 		}
+		out = rewritten
 	}
-}
-
-// splitPacket 从缓冲里切出一个完整 IP 包。
-//
-// 返回 (nil, buf, nil) 表示数据还不够一个包，需要继续等。
-func splitPacket(buf []byte) (pkt []byte, rest []byte, err error) {
-	if len(buf) < ipv4MinHeader {
-		return nil, buf, nil
+	select {
+	case r.queue <- out:
+	case <-r.closed:
+		return
+	default:
+		// 队列满，丢弃。隧道里的 TCP 会重传，UDP 本来就允许丢。
+		r.countDrop(dropDownlinkFull)
 	}
-	total, err := ipv4TotalLength(buf)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(buf) < total {
-		return nil, buf, nil
-	}
-	pkt = make([]byte, total)
-	copy(pkt, buf[:total])
-	return pkt, buf[total:], nil
 }
 
 // dropReason 是丢包原因。每种原因单独计数、单独限速打日志。
@@ -251,6 +213,9 @@ const (
 	dropDownlinkAddr
 	// dropDownlinkFull：下行队列满（WireGuard 读得慢）。
 	dropDownlinkFull
+	// dropDownlinkNoSession：隧道下行包到达时会话刚被摘掉（断开窗口里的
+	// 尾巴）。以前这里静默返回，丢了多少没有任何线索。
+	dropDownlinkNoSession
 	// dropUplinkNotIPv4：WireGuard 解出来的不是 IPv4 包。
 	dropUplinkNotIPv4
 	// dropUplinkAddr：上行包的源地址不是 peer 地址——最典型的成因是
@@ -270,25 +235,26 @@ const (
 	// dropUplinkRejected：上行通道接上了，但隧道拒绝了这个包
 	//（最常见的是目标不在资源表内、或该流鉴权失败）。
 	dropUplinkRejected
-	// dropSessionSwap：会话切换（重连、换账号）时切包缓冲里还留着半个包，
-	// 只能丢掉——留着它会让新会话的下行全部错位。
-	dropSessionSwap
+	// dropStaleQueue：会话切换（重连、换账号）时队列里还留着属于旧会话的
+	// 下行包。它们的地址是按旧会话改写好的，交出去就是一批孤儿包。
+	dropStaleQueue
 
 	dropReasonCount
 )
 
 var dropReasonText = [dropReasonCount]string{
-	dropDownlinkInvalid: "下行数据切不出 IPv4 包",
-	dropDownlinkAddr:    "下行包的目的地址不是本次分配到的地址（检查客户端 allowed_ips 与 peer_address）",
-	dropDownlinkFull:    "下行队列已满",
-	dropUplinkNotIPv4:   "上行解出来的不是 IPv4 包",
-	dropUplinkAddr:      "上行包的源地址不是 peer_address（客户端 ip 配置不一致？）",
-	dropPeerNotReady:    "客户端尚未握手，下行包被丢弃（客户端还没连上，或密钥不匹配）",
-	dropNoBuffer:        "读缓冲装不下这个包",
-	dropNoSession:       "隧道尚未建立，客户端发来的包被丢弃",
-	dropNoUplink:        "隧道上行通道未就绪，包被丢弃",
-	dropUplinkRejected:  "隧道拒绝了这个上行包",
-	dropSessionSwap:     "会话切换时丢掉了残留的半包（重连时正常）",
+	dropDownlinkInvalid:   "下行数据切不出 IPv4 包",
+	dropDownlinkAddr:      "下行包的目的地址不是本次分配到的地址（检查客户端 allowed_ips 与 peer_address）",
+	dropDownlinkFull:      "下行队列已满",
+	dropDownlinkNoSession: "会话已摘掉，下行包被丢弃（断开窗口里的尾巴）",
+	dropUplinkNotIPv4:     "上行解出来的不是 IPv4 包",
+	dropUplinkAddr:        "上行包的源地址不是 peer_address（客户端 ip 配置不一致？）",
+	dropPeerNotReady:      "客户端尚未握手，下行包被丢弃（客户端还没连上，或密钥不匹配）",
+	dropNoBuffer:          "读缓冲装不下这个包",
+	dropNoSession:         "隧道尚未建立，客户端发来的包被丢弃",
+	dropNoUplink:          "隧道上行通道未就绪，包被丢弃",
+	dropUplinkRejected:    "隧道拒绝了这个上行包",
+	dropStaleQueue:        "会话切换时丢掉了队列里属于旧会话的下行包（重连时正常）",
 }
 
 // dropQuietInterval 是几种"预期之内、会一直重复"的丢包原因的日志间隔。
@@ -298,22 +264,25 @@ var dropReasonText = [dropReasonCount]string{
 // 知道发生了什么，之后按这个间隔报一次数，不必跟着默认间隔刷屏。
 // 零值表示用默认的 dropLogInterval。
 var dropQuietInterval = [dropReasonCount]time.Duration{
-	dropPeerNotReady: 5 * time.Minute,
-	dropSessionSwap:  5 * time.Minute,
+	dropPeerNotReady:      5 * time.Minute,
+	dropDownlinkNoSession: 5 * time.Minute,
+	dropStaleQueue:        5 * time.Minute,
 }
 
 // dropCounter 是一种原因的计数与限速状态。
 type dropCounter struct {
-	n        atomic.Uint64
-	lastLog  atomic.Int64
-	firstLog atomic.Bool
+	n       atomic.Uint64
+	lastLog atomic.Int64
+	// lastDetail 是上次打出来的整句文案（含具体原因）。原因变了就立刻打
+	// 一条：同一种丢包可能由多个调用点触发（目标不在资源表内、该流鉴权
+	// 失败……），限速窗口内共用第一句话等于把排查往回推给"猜"。
+	lastDetail atomic.Pointer[string]
 }
 
 // countDrop 记录一次丢包，并按原因限速打日志。
 //
 // 每种原因第一次出现必定打一条（否则用户第一次踩配置错误时什么都没看到），
-// 之后按间隔限速。
-// countDrop 记录一次丢包。
+// 之后按间隔限速；原因文案变了则立刻再打一条。
 func (r *Relay) countDrop(reason dropReason) { r.countDropDetail(reason, nil) }
 
 // countDropDetail 与 countDrop 同样限速，但把具体原因一起打出来。
@@ -324,19 +293,20 @@ func (r *Relay) countDrop(reason dropReason) { r.countDropDetail(reason, nil) }
 func (r *Relay) countDropDetail(reason dropReason, detail error) {
 	c := &r.drops[reason]
 	n := c.n.Add(1)
-	interval := dropLogInterval
-	if quiet := dropQuietInterval[reason]; quiet > 0 {
-		interval = quiet
-	}
 	text := dropReasonText[reason]
 	if detail != nil {
 		text += ": " + detail.Error()
 	}
 	report := func() { log.Printf("wireguard: 丢弃 %s（累计 %d 个）", text, n) }
-	if c.firstLog.CompareAndSwap(false, true) {
+	// 第一次出现、或原因文案变了：立刻打一条，不等限速窗口。
+	if old := c.lastDetail.Swap(&text); old == nil || *old != text {
 		c.lastLog.Store(time.Now().UnixNano())
 		report()
 		return
+	}
+	interval := dropLogInterval
+	if quiet := dropQuietInterval[reason]; quiet > 0 {
+		interval = quiet
 	}
 	now := time.Now().UnixNano()
 	last := c.lastLog.Load()

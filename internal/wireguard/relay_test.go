@@ -65,54 +65,64 @@ func readOne(t *testing.T, r *Relay, size int) []byte {
 	}
 }
 
-// TestRelaySessionSwapDropsPartialPacket 验证会话切换时残留的半包被丢掉。
+// TestRelaySessionSwapDropsQueuedPackets 验证会话切换时排空属于旧会话的下行包。
 //
-// 切包缓冲跨会话共用：旧会话断开时若正好只送来半个包，那半截会被当成新会话
-// 第一个包的前半段，接下来的字节全部错位（重组出一个长度对得上、内容全错的
-// 包），表现是"重连成功之后一段时间下行没有反应"，而丢包统计里一条记录都
-// 没有。
-func TestRelaySessionSwapDropsPartialPacket(t *testing.T) {
+// 队列里存的是按旧会话地址改写好的包：换绑后新会话的映射认不出它们（下行
+// 目的地址对不上），交给客户端就是一批孤儿包，而且不会有任何记录。会话换绑
+// 是唯一知道"这些包已经没用"的时刻。
+func TestRelaySessionSwapDropsQueuedPackets(t *testing.T) {
 	peer := [4]byte{10, 66, 66, 2}
 	pub := [4]byte{172, 29, 56, 18}
 	full := ipv4Pkt(pub, peer, 100)
 
 	t.Run("换绑会话", func(t *testing.T) {
 		r, epA := newTestRelay(t)
-		// 旧会话只送来半个包。
-		epA.Deliver(full[:30])
-		if len(r.frameBuf) != 30 {
-			t.Fatalf("半包没进缓冲：%d 字节", len(r.frameBuf))
+		// 旧会话留下两个还没被取走的包。
+		epA.Deliver(full)
+		epA.Deliver(full)
+		if n := len(r.queue); n != 2 {
+			t.Fatalf("队列里有 %d 个包，期望 2", n)
 		}
 
 		epB := l3.New()
 		r.InstallSession(epB, nil)
-		if len(r.frameBuf) != 0 {
-			t.Fatalf("换绑之后缓冲里还剩 %d 字节", len(r.frameBuf))
+		if n := len(r.queue); n != 0 {
+			t.Fatalf("换绑之后队列里还剩 %d 个包", n)
 		}
-		waitDrop(t, r, dropSessionSwap)
+		waitDrop(t, r, dropStaleQueue)
 
-		// 新会话的第一个包必须原样出来，不能与旧半包拼接。
+		// 新会话的第一个包必须原样出来。
 		epB.Deliver(full)
 		got := readOne(t, r, 4096)
 		if !bytes.Equal(got, full) {
-			t.Fatalf("下行包被旧会话的半包污染了：%d 字节", len(got))
+			t.Fatalf("下行包与投递的不一致：%d 字节", len(got))
 		}
 	})
 
 	t.Run("摘掉会话", func(t *testing.T) {
 		r, ep := newTestRelay(t)
-		ep.Deliver(full[:30])
+		ep.Deliver(full)
 		r.ClearSession()
-		if len(r.frameBuf) != 0 {
-			t.Fatalf("摘掉会话之后缓冲里还剩 %d 字节", len(r.frameBuf))
+		if n := len(r.queue); n != 0 {
+			t.Fatalf("摘掉会话之后队列里还剩 %d 个包", n)
 		}
-		waitDrop(t, r, dropSessionSwap)
+		waitDrop(t, r, dropStaleQueue)
+
+		// 会话摘掉之后才漂进来的包也要计数，而不是静默丢掉：断开窗口里
+		// 丢了多少，日志里得有数。这里直接调回调——真实场景是 Deliver 与
+		// 会话切换撞在一起，端点那一侧的回调此时还没摘。
+		r.deliver(full)
+		waitCount(t, r, dropDownlinkNoSession, 1)
 	})
 }
 
-// 回归：隧道下行是字节流，服务端可能把两个包写进一次 TLS 记录。
-// 旧实现把一次读到的字节当成一个包，粘包会直接产生非法报文。
-func TestRelayFramesCoalescedPackets(t *testing.T) {
+// TestRelayDropsMalformedChunk 回归：投递的必须是完整包。
+//
+// 切包由隧道层负责（splitPackets 按 IPv4 总长度切好边界再逐包投递），中继层
+// 不再攒半包：长度对不上的整段丢掉并计数。以前这里维护一条跨会话的切包缓冲，
+// 防的是永远不会出现的半包，却让"缓冲里还留着上一个会话的字节"变成一个要
+// 记得清的状态。
+func TestRelayDropsMalformedChunk(t *testing.T) {
 	r, ep := newTestRelay(t)
 	peer := [4]byte{10, 66, 66, 2}
 	pub := [4]byte{172, 29, 56, 18}
@@ -120,38 +130,21 @@ func TestRelayFramesCoalescedPackets(t *testing.T) {
 	first := ipv4Pkt(pub, peer, 100)
 	second := ipv4Pkt(pub, peer, 200)
 
-	// 两个包一次送达。
+	// 半包。
+	ep.Deliver(first[:30])
+	// 粘包：两个包一次送达。
 	coalesced := append(append([]byte(nil), first...), second...)
 	ep.Deliver(coalesced)
-
-	got1 := readOne(t, r, 1500)
-	if len(got1) != len(first) {
-		t.Fatalf("第一个包长度 = %d，期望 %d", len(got1), len(first))
+	if n := len(r.queue); n != 0 {
+		t.Fatalf("非法输入不该进队列，队列里有 %d 个包", n)
 	}
-	got2 := readOne(t, r, 1500)
-	if len(got2) != len(second) {
-		t.Fatalf("第二个包长度 = %d，期望 %d", len(got2), len(second))
-	}
-}
+	waitCount(t, r, dropDownlinkInvalid, 2)
 
-// 回归：一个包分两次到达时，不能在第一个片段上就交给 WireGuard。
-func TestRelayFramesSplitPacket(t *testing.T) {
-	r, ep := newTestRelay(t)
-	peer := [4]byte{10, 66, 66, 2}
-	pub := [4]byte{172, 29, 56, 18}
-	pkt := ipv4Pkt(pub, peer, 60)
-
-	ep.Deliver(pkt[:30])
-	ep.Deliver(pkt[30:])
-
-	got := readOne(t, r, 1500)
-	if len(got) != len(pkt) {
-		t.Fatalf("包长度 = %d，期望 %d", len(got), len(pkt))
-	}
-	for i := range pkt {
-		if got[i] != pkt[i] {
-			t.Fatalf("第 %d 字节不一致", i)
-		}
+	// 完整包照常通过，且内容一个字节都不变。
+	ep.Deliver(first)
+	got := readOne(t, r, 4096)
+	if !bytes.Equal(got, first) {
+		t.Fatalf("完整包没有原样通过")
 	}
 }
 
@@ -377,6 +370,19 @@ func hasDrop(r *Relay, text string) bool {
 		}
 	}
 	return false
+}
+
+// waitCount 等某种原因的累计丢包数达到 want。
+func waitCount(t *testing.T, r *Relay, reason dropReason, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for r.drops[reason].n.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("「%s」的累计丢包 = %d，期望至少 %d",
+				dropReasonText[reason], r.drops[reason].n.Load(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // waitDrop 等某种原因的丢包计数涨上来。
