@@ -358,7 +358,6 @@ func (t *tunnelConn) heartbeatLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			t.flows.expire(time.Now())
 			if err := t.write(encodeHeartbeat()); err != nil {
 				t.close(err)
 				return
@@ -386,6 +385,10 @@ func (t *tunnelConn) authLoop() {
 				return
 			}
 		case <-ticker.C:
+			// 回收超时的流。挂在 250ms 的扫描上而不是 15 秒的心跳上：
+			// flowAuthTimeout 是 8 秒，响应丢失的流最坏要等一个心跳周期才
+			// 被放掉，表现为偶发的一次"连接卡住"。
+			t.flows.expire(time.Now())
 			if !t.dispatchAuth() {
 				return
 			}

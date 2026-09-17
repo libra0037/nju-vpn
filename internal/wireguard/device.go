@@ -253,10 +253,16 @@ func (d *Device) Close() error {
 	return nil
 }
 
-// handshakeSettleInterval 是“下行闩锁松开”的探测间隔。
+// handshakeSettleInterval 是“下行闩锁松开”的探测起点。
 //
 // 只在闩锁闭合且客户端还没露面时探测；握手一完成就不再回读设备。
 const handshakeSettleInterval = 200 * time.Millisecond
+
+// handshakeSettleMax 是探测间隔的上限。
+//
+// 客户端可能很久之后才连进来（甚至一直不连），所以探测要退避：5 次/秒的
+// UAPI 读一直跑下去没有意义，还会和设备的其它 UAPI 操作抢同一把锁。
+const handshakeSettleMax = 5 * time.Second
 
 // watchPeerHandshake 在闩锁闭合期间盯着设备，客户端握手一完成就放行下行。
 //
@@ -268,23 +274,29 @@ const handshakeSettleInterval = 200 * time.Millisecond
 // 这里读 UAPI 是安全的：早期版本在 Relay.Read（TUN 读取协程）里读，会和
 // wireguard-go 的状态机抢锁把设备锁死，所以探测必须跑在自己的协程里。
 func (d *Device) watchPeerHandshake() {
-	ticker := time.NewTicker(handshakeSettleInterval)
-	defer ticker.Stop()
+	interval := handshakeSettleInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-d.closed:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		// 闩锁开着（客户端已经露面，或设备里根本没配 peer）时不必探测。
 		if !d.relay.hold.Load() || d.relay.peerSeen.Load() {
+			interval = handshakeSettleInterval
+			timer.Reset(interval)
 			continue
 		}
 		cfg, err := d.config()
-		if err != nil {
+		if err == nil && cfg.lastHandshakeSec > 0 {
+			d.relay.peerSeen.Store(true)
+			interval = handshakeSettleInterval
+			timer.Reset(interval)
 			continue
 		}
-		if cfg.lastHandshakeSec > 0 {
-			d.relay.peerSeen.Store(true)
-		}
+		interval = min(interval*2, handshakeSettleMax)
+		timer.Reset(interval)
 	}
 }

@@ -627,7 +627,24 @@ func writePreservingMode(path string, fi os.FileInfo, lines []string) error {
 	}
 	// 临时名带 pid：两个进程同时写回时不会互相截断成半截 YAML。
 	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
-	if err := os.WriteFile(tmp, []byte(content), fi.Mode().Perm()); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("写入 %s: %w", tmp, err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("写入 %s: %w", tmp, err)
+	}
+	// 落盘之后再改名：这份文件里已经有新生成的私钥与设备标识，rename 之后
+	// 才崩溃的话，用户拿到的是一个"看起来成功、内容没落盘"的配置。
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("写入 %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("写入 %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
