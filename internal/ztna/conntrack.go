@@ -36,7 +36,6 @@ type flow struct {
 	authID uint64
 	token  string
 	state  flowState
-	err    error
 
 	pending  [][]byte
 	authSent time.Time
@@ -64,26 +63,31 @@ func newFlowTable() *flowTable {
 	return &flowTable{flows: make(map[flowKey]*flow)}
 }
 
-// get 返回已有条目；没有就按 appID/groupID 建一条。
-func (t *flowTable) get(key flowKey, appID, groupID string) *flow {
+// sendState 是上行路径的判定：取（必要时建）该流的条目，并读出令牌与状态。
+//
+// 建流、续期、读状态必须落在同一次加锁里。以前这里把 *flow 交给调用方、
+// 让它在锁外读 state，而 completeAuth 跑在隧道读协程里改同一个字段——
+// 那是一处真实的数据竞争（-race 可复现）；实际后果是失败流的判定可能读到
+// 陈旧值，把包塞进缓存直到上限。
+func (t *flowTable) sendState(key flowKey, appID, groupID string) (string, flowState) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()
-	if f, ok := t.flows[key]; ok {
-		f.updatedAt = now
-		return f
+	f, ok := t.flows[key]
+	if !ok {
+		if len(t.flows) >= maxFlows {
+			t.evictLocked(now)
+		}
+		t.next++
+		f = &flow{
+			key: key, appID: appID, groupID: groupID,
+			authID: t.next, state: flowPending,
+			createdAt: now, updatedAt: now,
+		}
+		t.flows[key] = f
 	}
-	if len(t.flows) >= maxFlows {
-		t.evictLocked(now)
-	}
-	t.next++
-	f := &flow{
-		key: key, appID: appID, groupID: groupID,
-		authID: t.next, state: flowPending,
-		createdAt: now, updatedAt: now,
-	}
-	t.flows[key] = f
-	return f
+	f.updatedAt = now
+	return f.token, f.state
 }
 
 // pendingAuth 返回所有等待发鉴权请求的流（每条流只发一次）。
@@ -122,7 +126,6 @@ func (t *flowTable) completeAuth(authID uint64, token string, err error) (flowKe
 		f.updatedAt = time.Now()
 		if err != nil {
 			f.state = flowFailed
-			f.err = err
 			f.pending = nil
 			return key, nil
 		}
@@ -149,16 +152,6 @@ func (t *flowTable) cache(key flowKey, pkt []byte) {
 	cp := make([]byte, len(pkt))
 	copy(cp, pkt)
 	f.pending = append(f.pending, cp)
-}
-
-func (t *flowTable) token(key flowKey) (string, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	f, ok := t.flows[key]
-	if !ok || f.state != flowReady {
-		return "", false
-	}
-	return f.token, true
 }
 
 // expire 回收超时条目，返回回收的数量。

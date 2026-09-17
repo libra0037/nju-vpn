@@ -237,12 +237,14 @@ func (t *tunnelConn) Send(pkt []byte) error {
 		return fmt.Errorf("目标不在资源表内: %s %s:%d", proto, info.dstIP, info.dstPort)
 	}
 
-	f := t.flows.get(info.key, appID, groupID)
-	if f.state == flowFailed {
+	token, state := t.flows.sendState(info.key, appID, groupID)
+	switch state {
+	case flowFailed:
 		return fmt.Errorf("该流鉴权失败: %s", info.key)
-	}
-	token, ready := t.flows.token(info.key)
-	if !ready {
+	case flowReady:
+		// 有令牌，直接发。
+	default:
+		// 还没拿到令牌（或流刚建）：先缓存首包，让 authLoop 去申请。
 		t.flows.cache(info.key, pkt)
 		t.wakeAuth()
 		return nil

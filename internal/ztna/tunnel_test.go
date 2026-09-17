@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,66 @@ import (
 	"github.com/libra0037/nju-vpn/internal/l3"
 	"github.com/libra0037/nju-vpn/internal/ztnatest"
 )
+
+// TestSendReadsFlowStateUnderLock 回归：上行每包的判定必须在流表的锁里取。
+//
+// 以前 Send 拿到共享的 *flow 指针、在锁外读 state，而 completeAuth 跑在
+// 隧道读协程里改同一个字段：跑 -race 会报数据竞争（把 sendState 退回
+// “get 之后在锁外读 state”即复现）。实际后果是失败流的判定可能读到陈旧值，
+// 包被塞进缓存直到上限。
+func TestSendReadsFlowStateUnderLock(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	// net.Pipe 是同步的：没人在另一头读，写入会一直阻塞。
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+
+	table, err := parseResourceTable([]byte(`{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[
+		{"id":"app-a","nodeGroupId":"groupWan","accessModel":"L3VPN","addressList":[
+			{"protocol":"tcp","port":"443","host":"10.1.0.0/16"}]}]}],"config":{"nodeGroupConf":{
+		"majorNodeGroup":{"id":"groupWan"},"nodeGroupList":[{"id":"groupWan","addressInfo":[]}]}}}}}}`), "vpn.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tc := &tunnelConn{
+		node:     "test-node",
+		conn:     client,
+		ep:       l3.New(),
+		flows:    newFlowTable(),
+		table:    table,
+		authWake: make(chan struct{}, 1),
+		logf:     func(string, ...any) {},
+	}
+	pkt := ipv4TCP("10.66.66.2", "10.1.2.3", 40000, 443, nil)
+
+	// 首包建流并缓存首包。
+	if err := tc.Send(pkt); err != nil {
+		t.Fatalf("首包应当被缓存而不是失败: %v", err)
+	}
+	flows := tc.flows.pendingAuth(1)
+	if len(flows) != 1 {
+		t.Fatalf("首包没有建流，pendingAuth = %d 条", len(flows))
+	}
+	authID := flows[0].authID // 建流时写一次，之后不再变
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			_ = tc.Send(pkt)
+		}
+	}()
+	// 另一侧（隧道读协程的角色）把这条流判成失败。
+	for i := 0; i < 300; i++ {
+		tc.flows.completeAuth(authID, "", errors.New("鉴权被拒"))
+	}
+	<-done
+
+	if err := tc.Send(pkt); err == nil {
+		t.Fatal("鉴权失败的流仍被放行")
+	}
+}
 
 // stallOptions 指向一个“TCP/TLS 都通、但收下握手请求后不再回帧”的节点。
 func stallOptions(t *testing.T, timeout time.Duration) tunnelOptions {
