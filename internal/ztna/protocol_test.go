@@ -368,3 +368,29 @@ func ipv4TCP(src, dst string, sport, dport uint16, payload []byte) []byte {
 	copy(pkt[40:], payload)
 	return pkt
 }
+
+// TestResourceTableDropsMalformedNodes 回归：资源表里的畸形节点地址必须在校验
+// 阶段丢掉，不能进探活、日志与 CONNECT 请求行。
+func TestResourceTableDropsMalformedNodes(t *testing.T) {
+	raw := []byte(`{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[
+		{"id":"app-a","nodeGroupId":"g","accessModel":"L3VPN","addressList":[
+			{"protocol":"tcp","port":"443","host":"10.1.0.0/16"}]}]}],
+		"config":{"nodeGroupConf":{"majorNodeGroup":{"id":"g"},"nodeGroupList":[
+		{"id":"g","addressInfo":[
+			{"address":"node-a:441","type":"wan"},
+			{"address":"evil\r\nGET http://127.0.0.1:8080/admin HTTP/1.1","type":"wan"},
+			{"address":"node-b:0","type":"wan"},
+			{"address":"node-c","type":"lan"}]}]}}}}}}`)
+
+	table, err := parseResourceTable(raw, "vpn.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if table.badNodes != 2 {
+		t.Errorf("丢弃的节点数 = %d，期望 2（注入串与端口 0；缺端口的补 :441 之后合法）", table.badNodes)
+	}
+	nodes := table.candidateNodes("g")
+	if len(nodes) != 2 || nodes[0] != "node-a:441" || nodes[1] != "node-c:441" {
+		t.Fatalf("候选节点 = %v，期望 [node-a:441 node-c:441]", nodes)
+	}
+}

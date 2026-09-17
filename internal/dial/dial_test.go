@@ -155,3 +155,44 @@ func TestProxyParseErrorDoesNotLeakCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestValidHostPort 验证地址白名单：能进 CONNECT 请求行的只有 IP 字面量或
+// 字母数字/点/连字符的域名，加 1-65535 的端口。
+func TestValidHostPort(t *testing.T) {
+	good := []string{"10.1.2.3:441", "node-a.example.edu:443", "127.0.0.1:1", "[2001:db8::1]:443"}
+	for _, addr := range good {
+		if !ValidHostPort(addr) {
+			t.Errorf("%q 应当接受", addr)
+		}
+	}
+	bad := []string{
+		"", "node-a", "node-a:0", "node-a:70000", "node-a:abc",
+		"evil\r\nGET http://127.0.0.1:8080/admin HTTP/1.1",
+		"node a:441", "node_a:441", "node-a:441 ", "http://node-a:441",
+	}
+	for _, addr := range bad {
+		if ValidHostPort(addr) {
+			t.Errorf("%q 应当拒绝", addr)
+		}
+	}
+}
+
+// TestProxyDialerRejectsUnsafeAddressBeforeConnecting 回归：畸形目标地址必须
+// 在连代理之前被挡下。
+//
+// 地址最终来自资源表（控制面下发），而 CONNECT 请求行是纯文本协议：带控制
+// 字符的地址能在请求行里插进第二条请求，把本地代理变成攻击者的转发器。
+// 代理地址故意指向没人监听的端口：如果校验发生在连接之后，错误会是连接失败。
+func TestProxyDialerRejectsUnsafeAddressBeforeConnecting(t *testing.T) {
+	fn, err := New("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fn("tcp", "evil\r\nGET http://127.0.0.1:8080/admin HTTP/1.1")
+	if err == nil {
+		t.Fatal("畸形地址没有被拒绝")
+	}
+	if !strings.Contains(err.Error(), "不能用于 CONNECT") {
+		t.Fatalf("错误应当来自地址校验，而不是连代理失败: %v", err)
+	}
+}

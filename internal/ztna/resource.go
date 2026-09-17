@@ -6,6 +6,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/libra0037/nju-vpn/internal/dial"
 )
 
 // 资源表描述"哪些目标可以走隧道"。服务端只对表里命中的目标做逐流鉴权，
@@ -34,6 +36,9 @@ type resourceTable struct {
 	// portFallbacks 是端口段看不懂、按整段（1-65535）处理的规则条数。
 	// 计数而不是忽略：放宽带会让客户端多发鉴权请求，用户至少该有一条线索。
 	portFallbacks int
+	// badNodes 是地址不合法被丢掉的节点条数。同样计数不忽略：控制面被
+	// 攻陷或证书校验被关掉时，畸形的节点地址会进 CONNECT 请求行。
+	badNodes int
 }
 
 func ip4ToUint32(ip net.IP) (uint32, bool) {
@@ -136,6 +141,12 @@ func parseResourceTable(raw []byte, serverHost string) (*resourceTable, error) {
 			}
 			if !strings.Contains(addr, ":") {
 				addr += ":441"
+			}
+			// 资源表里的地址会进探活、CONNECT 请求行与日志：控制字符、
+			// 空白都能伪造出额外的行。不合法就整条丢掉并计数。
+			if !dial.ValidHostPort(addr) {
+				t.badNodes++
+				continue
 			}
 			switch strings.ToLower(a.Type) {
 			case "wan":

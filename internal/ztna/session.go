@@ -248,6 +248,9 @@ func (s *Session) prepare(ctx context.Context) error {
 		s.client.logf("资源表里有 %d 条规则的端口段看不懂，已按 1-65535 处理（可能会多发几次鉴权请求）",
 			table.portFallbacks)
 	}
+	if table.badNodes > 0 {
+		s.client.logf("资源表里有 %d 个节点地址不合法，已丢弃（它们会进探活与 CONNECT 请求行）", table.badNodes)
+	}
 
 	node, err := probeNodes(ctx, s.client.opts.Dial, table.candidateNodes(table.major), 6*time.Second)
 	if err != nil {

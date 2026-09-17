@@ -105,6 +105,34 @@ func proxyParseReason(err error) string {
 	return credentialLike.ReplaceAllString(reason, "****:****@")
 }
 
+// ValidHostPort 判断 "host:port" 能不能安全地交给拨号与 CONNECT 请求行。
+//
+// 规则留一份，两处用：资源表解析时挡掉控制面下发的畸形节点地址，拨号时
+// 再挡一道（不依赖调用方先校验）。允许 IP 字面量或字母数字/点/连字符的
+// 域名，端口 1-65535；空白、冒号以外的分隔符与控制字符一律拒绝——它们能
+// 在 CONNECT 请求行或日志里伪造出额外的行。
+func ValidHostPort(addr string) bool {
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	for i := 0; i < len(host); i++ {
+		switch c := host[i]; {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // httpProxyDialer 通过 HTTP 代理的 CONNECT 方法建到目标地址的隧道。
 func httpProxyDialer(u *url.URL) (DialFunc, error) {
 	// https 代理必须先建立 TLS 再发 CONNECT：否则 Proxy-Authorization
@@ -128,6 +156,12 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 	return func(network, address string) (net.Conn, error) {
 		if network != "tcp" && network != "tcp4" && network != "tcp6" {
 			return nil, fmt.Errorf("HTTP 代理只支持 tcp，收到 %q", network)
+		}
+		// 地址最终来自资源表（控制面下发）。CONNECT 请求行是纯文本协议：
+		// 一个带控制字符的地址就能在请求行里插进第二条请求，把本地代理
+		// 变成攻击者的转发器。这里兜一道底。
+		if !ValidHostPort(address) {
+			return nil, fmt.Errorf("目标地址不能用于 CONNECT: %q", address)
 		}
 
 		conn, err := dialProxy(host, useTLS)
