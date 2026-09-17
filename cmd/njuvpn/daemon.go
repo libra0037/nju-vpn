@@ -181,7 +181,7 @@ func spawnService(configPath, logPath string) (<-chan error, error) {
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("打开服务日志 %s: %w", logPath, err)
+		return nil, fmt.Errorf("打开服务进程日志 %s: %w", logPath, err)
 	}
 
 	cmd := exec.Command(exe, args...)
@@ -242,7 +242,7 @@ func logTail(path string) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("\n服务日志的最后几行（" + path + "）：")
+	b.WriteString("\n服务进程日志的最后几行（" + path + "）：")
 	for _, line := range lines {
 		b.WriteString("\n  " + line)
 	}

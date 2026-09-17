@@ -138,7 +138,7 @@ func TestUAPIConfigUsesHexKeys(t *testing.T) {
 	}
 }
 
-// 没有 peer 公钥时设备仍然照常启动，只是没有客户端能接入。
+// 没有 peer 公钥时设备仍然照常启动，只是没有对端能接入。
 func TestUAPIConfigWithoutPeer(t *testing.T) {
 	priv, err := GenerateKey()
 	if err != nil {

@@ -38,6 +38,36 @@ flag_set() {
     grep -oE -- '--?[a-z][a-z0-9-]*' | sed -E 's/^--/-/' | sort -u
 }
 
+# scan_terms 打印命中模式的文件行。扫描范围是本仓库自己的源文件与文档：dist/、
+# 本地审查报告与使用者的真实配置都不在内。
+scan_terms() {
+  grep -rnE "$1" --include='*.go' --include='*.md' --include='*.yaml' . |
+    grep -vE '^\./(dist/|REVIEW\.md:|config\.yaml:|[^/]*\.local\.yaml:)'
+}
+
+# terminology_check 挡住回潮的旧叫法，管两件事：
+#  ① WireGuard 两侧是 peer，只有部署上不对称，所以叫承载层与对端。"服务端"
+#     "客户端"在本仓库另有真正的主人——校园网服务端与命令行客户端——混着用会
+#     把承载层公钥说成服务端公钥（它是本机生成的）。校园网那边的"服务端公钥"
+#     （门户登录用的那把）不能被扫进来，所以模式带 WireGuard 前缀。
+#  ② 指本机那个进程时一律写全"服务进程"：裸"服务"会跟校园网那边的服务端混。
+terminology_check() {
+  local hits
+  hits=$(scan_terms 'WireGuard 服务端公钥|客户端公钥|服务端与客户端')
+  if [ -n "$hits" ]; then
+    echo "术语检查：WireGuard 两侧叫承载层与对端，命中旧叫法："
+    echo "$hits"
+    return 1
+  fi
+  hits=$(scan_terms '服务日志|服务是否在运行|查看服务与隧道状态')
+  if [ -n "$hits" ]; then
+    echo '术语检查：本机那个进程写"服务进程"，命中裸叫法：'
+    echo "$hits"
+    return 1
+  fi
+}
+run terminology_check
+
 # gofmt -l 有输出就算失败（它列出的是没格式化的文件）。
 fmt_out=$(gofmt -l . 2>&1)
 if [ -n "$fmt_out" ]; then

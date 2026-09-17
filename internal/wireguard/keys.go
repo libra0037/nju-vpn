@@ -45,7 +45,7 @@ func (k Key) PublicKey() (Key, error) {
 	return pub, nil
 }
 
-// String 返回 base64 形式，即配置文件与客户端配置里使用的写法。
+// String 返回 base64 形式，即配置文件与对端配置里使用的写法。
 func (k Key) String() string { return base64.StdEncoding.EncodeToString(k[:]) }
 
 // IsZero 报告密钥是否为空（全零）。

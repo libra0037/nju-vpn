@@ -13,10 +13,10 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 )
 
-// TestDownlinkGateOpensOnHandshake 验证下行闩锁由“握手完成”松开，而不是等客户端
+// TestDownlinkGateOpensOnHandshake 验证下行闩锁由“握手完成”松开，而不是等对端
 // 先送来数据包。
 //
-// 客户端只发保活（空包不进 TUN）时，老判据永远等不到那一刻：纯下载的客户端
+// 对端只发保活（空包不进 TUN）时，老判据永远等不到那一刻：纯下载的对端
 // 会一直卡在闩锁前面，表现是隧道 up 但什么都不通。
 func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -40,7 +40,7 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 服务端：承载设备。会话与映射先不挂，只验证闩锁。
+	// 承载层：承载设备。会话与映射先不挂，只验证闩锁。
 	port := freeUDPPort(t)
 	server, err := NewDevice(DeviceOptions{MTU: 1420, PrivateKey: serverPriv, ListenPort: port})
 	if err != nil {
@@ -54,10 +54,10 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 		t.Fatal("装了 peer 之后下行闩锁应当是闭合的")
 	}
 	if server.relay.peerSeen.Load() {
-		t.Fatal("客户端还没露面，闩锁不该松开")
+		t.Fatal("对端还没露面，闩锁不该松开")
 	}
 
-	// 客户端：一台真实设备，只配保活，不发任何数据。
+	// 对端：一台真实设备，只配保活，不发任何数据。
 	clientTun := newMemoryTun()
 	clientDev := device.NewDevice(clientTun, conn.NewDefaultBind(),
 		device.NewLogger(device.LogLevelError, "client: "))
@@ -66,10 +66,10 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 		"private_key=%s\nlisten_port=0\nreplace_peers=true\npublic_key=%s\nendpoint=127.0.0.1:%d\nallowed_ip=0.0.0.0/0\npersistent_keepalive_interval=1\n",
 		hex.EncodeToString(clientPriv[:]), hex.EncodeToString(serverPub[:]), port)
 	if err := clientDev.IpcSet(clientConf); err != nil {
-		t.Fatalf("配置客户端失败: %v", err)
+		t.Fatalf("配置对端失败: %v", err)
 	}
 	if err := clientDev.Up(); err != nil {
-		t.Fatalf("启动客户端失败: %v", err)
+		t.Fatalf("启动对端失败: %v", err)
 	}
 
 	// 闩锁应当在一两秒内松开（探测间隔 200ms）。
@@ -80,7 +80,7 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("客户端完成握手之后下行闩锁仍然闭着（老判据只认客户端数据包）")
+	t.Fatal("对端完成握手之后下行闩锁仍然闭着（老判据只认对端数据包）")
 }
 
 // TestMapperFollowsAddressChange 验证映射用的是“当前”隧道地址：服务端中途下发
@@ -123,15 +123,15 @@ func TestMapperFollowsAddressChange(t *testing.T) {
 
 // TestProbeIntervalBacksOff 钉住探测节奏。
 //
-// 只有"有会话、还没见到握手"这一段才短间隔探测；闩锁开着（没有会话，或客户
-// 端已经露面）时一律用上限等着——老实现把这两种情况都重置回 200ms，于是稳态
+// 只有"有会话、还没见到握手"这一段才短间隔探测；闩锁开着（没有会话，或对端
+// 已经露面）时一律用上限等着——老实现把这两种情况都重置回 200ms，于是稳态
 // 下每秒醒五次，读到进程结束。
 func TestProbeIntervalBacksOff(t *testing.T) {
 	if got := probeInterval(false, false, handshakeSettleMax); got != handshakeSettleMax {
 		t.Errorf("没有会话时下一次探测间隔 %v，期望 %v", got, handshakeSettleMax)
 	}
 	if got := probeInterval(true, true, handshakeSettleMax); got != handshakeSettleMax {
-		t.Errorf("客户端已露面时 %v，期望 %v", got, handshakeSettleMax)
+		t.Errorf("对端已露面时 %v，期望 %v", got, handshakeSettleMax)
 	}
 	if got := probeInterval(true, false, handshakeSettleInterval); got != 2*handshakeSettleInterval {
 		t.Errorf("探测阶段应当退避，得到 %v", got)

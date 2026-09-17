@@ -32,7 +32,7 @@ func newBearer(cfg *config.Config) (*bearer, error) {
 			return nil, fmt.Errorf("wireguard.peer_public_key: %w", err)
 		}
 		// 全零公钥能通过 base64 解析，却不是合法的 x25519 公钥点。
-		// 不拦住的话它会一路走到设备配置，客户端表现为永远握手失败。
+		// 不拦住的话它会一路走到设备配置，对端表现为永远握手失败。
 		if peerKey.IsZero() {
 			return nil, fmt.Errorf("wireguard.peer_public_key 是全零公钥，不是合法的 WireGuard 公钥")
 		}
@@ -77,8 +77,8 @@ func (b *bearer) attach(sess *ztna.Session) error {
 
 // detach 摘掉当前会话。
 //
-// 先摘 peer 再摘会话：设备还在监听，留着 peer 会让客户端握手成功，而它的
-// 包其实已经没有隧道可走——从客户端看是"连上了但什么都打不开"。
+// 先摘 peer 再摘会话：设备还在监听，留着 peer 会让对端握手成功，而它的
+// 包其实已经没有隧道可走——从对端看是"连上了但什么都打不开"。
 func (b *bearer) detach() {
 	if err := b.dev.ClearPeer(); err != nil {
 		log.Printf("摘除 WireGuard peer 时出错: %v", err)
@@ -112,7 +112,7 @@ func (b *bearer) summary() string {
 		scope = "全部网卡"
 	}
 	if b.peerKey.IsZero() {
-		return fmt.Sprintf("UDP %d（%s）已就绪；未配置 wireguard.peer_public_key，任何客户端都无法接入", port, scope)
+		return fmt.Sprintf("UDP %d（%s）已就绪；未配置 wireguard.peer_public_key，任何对端都无法接入", port, scope)
 	}
 	return fmt.Sprintf("UDP %d（%s）已就绪，peer 地址 %s", port, scope, b.peerAddr)
 }

@@ -399,7 +399,7 @@ func (c *Config) Warnings() []string {
 		out = append(out, c.permNote)
 	}
 	if c.WireGuard.PeerPublicKey == "" {
-		out = append(out, "未配置 wireguard.peer_public_key，任何客户端都无法接入")
+		out = append(out, "未配置 wireguard.peer_public_key，任何对端都无法接入")
 	}
 	if c.LoginDomain == "" {
 		out = append(out, "未配置 login_domain，将使用服务端返回的第一个口令登录方式")
@@ -449,7 +449,7 @@ func validateHost(field, host string) error {
 // PersistPrivateKey 把自动生成的 WireGuard 私钥写回配置文件。
 //
 // 已经有了就不覆盖：两个进程同时首启同一份配置时，后写的那个会让盘上的
-// 私钥与正在跑的那个进程内存里的不一致——之后所有客户端配置都会失效。
+// 私钥与正在跑的那个进程内存里的不一致——之后所有对端配置都会失效。
 func PersistPrivateKey(path, key string) error {
 	return persistField(path, "wireguard", "private_key", key)
 }

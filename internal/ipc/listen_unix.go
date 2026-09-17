@@ -154,7 +154,7 @@ func Dial(endpoint string) (net.Conn, error) {
 	// 客户端连 SetDeadline 都执行不到。
 	conn, err := net.DialTimeout("unix", endpoint, dialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("连接服务进程 %s: %w（服务是否在运行？）", endpoint, err)
+		return nil, fmt.Errorf("连接服务进程 %s: %w（服务进程是否在运行？）", endpoint, err)
 	}
 	return conn, nil
 }

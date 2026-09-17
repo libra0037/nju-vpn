@@ -47,7 +47,7 @@ const closeGrace = 30 * time.Second
 // authWaitTimeout 是等待验证码的上限。
 //
 // 用户在提示符前直接关掉终端时，进程会一直停在 auth_pending，服务端那条
-// "同一账号只允许一个客户端"的名额也跟着被占住。到点就登出，宁可让用户
+// "同一账号只允许一条隧道会话"的名额也跟着被占住。到点就登出，宁可让用户
 // 重新 start 一次。
 //
 // 用变量而不是常量：测试要把它缩到百毫秒级才能覆盖这条路径。
@@ -118,7 +118,7 @@ type credentials struct {
 // pendingOp 是一次停在"等验证码"那一步的操作。
 //
 // 它必须持有半完成的会话对象：丢掉它就没法登出，服务端那条"同一账号只
-// 允许一个客户端"的名额会一直占着，直到它自己超时。
+// 允许一条隧道会话"的名额会一直占着，直到它自己超时。
 type pendingOp struct {
 	kind  commandKind // cmdStart 或 cmdDevices
 	trust bool        // cmdStart：登录成功后顺带绑授信终端
@@ -333,7 +333,7 @@ func (s *Service) Stop() error {
 // Close 停止命令循环、释放资源并通知服务端登出。可安全重复调用。
 //
 // 与 Stop 的区别是不判断状态、不返回错误：进程退出路径必须执行它。服务端
-// 同一账号只允许一个客户端，残留会话会让后续建隧道被拒。
+// 同一账号只允许一条隧道会话，残留会话会让后续建隧道被拒。
 func (s *Service) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
@@ -751,7 +751,7 @@ func (s *Service) stop() error {
 func (s *Service) finishConnect(sess *ztna.Session) error {
 	// 先接管会话再挂承载：挂载失败（没分配到地址、地址映射建不起来、装
 	// 接入方公钥失败）时这条会话已经在 s.session 上，fail → teardown 才会
-	// 发出登出。顺序反过来会让服务端的单客户端名额被一条没人持有的会话
+	// 发出登出。顺序反过来会让服务端的单会话名额被一条没人持有的会话
 	// 占着，用户下一次 start 直接被拒。
 	s.attach(sess)
 	if err := s.br.attach(sess); err != nil {

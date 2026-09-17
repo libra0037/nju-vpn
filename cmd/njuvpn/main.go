@@ -36,7 +36,7 @@ func usage() {
   %s run                       以服务进程身份运行（一般由 start 自动拉起）
   %s start [--trust]           建立隧道（必要时自动拉起服务进程）
   %s stop                      断开隧道，服务进程继续运行
-  %s status [--check]          查看服务与隧道状态
+  %s status [--check]          查看服务进程与隧道状态
   %s trust                     把本机绑成授信终端（之后登录免二次验证）
   %s untrust [--all]           解除本机授信；--all 解除该账号下全部授信终端
   %s restart                   重启服务进程（改完配置后用它，不必手工杀进程）

@@ -255,7 +255,7 @@ func TestMapperRewritesICMPErrorInner(t *testing.T) {
 	const innerAt = ipv4MinHeader + icmpEmbeddedOff
 
 	t.Run("下行差错改内层源地址", func(t *testing.T) {
-		// 校园网路由器回给"客户端发出的那个包"的差错：外层目的地址是隧道
+		// 校园网路由器回给"对端发出的那个包"的差错：外层目的地址是隧道
 		// 地址，内层原始报文的源地址也是隧道地址（改写过之后就是这个）。
 		// 真差错只带原始报文的前 28 字节，这里照做。
 		inner := buildUDP(public4, remote, []byte("big"))[:28]
@@ -284,7 +284,7 @@ func TestMapperRewritesICMPErrorInner(t *testing.T) {
 	})
 
 	t.Run("上行差错改内层目的地址", func(t *testing.T) {
-		// 客户端协议栈对"收到的包"回差错：外层源地址是 peer，内层原始
+		// 对端协议栈对"收到的包"回差错：外层源地址是 peer，内层原始
 		// 报文的目的是 peer（它看到的就是这个地址）。
 		inner := buildUDP(remote, peer4, []byte("hi"))[:28]
 		pkt := buildICMPError(peer4, remote, 3, 3, inner)

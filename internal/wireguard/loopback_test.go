@@ -22,13 +22,13 @@ import (
 // 这个文件做一次真正的端到端回环：本进程的承载设备（Relay + 映射 + 假校园网隧道）
 // 与另一台真实的 WireGuard 设备互通，验证握手、加密、包转发与地址改写都对。
 //
-// 客户端用内存 TUN，不创建任何网卡，也不需要 root；UDP 只在 127.0.0.1 上回环。
+// 对端用内存 TUN，不创建任何网卡，也不需要 root；UDP 只在 127.0.0.1 上回环。
 
-// memoryTun 是实现 tun.Device 的内存设备，充当客户端的网络栈。
+// memoryTun 是实现 tun.Device 的内存设备，充当对端的网络栈。
 type memoryTun struct {
-	// sendQ 是客户端想发出去的包（由 device 的 Read 取走）。
+	// sendQ 是对端想发出去的包（由 device 的 Read 取走）。
 	sendQ chan []byte
-	// recvQ 是客户端从隧道收到的包（由 device 的 Write 放入）。
+	// recvQ 是对端从隧道收到的包（由 device 的 Write 放入）。
 	recvQ chan []byte
 
 	events    chan tun.Event
@@ -94,18 +94,18 @@ func (t *memoryTun) Close() error {
 	return nil
 }
 
-// send 让客户端把包发进隧道。
+// send 让对端把包发进隧道。
 func (t *memoryTun) send(pkt []byte) {
 	t.sendQ <- append([]byte(nil), pkt...)
 }
 
-// recv 等待客户端从隧道收到一个包。
+// recv 等待对端从隧道收到一个包。
 func (t *memoryTun) recv(timeout time.Duration) ([]byte, error) {
 	select {
 	case pkt := <-t.recvQ:
 		return pkt, nil
 	case <-time.After(timeout):
-		return nil, fmt.Errorf("等待客户端收包超时")
+		return nil, fmt.Errorf("等待对端收包超时")
 	}
 }
 
@@ -128,11 +128,11 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 	}
 
 	const (
-		peerIP   = "10.66.66.2"   // 分配给客户端的地址
+		peerIP   = "10.66.66.2"   // 分配给对端的地址
 		campusIP = "172.29.56.18" // 校园网分配到的地址
 	)
 
-	// 服务端密钥与客户端密钥。
+	// 承载层密钥与对端密钥。
 	serverPriv, err := GenerateKey()
 	if err != nil {
 		t.Fatal(err)
@@ -188,10 +188,10 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 		t.Fatalf("读取设备配置失败: %v", err)
 	}
 	if !strings.Contains(uapi, hex.EncodeToString(clientPub[:])) {
-		t.Fatalf("设备配置里没有客户端公钥: %s", uapi)
+		t.Fatalf("设备配置里没有对端公钥: %s", uapi)
 	}
 
-	// 客户端：一台真实的 WireGuard 设备 + 内存 TUN。
+	// 对端：一台真实的 WireGuard 设备 + 内存 TUN。
 	clientTun := newMemoryTun()
 	clientDev := device.NewDevice(clientTun, conn.NewDefaultBind(),
 		device.NewLogger(device.LogLevelError, "client: "))
@@ -201,13 +201,13 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 		"private_key=%s\nlisten_port=0\nreplace_peers=true\npublic_key=%s\nendpoint=127.0.0.1:%d\nallowed_ip=0.0.0.0/0\n",
 		hex.EncodeToString(clientPriv[:]), hex.EncodeToString(serverPub[:]), port)
 	if err := clientDev.IpcSet(clientConf); err != nil {
-		t.Fatalf("配置客户端失败: %v", err)
+		t.Fatalf("配置对端失败: %v", err)
 	}
 	if err := clientDev.Up(); err != nil {
-		t.Fatalf("启动客户端失败: %v", err)
+		t.Fatalf("启动对端失败: %v", err)
 	}
 
-	// 上行：客户端把一个包送进隧道。
+	// 上行：对端把一个包送进隧道。
 	outbound := ipv4Pkt(
 		[4]byte{10, 66, 66, 2},
 		[4]byte{202, 119, 32, 69},
@@ -231,7 +231,7 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 		t.Fatal("校园网隧道没有收到上行包（握手或转发失败）")
 	}
 
-	// 下行：注入一个发往校园网地址的包，客户端应该收到改写后的版本。
+	// 下行：注入一个发往校园网地址的包，对端应该收到改写后的版本。
 	inbound := ipv4Pkt(
 		[4]byte{202, 119, 32, 69},
 		[4]byte{172, 29, 56, 18},
@@ -251,7 +251,7 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 	}
 }
 
-// 只配了服务端单边 peer 时（客户端不认识服务端公钥），不能建立隧道。
+// 只配了承载层单边 peer 时（对端不认识承载层公钥），不能建立隧道。
 func TestLoopbackRejectsUnknownClient(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 的 ring bind 需要管理员权限")
@@ -259,7 +259,7 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 
 	serverPriv, _ := GenerateKey()
 	serverPub, _ := serverPriv.PublicKey()
-	// 客户端公钥不是服务端允许的那个。
+	// 对端公钥不是承载层允许的那个。
 	allowedPriv, _ := GenerateKey()
 	allowedPub, _ := allowedPriv.PublicKey()
 	intruderPriv, _ := GenerateKey()
@@ -317,7 +317,7 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 
 	select {
 	case pkt := <-uplinkCh:
-		t.Fatalf("未授权的客户端竟然把包送进了隧道（%d 字节）", len(pkt))
+		t.Fatalf("未授权的对端竟然把包送进了隧道（%d 字节）", len(pkt))
 	case <-time.After(3 * time.Second):
 		// 超时正是期望的结果：握手没通过，没有包过来。
 	}
@@ -400,8 +400,8 @@ func captureLogs(t *testing.T, fn func()) string {
 	return string(out)
 }
 
-// 回归（真机症状）：隧道刚建好、客户端还没接进来时，校园网网关自己就会往
-// 分配到的地址发包。这些包以前会被交给 wireguard-go，而它不知道客户端在
+// 回归（真机症状）：隧道刚建好、对端还没接进来时，校园网网关自己就会往
+// 分配到的地址发包。这些包以前会被交给 wireguard-go，而它不知道对端在
 // 哪儿，于是每 5 秒往日志里写一行
 //
 //	ERROR: wireguard: peer(...) - Failed to send handshake initiation: no known endpoint for peer
@@ -432,7 +432,7 @@ func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 客户端还没接进来：校园网网关往分配到的地址发了好几个包。
+	// 对端还没接进来：校园网网关往分配到的地址发了好几个包。
 	campus := [4]byte{172, 29, 56, 18}
 
 	logs := captureLogs(t, func() {
@@ -457,7 +457,7 @@ func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
 	})
 
 	if strings.Contains(logs, "no known endpoint") {
-		t.Fatalf("客户端还没接进来时不该有握手噪声，实际日志：\n%s", logs)
+		t.Fatalf("对端还没接进来时不该有握手噪声，实际日志：\n%s", logs)
 	}
 	if n := strings.Count(logs, dropReasonText[dropPeerNotReady]); n != 1 {
 		t.Fatalf("被丢掉的下行包应当只留一条记录，实际 %d 条：\n%s", n, logs)

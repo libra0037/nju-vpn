@@ -377,7 +377,7 @@ func RunServer(svc *Service, endpoint string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("服务已启动，监听 %s", endpoint)
+	log.Printf("服务进程已启动，监听 %s", endpoint)
 
 	srv := NewServer(svc, ln)
 

@@ -13,7 +13,7 @@ import (
 type ListenHost int
 
 const (
-	// ListenLoopback 只绑定回环地址。服务端与客户端在同一台机器上时用这个：
+	// ListenLoopback 只绑定回环地址。承载层与对端在同一台机器上时用这个：
 	// 同一个局域网里的其他人连不上这个端口。
 	ListenLoopback ListenHost = iota
 	// ListenAll 绑定全部网卡，需要从其他机器接入时才用。
@@ -43,7 +43,7 @@ func newBind(host ListenHost) conn.Bind {
 // loopbackBind 是只绑定回环地址的最小 conn.Bind 实现。
 //
 // wireguard-go 自带的绑定用的是 ":port"，也就是 0.0.0.0:port：同一个
-// 局域网里任何人都能打到这个 UDP 端口。服务端与客户端同机时没有这个
+// 局域网里任何人都能打到这个 UDP 端口。承载层与对端同机时没有这个
 // 必要，所以这里自己实现一份，只监听 127.0.0.1。
 //
 // 只做同机场景需要的事：批量大小固定为 1，不使用 GSO、PKTINFO 与

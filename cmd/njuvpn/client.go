@@ -37,7 +37,7 @@ func clientConfig(configPath string) (*config.Config, error) {
 	}
 	// 没显式指定路径时退一步：路径还是默认路径，只是内容读不出来或校验
 	// 不过。端点只依赖路径，仍然算得出来；服务进程若也是这个情形，它同样
-	// 起不来，命令会以"服务是否在运行"收场。
+	// 起不来，命令会以"服务进程是否在运行"收场。
 	fmt.Fprintf(os.Stderr, "%s: 配置 %s 不可用: %v（按默认路径的端点继续）\n", prog, config.DefaultPath(), err)
 	fallback := &config.Config{}
 	fallback.SetSourcePath(config.DefaultPath())

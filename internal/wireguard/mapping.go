@@ -11,14 +11,14 @@ import (
 
 // Mapper 在两类地址之间改写 IP 包的源/目的地址：
 //
-//	上行  客户端 peer 的固定地址 → 校园网分配的隧道地址（改源）
-//	下行  校园网分配的隧道地址   → 客户端 peer 的固定地址（改目的）
+//	上行  对端 peer 的固定地址 → 校园网分配的隧道地址（改源）
+//	下行  校园网分配的隧道地址   → 对端 peer 的固定地址（改目的）
 //
 // 改写后必须修正校验和。这里用 RFC 1624 的增量算法，而不是整包重算：
 // 分片报文的非首片没有传输层头部，整包重算无从下手，增量更新则只需知道
 // 变了哪两个 16 位字。
 type Mapper struct {
-	peerIP [4]byte // 客户端 peer 的地址，例如 10.66.66.2
+	peerIP [4]byte // 对端 peer 的地址，例如 10.66.66.2
 	// public 现取隧道分配的地址，例如 172.29.56.18。
 	//
 	// 用回调而不是固定值：服务端会在会话中途下发地址（0x96，载荷是地址
@@ -70,7 +70,7 @@ func to4(ip net.IP) ([4]byte, error) {
 	return out, nil
 }
 
-// Uplink 把客户端发出的包改写为隧道地址发出，原地修改 buf。
+// Uplink 把对端发出的包改写为隧道地址发出，原地修改 buf。
 func (m *Mapper) Uplink(buf []byte) ([]byte, error) {
 	hdr, err := parseIPv4(buf)
 	if err != nil {
@@ -87,7 +87,7 @@ func (m *Mapper) Uplink(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-// Downlink 把隧道收到的包改写为发往客户端，原地修改 buf。
+// Downlink 把隧道收到的包改写为发往对端，原地修改 buf。
 func (m *Mapper) Downlink(buf []byte) ([]byte, error) {
 	hdr, err := parseIPv4(buf)
 	if err != nil {
@@ -219,7 +219,7 @@ func (m *Mapper) rewriteICMPInner(buf []byte, hdr ipv4Header, old, new [4]byte) 
 	if err != nil {
 		return
 	}
-	// 内层两个地址里最多有一个是我们的：上行方向它是源（客户端报的是它
+	// 内层两个地址里最多有一个是我们的：上行方向它是源（对端报的是它
 	// 收到的包），下行方向它是目的。两个都查一遍就不必区分方向。
 	var srcChanged, dstChanged bool
 	if equal4(buf[inner+ipv4SrcOffset:], old) {

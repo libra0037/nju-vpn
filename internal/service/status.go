@@ -8,7 +8,7 @@
 //
 //   - 不在持锁时做网络 I/O；
 //   - 半完成的登录必须留下来（拿着它才登得出去），不能丢掉，否则服务端
-//     那条"同一账号只允许一个客户端"的名额要等它自己超时才释放；
+//     那条"同一账号只允许一条隧道会话"的名额要等它自己超时才释放；
 //   - 隧道协程的每一条汇报都带代次，过期汇报不许改状态。
 package service
 
@@ -41,7 +41,7 @@ type Status struct {
 	// ClientIP / PeerIP 不在这份快照里：会话挂着时由 Service.Status 现取
 	// （端点上的当前地址加配置里的 peer 地址），会话摘掉后为空。
 	ClientIP string `json:"client_ip,omitempty"` // 校园网分配的地址
-	PeerIP   string `json:"peer_ip,omitempty"`   // 客户端 peer 的地址
+	PeerIP   string `json:"peer_ip,omitempty"`   // 对端 peer 的地址
 	// Since 是进入当前状态的时间，便于判断"卡了多久"。
 	Since time.Time `json:"since"`
 	// Identity 是实例身份，用来区分同机上的多个实例。

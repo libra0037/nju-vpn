@@ -2,7 +2,7 @@
 
 南京大学校园网 VPN 的第三方客户端。支持 Windows 与 Linux，理论上支持 macOS 但未实测。
 
-服务进程把校园网隧道拼接到 WireGuard 隧道上，任何支持 WireGuard 节点的客户端（Clash、sing-box 等）都能通过它访问校内资源。
+服务进程把校园网隧道拼接到 WireGuard 隧道上，Clash、sing-box 之类的程序都能以 WireGuard 对端的身份接入，从而访问校内资源。
 
 > 实测结论、设计取舍与踩过的坑见 [HANDOFF.md](HANDOFF.md)。
 
@@ -39,7 +39,7 @@ go build -o njuvpn ./cmd/njuvpn
 - `password` 留空则需要在每次建立隧道时手动输入登录密码。
 - 通常不需填写 `proxy`，除非本机到服务端需要另择出口（服务端把会话绑到源 IP，代理的出口必须是稳定的单一地址）。
 - 首次启动会生成 `device_id` 并写回配置：授信终端绑的就是它，删掉或换掉等于换了一台设备，登录又要走一次二次验证。
-- 首次启动会自动生成 WireGuard 私钥并写回配置文件，启动日志里打印服务端公钥。
+- 首次启动会自动生成 WireGuard 私钥并写回配置文件，启动日志里打印承载层公钥。
 - 配置文件里有凭据，服务进程启动时会把它收紧到 `0600`。
 
 ### 2. 命令行
@@ -58,16 +58,16 @@ njuvpn version          查看版本
 
 `start` 支持管道输入，便于脚本：`printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start`。
 
-### 3. 客户端接入
+### 3. WireGuard 对端接入
 
-客户端是任意支持 WireGuard 的程序。两边的公钥是分开的，按这个顺序来：
+对端可以是任意支持 WireGuard 的程序（Clash、sing-box、内核 WireGuard）。两边各填对方的公钥，按这个顺序来：
 
-1. 客户端先生成自己的密钥对（Clash Verge 会自动生成；内核 WireGuard 用 `wg genkey | wg pubkey`），把**客户端公钥**填进配置的 `wireguard.peer_public_key`。
+1. 对端先生成自己的密钥对（Clash Verge 会自动生成；内核 WireGuard 用 `wg genkey | wg pubkey`），把**对端公钥**填进配置的 `wireguard.peer_public_key`。
    （承载层在服务进程启动时就建好了，之后改这个键要 `njuvpn restart`，重启会重新登录一次。）
-2. 启动 `njuvpn start`。首次启动会生成承载层私钥并写回配置文件，日志里有一行 `WireGuard 服务端公钥: ...`——**服务端公钥是启动之后才有的**。
-3. 把**服务端公钥**填进客户端。这一步不影响服务进程，不必重启。
+2. 启动 `njuvpn start`。首次启动会生成承载层私钥并写回配置文件，日志里有一行 `WireGuard 承载层公钥: ...`——**承载层公钥是启动之后才有的**。
+3. 把**承载层公钥**填进对端。这一步不影响服务进程，不必重启。
 
-**Clash Verge**：添加一个 WireGuard 节点即可（客户端私钥由它自己生成，把对应的公钥填进 `wireguard.peer_public_key`；`ip` 必须与服务端的 `peer_address` 一致，通常是 10.66.66.2）：
+**Clash Verge**：添加一个 WireGuard 节点即可（对端私钥由它自己生成，把对应的公钥填进 `wireguard.peer_public_key`；`ip` 必须与配置里的 `wireguard.peer_address` 一致，通常是 10.66.66.2）：
 
 ```yaml
 - name: nju-vpn
@@ -75,8 +75,8 @@ njuvpn version          查看版本
   server: 127.0.0.1
   port: 51820
   ip: 10.66.66.2
-  private-key: <客户端私钥>
-  public-key: <服务端公钥>
+  private-key: <对端私钥>
+  public-key: <承载层公钥>
   allowed-ips: ["0.0.0.0/0"]
   udp: true
   mtu: 1320
@@ -86,7 +86,7 @@ njuvpn version          查看版本
 
 ```
 sudo apt install wireguard-tools
-wg genkey | sudo tee /etc/wireguard/client.key | wg pubkey   # 输出的就是客户端公钥
+wg genkey | sudo tee /etc/wireguard/client.key | wg pubkey   # 输出的就是对端公钥
 sudo chmod 600 /etc/wireguard/client.key
 ```
 
@@ -94,12 +94,12 @@ sudo chmod 600 /etc/wireguard/client.key
 
 ```ini
 [Interface]
-PrivateKey = <客户端私钥>
+PrivateKey = <对端私钥>
 Address = 10.66.66.2/32
 MTU = 1320
 
 [Peer]
-PublicKey = <服务端公钥>
+PublicKey = <承载层公钥>
 Endpoint = 127.0.0.1:51820
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
@@ -113,7 +113,7 @@ sudo wg-quick down njuvpn   # 收工
 sudo wg show                # 看握手与流量
 ```
 
-两种客户端的 `allowed-ips` / `AllowedIPs` 都写 `0.0.0.0/0` 时，整台机器的流量都走校园网出口；只想让校内地址走隧道，就把它们收窄到校内网段。
+两份配置的 `allowed-ips` / `AllowedIPs` 都写 `0.0.0.0/0` 时，整台机器的流量都走校园网出口；只想让校内地址走隧道，就把它们收窄到校内网段。
 
 ### 多实例与开机自启
 

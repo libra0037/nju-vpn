@@ -35,9 +35,9 @@ type DeviceOptions struct {
 
 // Device 是 WireGuard 承载层。
 //
-// 客户端通过 UDP 接入，本进程把解出来的 IP 包交给校园网隧道，
-// 反向则把隧道收到的包加密送回客户端。这里不创建 TUN 网卡：
-// 承载端是内存里的 Relay，客户端自带用户态网络栈。
+// 对端通过 UDP 接入，本进程把解出来的 IP 包交给校园网隧道，
+// 反向则把隧道收到的包加密送回对端。这里不创建 TUN 网卡：
+// 承载端是内存里的 Relay，对端自带用户态网络栈。
 //
 // 设备与校园网会话是两条独立的生命周期：设备在服务进程启动时就建好
 // （端口冲突、私钥写错这类问题当场暴露），会话则随 njuvpn start / stop
@@ -55,7 +55,7 @@ type Device struct {
 
 	// peerInstalls 统计 SetPeer 成功下发的次数。
 	//
-	// 每次重装都会清掉设备上的 peer（replace_peers），客户端已经握好的会话
+	// 每次重装都会清掉设备上的 peer（replace_peers），对端已经握好的会话
 	// 密钥随之作废，表现是隧道 up 却长时间不通。这个计数是排查时唯一能直接
 	// 看出“有没有发生重装”的证据，服务层据此判断要不要动设备。
 	peerInstalls atomic.Int64
@@ -141,7 +141,7 @@ func (d *Device) ClearSession() {
 
 // SetPeer 在不重启设备的前提下替换 peer。
 //
-// 重新生成客户端密钥时不必重建隧道：隧道登录与 WireGuard 设备是两件
+// 重新生成对端密钥时不必重建隧道：隧道登录与 WireGuard 设备是两件
 // 独立的事，后者可以就地更新。这一点很实用——重建隧道要重新登录一次。
 func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	if pub.IsZero() {
@@ -155,21 +155,21 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 		return fmt.Errorf("更新 peer: %w", err)
 	}
 	d.peerInstalls.Add(1)
-	// 换了 key 就等于重新开始：客户端得重新握手，下行方向才再次放行。
+	// 换了 key 就等于重新开始：对端得重新握手，下行方向才再次放行。
 	d.relay.HoldDownlink(true)
 	return nil
 }
 
 // PeerInstalls 返回 peer 被成功下发（重装）的累计次数，供测试断言
-// "密钥没变就不再重装"（重装会作废客户端已经握好的会话密钥）。
+// "密钥没变就不再重装"（重装会作废对端已经握好的会话密钥）。
 //
-// 公钥没变时不该增长：每增长一次都意味着客户端的会话密钥被作废。
+// 公钥没变时不该增长：每增长一次都意味着对端的会话密钥被作废。
 func (d *Device) PeerInstalls() int64 { return d.peerInstalls.Load() }
 
 // ClearPeer 摘掉接入方。
 //
-// 隧道断开后必须做这件事：设备还在监听，若 peer 留着，客户端会握手成功，
-// 然后每个包都撞上"没有会话"被丢掉——从客户端看是"连上了但什么都打不开"，
+// 隧道断开后必须做这件事：设备还在监听，若 peer 留着，对端会握手成功，
+// 然后每个包都撞上"没有会话"被丢掉——从对端看是"连上了但什么都打不开"，
 // 比干脆连不上难查得多。
 func (d *Device) ClearPeer() error {
 	if err := d.dev.IpcSet("replace_peers=true\n"); err != nil {
@@ -204,7 +204,7 @@ func parseUAPI(out string) deviceConfig {
 			cfg.listenPort, _ = strconv.Atoi(strings.TrimSpace(value))
 			continue
 		}
-		// 设备上只有一个 peer，所以这两行就是“客户端接进来了没有”。
+		// 设备上只有一个 peer，所以这两行就是“对端接进来了没有”。
 		if key == "last_handshake_time_sec" {
 			cfg.lastHandshakeSec, _ = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 		}
@@ -261,18 +261,18 @@ func (d *Device) Close() error {
 
 // handshakeSettleInterval 是“下行闩锁松开”的探测起点。
 //
-// 只在闩锁闭合且客户端还没露面时探测；握手一完成就不再回读设备。
+// 只在闩锁闭合且对端还没露面时探测；握手一完成就不再回读设备。
 const handshakeSettleInterval = 200 * time.Millisecond
 
 // handshakeSettleMax 是探测间隔的上限。
 //
-// 客户端可能很久之后才连进来（甚至一直不连），所以探测要退避：5 次/秒的
+// 对端可能很久之后才连进来（甚至一直不连），所以探测要退避：5 次/秒的
 // UAPI 读一直跑下去没有意义，还会和设备的其它 UAPI 操作抢同一把锁。
 const handshakeSettleMax = 5 * time.Second
 
-// watchPeerHandshake 在闩锁闭合期间盯着设备，客户端握手一完成就放行下行。
+// watchPeerHandshake 在闩锁闭合期间盯着设备，对端握手一完成就放行下行。
 //
-// 为什么不问“客户端发来的数据包”：保活包与握手都不进 TUN，纯下行的客户端
+// 为什么不问“对端发来的数据包”：保活包与握手都不进 TUN，纯下行的对端
 // （下载已经在跑、自己没有待发数据）永远等不到那一步，下行会一直扣着——
 // 表现就是“隧道 up 但什么都不通”。设备自己知道握手有没有完成（UAPI 的
 // last_handshake_time_sec），这是最直接的证据。
@@ -288,7 +288,7 @@ func (d *Device) watchPeerHandshake() {
 		case <-d.closed:
 			return
 		case <-d.relay.holdWake:
-			// 会话刚接上（或刚摘掉）：立刻看一眼，客户端可能已经握好手了。
+			// 会话刚接上（或刚摘掉）：立刻看一眼，对端可能已经握好手了。
 			interval = handshakeSettleInterval
 			timer.Reset(interval)
 			continue
@@ -309,7 +309,7 @@ func (d *Device) watchPeerHandshake() {
 
 // probeInterval 决定下一次探测的间隔。
 //
-// 只在"有会话、还没见到握手"这一段退避着探测；闩锁开着（没有会话，或客户端
+// 只在"有会话、还没见到握手"这一段退避着探测；闩锁开着（没有会话，或对端
 // 已经露面）时用上限等着——这两段时间不会自己变回来，会话接上时由 holdWake
 // 叫醒，不必每秒读几次 UAPI。
 func probeInterval(hold, seen bool, current time.Duration) time.Duration {

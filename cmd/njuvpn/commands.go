@@ -54,7 +54,7 @@ func cmdRun(args []string) error {
 	}
 	log.Printf("WireGuard 承载: %s", svc.BearerSummary())
 
-	// 退出路径上无条件登出：服务端同一账号只允许一个客户端，残留会话会让
+	// 退出路径上无条件登出：服务端同一账号只允许一条隧道会话，残留会话会让
 	// 后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
@@ -64,7 +64,7 @@ func cmdRun(args []string) error {
 // ensureIdentity 保证设备标识与 WireGuard 私钥存在，并尽量写回配置文件。
 //
 // 两者都必须在服务进程启动时定下来：设备标识决定授信终端绑的是哪台设备，
-// 换一个就得重新做一次二次验证；私钥换一个，所有客户端配置都会失效。
+// 换一个就得重新做一次二次验证；私钥换一个，所有对端配置都会失效。
 //
 // 写回失败只记警告：配置可能是只读的，那种情况下进程仍然能跑，只是下次
 // 启动会换一个标识——用户需要知道这一点。设备标识生成不出来则是另一回事：
@@ -90,7 +90,7 @@ func ensureIdentity(cfg *config.Config) error {
 		}
 		cfg.WireGuard.PrivateKey = key.String()
 		if err := config.PersistPrivateKey(cfg.SourcePath(), key.String()); err != nil {
-			log.Printf("警告: 私钥已生成但无法写回配置（%v）；重启后公钥会变，客户端需要重新配置", err)
+			log.Printf("警告: 私钥已生成但无法写回配置（%v）；重启后公钥会变，对端需要重新配置", err)
 		} else {
 			log.Printf("已生成 WireGuard 私钥并写回 %s", cfg.SourcePath())
 		}
@@ -98,7 +98,7 @@ func ensureIdentity(cfg *config.Config) error {
 	return nil
 }
 
-// logWireGuardPublicKey 打印服务端公钥，用户需要把它填进客户端配置。
+// logWireGuardPublicKey 打印承载层公钥，用户需要把它填进对端配置。
 func logWireGuardPublicKey(cfg *config.Config) {
 	if cfg.WireGuard.PrivateKey == "" {
 		return
@@ -113,7 +113,7 @@ func logWireGuardPublicKey(cfg *config.Config) {
 		log.Printf("警告: 推导 WireGuard 公钥失败: %v", err)
 		return
 	}
-	log.Printf("WireGuard 服务端公钥: %s", pub.String())
+	log.Printf("WireGuard 承载层公钥: %s", pub.String())
 }
 
 // cmdStart 用一条命令走完整个建立流程。
