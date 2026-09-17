@@ -212,8 +212,8 @@ func (c *control) do(ctx context.Context, method, path string, params url.Values
 	return raw, nil
 }
 
-// envelopeData 把响应解成信封并检查 code。
-// envelopeData 解析控制面响应，会话类错误码按"会话已失效"处理。
+// envelopeData 解析控制面响应：解信封、检查 code，会话类错误码按"会话已失效"
+// 处理。
 func envelopeData(raw []byte) (json.RawMessage, error) {
 	return decodeEnvelope(raw, true)
 }

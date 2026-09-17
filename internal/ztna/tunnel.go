@@ -343,9 +343,9 @@ func (t *tunnelConn) handleVIPUpdate(status byte, payload []byte) {
 		if cur := t.VIP(); cur != nil && cur.Equal(v4) {
 			return
 		}
+		// 两个值一起更新：承载层的映射读端点上的地址（上下行改写都用它），
+		// VIP 供状态与后续判断读。它们描述的是同一个事实，不能只改一半。
 		t.setVIP(v4)
-		// 先让承载层跟着切，再记自己的值：顺序反了会出现“映射还在用旧地址”
-		// 的窗口，那段时间上下行都会被丢。
 		t.ep.SetLocalAddr(v4)
 		t.logf("服务端下发地址: %s（数据面已跟着切）", v4)
 		return

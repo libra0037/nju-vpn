@@ -13,7 +13,6 @@
 package service
 
 import (
-	"log"
 	"sync"
 	"time"
 )
@@ -60,18 +59,6 @@ type Identity struct {
 	Username   string `json:"username,omitempty"`
 }
 
-// transitions 是状态迁移表。key 是当前状态，value 是允许进入的下一状态。
-//
-// error 与 idle 从任何状态都可达：失败与断开必须在任何时刻都能收敛，
-// 没有恢复路径的状态机是运维事故的温床。
-var transitions = map[State][]State{
-	StateIdle:        {StateLoggingIn, StateError},
-	StateLoggingIn:   {StateAuthPending, StateUp, StateIdle, StateError},
-	StateAuthPending: {StateLoggingIn, StateUp, StateIdle, StateError},
-	StateUp:          {StateIdle, StateError, StateLoggingIn},
-	StateError:       {StateIdle, StateLoggingIn, StateError},
-}
-
 // statusStore 保存对外可见的状态快照。
 //
 // 只有 actor 协程写它，任何协程都可以读。
@@ -93,17 +80,13 @@ func (s *statusStore) Get() Status {
 
 // set 迁移到 next 状态。
 //
-// 非法迁移会写日志并照样迁移：调用点分布在错误路径上，返回错误只会被
-// 丢掉，结果是状态静默停在原地，对外还是一个看起来正常的状态，比迁移
-// 错误本身更难排查。
+// 这里不做"迁移是否合法"的判定：那张表曾经存在，但把每一条真实路径都走
+// 过一遍之后发现它拦的迁移一次都没发生过（隧道协程的汇报都带代次，过期
+// 汇报在调用点就被丢掉了），留着只会给读者一个"能报警"的错觉。状态是否
+// 合理由各调用点自己的前置条件保证（例如 tunnelDown 只看当前代次）。
 func (s *statusStore) set(next State, detail string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	cur := s.status.State
-	if cur != next && !allowed(cur, next) {
-		log.Printf("状态从 %s 迁移到 %s 不在预期内（继续迁移）", cur, next)
-	}
 	s.applyLocked(next, detail)
 }
 
@@ -133,13 +116,4 @@ func (s *statusStore) applyLocked(next State, detail string) {
 	if next == StateIdle || next == StateError {
 		s.status.Retrying = false
 	}
-}
-
-func allowed(cur, next State) bool {
-	for _, s := range transitions[cur] {
-		if s == next {
-			return true
-		}
-	}
-	return false
 }

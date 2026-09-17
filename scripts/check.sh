@@ -30,6 +30,8 @@ run go build ./...
 run env CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
 run env CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
 run go test ./... -race
+# 依赖面不许悄悄回涨：tidy 之后应当没有任何差异（悬空依赖、漏写的 require）。
+run go mod tidy -diff
 
 if command -v staticcheck >/dev/null 2>&1; then
   run staticcheck ./...
@@ -44,4 +46,3 @@ if [ "$fail" -ne 0 ]; then
 fi
 echo
 echo "全部通过"
-

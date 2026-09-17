@@ -842,6 +842,9 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 		log.Printf("忽略过期隧道协程的退出（第 %d 代，当前第 %d 代）: %v", gen, s.gen, err)
 		return nil
 	}
+	// 防御分支：按代次判定之后，能走到这里的状态本来就是 up（把状态改成
+	// 非 up 的路径都先经过 teardown，而 teardown 会推进代次）。留着它是
+	// 为了"状态与代次哪天不再同步"时留一条可见的线索。
 	if s.status.Get().State != StateUp {
 		log.Printf("隧道协程已退出（当前状态 %s）: %v", s.status.Get().State, err)
 		return nil
@@ -864,11 +867,15 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 //
 // 只改说明文字：状态仍是 up，因为登录会话、隧道对象与承载层都还在，
 // 重连成功后不需要重建它们。
+//
+// 守卫只认 StateUp：状态不是 up 时隧道协程的这一代早就结束了（teardown
+// 推进代次，代次检查会先把这条汇报丢掉），放宽到 error 只会让人以为
+// "error 状态下也该标正在重连"。
 func (s *Service) tunnelRetry(gen uint64, attempt int, err error) error {
 	if gen != s.gen {
 		return nil
 	}
-	if s.status.Get().State != StateUp && s.status.Get().State != StateError {
+	if s.status.Get().State != StateUp {
 		return nil
 	}
 	s.status.setRetrying(true)

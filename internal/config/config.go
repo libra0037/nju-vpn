@@ -594,7 +594,6 @@ func isBlockMapping(line, prefix string) bool {
 	return rest == "" || strings.HasPrefix(rest, "#")
 }
 
-// commentOf 取出行尾注释（连前面的分隔空格），没有注释就返回空串。
 // existingValue 取出某一行里字段的当前值（去掉行尾注释与引号）。
 func existingValue(line string) string {
 	i := strings.Index(line, ":")
@@ -608,6 +607,8 @@ func existingValue(line string) string {
 	return strings.Trim(strings.TrimSpace(rest), "\"'")
 }
 
+// commentOf 取出行尾注释（连前面的分隔空格），没有注释就返回空串。
+//
 // 只用于我们自己改写的那一行：值里不可能出现 #（是 base64 或十六进制）。
 func commentOf(line string) string {
 	i := strings.Index(line, "#")
