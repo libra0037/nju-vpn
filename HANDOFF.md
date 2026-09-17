@@ -61,7 +61,7 @@
     internal/service/         状态机、隧道生命周期、IPC 服务端
     internal/ztnatest/        测试替身：脚本化控制面 + 内存隧道服务端
 
-生产代码约 8.9k 行，测试约 5.3k 行（2026-09-17）。
+生产代码约 9.0k 行（不含 `internal/ztnatest` 的 921 行测试替身），测试约 5.9k 行、165 个用例（2026-09-17 重算）。
 
 ### 3.1 分层
 
@@ -87,7 +87,7 @@
 
 `go test ./... -race` 不连任何真实服务端：`internal/ztnatest` 提供脚本化控制面与内存隧道服务端；`internal/wireguard/loopback_test.go` 用一台真实的 wireguard-go 设备做回环，覆盖握手、加密、双向转发、地址改写、未授权客户端被拒与关闭后停止转发。
 
-已知例外：`internal/ztna` 的流表有一处数据竞争（上行在锁外读流状态，鉴权响应在锁内写），修掉之前 `-race` 会命中它。
+`-race` 基线是干净的：没有已知例外。
 
 ## 4. 承载层（WireGuard）
 
@@ -211,9 +211,9 @@ TLS 有两处，校验方式不同：控制面走系统信任链（门户证书�
 
 ### 9.2 检查清单
 
-提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l .`、`go vet ./...`、`go build ./...`、Windows 与 macOS 交叉编译、`go test ./... -race`、`staticcheck ./...`（未安装时跳过并提示）——都应当无输出或全绿。`scripts/build-release.sh <版本>` 生成各平台产物（产物目录不进 git）。
+提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l .`、`go vet ./...`、`go build ./...`、六个发布平台的交叉编译、`go test ./... -race`、`go mod tidy -diff`、`staticcheck ./...`、`deadcode -test ./...`，加上"README 里的子命令都能在 usage 里找到"这一条——都应当无输出或全绿。工具装在 `$(go env GOPATH)/bin` 下也会被找到（不必先进 PATH）。`scripts/build-release.sh <版本>` 生成各平台产物（产物目录不进 git）。
 
-`govulncheck` / `gosec` / `deadcode` 的基线数字是协议更换之前测的，尚未重测；重测之前不要按旧数字判断"新出现的条目"。
+`govulncheck` 已于 2026-09-17 重测：本代码 0 命中（依赖模块里有 30 条，但都不被调用）。`deadcode -test ./...` 已接进 `check.sh`，当前无输出。`gosec` 仍是协议更换之前测的，重测之前不要按旧数字判断"新出现的条目"。
 
 ### 9.3 调试时踩过的坑
 
