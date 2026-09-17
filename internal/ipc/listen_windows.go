@@ -8,7 +8,6 @@ import (
 	"net"
 	"os/user"
 	"strings"
-	"time"
 
 	"github.com/Microsoft/go-winio"
 )
@@ -73,7 +72,7 @@ func Dial(endpoint string) (net.Conn, error) {
 	if endpoint == "" {
 		return nil, ErrEmptyEndpoint
 	}
-	timeout := 5 * time.Second
+	timeout := dialTimeout
 	conn, err := winio.DialPipe(endpoint, &timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接服务进程 %s: %w（服务是否在运行？）", endpoint, err)

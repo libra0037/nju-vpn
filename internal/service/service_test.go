@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -622,4 +623,31 @@ func TestStatusAddressFollowsServerUpdate(t *testing.T) {
 	if st := svc.Status(); st.ClientIP != "" || st.PeerIP != "" {
 		t.Fatalf("断开后仍显示地址: %q / %q", st.ClientIP, st.PeerIP)
 	}
+}
+
+// TestListenHostTablesAgree 钉住 config 与 wireguard 的两份取值集合一致。
+//
+// config 是叶子包，为了不让依赖图绕圈自己留了一份写法集合（见
+// config.validateListenHost 的注释），一致性原来只靠注释提醒：从一边删掉
+// "any"，另一边照样放行，用户以为在监听全部网卡，承载层却静默回落到回环。
+func TestListenHostTablesAgree(t *testing.T) {
+	for _, v := range []string{"", "loopback", "local", "127.0.0.1", "all", "any", "0.0.0.0", "loop", "0.0.0.1", "ALL"} {
+		_, wgErr := wireguard.ParseListenHost(v)
+		cfgErr := loadWithListenHost(t, v)
+		if (wgErr == nil) != (cfgErr == nil) {
+			t.Errorf("取值 %q：wireguard 说 (err=%v)，config 说 (err=%v)——两份表必须一致", v, wgErr, cfgErr)
+		}
+	}
+}
+
+// loadWithListenHost 用最小可加载的配置跑一遍 config.Load，只为看校验结果。
+func loadWithListenHost(t *testing.T, value string) error {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "server: vpn.example\nusername: u\nmtu: 1320\nwireguard:\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := config.Load(path)
+	return err
 }

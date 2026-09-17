@@ -18,8 +18,15 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
+
+// dialTimeout 是客户端连接服务进程的超时。
+//
+// 放在这里而不是各自的构建标签文件里：Unix 与 Windows 两侧的行为要一致，
+// 而两份字面量靠注释提醒同步，改一边就会分叉。
+const dialTimeout = 5 * time.Second
 
 // 请求命令。每个命令的参数都是固定位置、固定个数，布尔值写成 名字=0/1：
 // 这样"少写一个参数"与"写错一个值"不会互相冒充。

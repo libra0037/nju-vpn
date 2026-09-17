@@ -70,6 +70,11 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 	if opts.ListenPort < 0 || opts.ListenPort > 65535 {
 		return nil, fmt.Errorf("监听端口超出范围: %d", opts.ListenPort)
 	}
+	// MTU 由调用方（配置）定下来：这里不再留一份 1320 的兜底默认值，
+	// 两份默认值改一边漏一边就是"帧大小按谁算"的静默分叉。
+	if opts.MTU <= 0 {
+		return nil, fmt.Errorf("缺少 MTU")
+	}
 
 	relay := NewRelay(RelayOptions{MTU: opts.MTU})
 

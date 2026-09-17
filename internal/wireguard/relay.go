@@ -94,12 +94,8 @@ type Relay struct {
 // 接上。这样"端口被占""私钥写错"这类问题在进程启动时就暴露，不必等到
 // 登录、短信、建隧道全部走完。
 func NewRelay(opts RelayOptions) *Relay {
-	mtu := opts.MTU
-	if mtu <= 0 {
-		mtu = 1320
-	}
 	r := &Relay{
-		mtu:      mtu,
+		mtu:      opts.MTU,
 		queue:    make(chan []byte, queueSize),
 		events:   make(chan tun.Event, 8),
 		closed:   make(chan struct{}),

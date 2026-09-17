@@ -34,9 +34,6 @@ func endpointPath(id string) string {
 // dialProbeTimeout 是探测这个套接字上还有没有活实例的超时。
 const dialProbeTimeout = 300 * time.Millisecond
 
-// dialTimeout 是连接服务进程的超时，与 Windows 侧保持一致。
-const dialTimeout = 5 * time.Second
-
 // Listen 在 Unix 域套接字上监听。
 //
 // 套接字与目录都收紧到属主专用：这个通道能启动隧道、提交验证码。
