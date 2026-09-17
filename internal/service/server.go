@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -134,6 +135,18 @@ func (s *Server) handle(conn net.Conn) {
 		}
 		req, err := ipc.ReadRequest(reader)
 		if err != nil {
+			// 超长行与畸形请求是"客户端写错了"，按协议回一条 400 再断开：
+			// 调用方读到 0 字节 + EOF 时，与"服务进程已经退出"或"命令打到了
+			// 别的实例"完全同形，也拿不到可重试的信号。正常断开（EOF）保持
+			// 静默——那是客户端干完了活。
+			if !errors.Is(err, io.EOF) {
+				msg := "请求格式错误"
+				if errors.Is(err, ipc.ErrLineTooLong) {
+					msg = fmt.Sprintf("请求超过 %d 字节的长度上限", ipc.MaxLineBytes)
+				}
+				_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				_ = ipc.WriteResponse(conn, ipc.Response{Code: ipc.CodeBadRequest, Message: msg})
+			}
 			return
 		}
 

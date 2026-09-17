@@ -116,12 +116,27 @@ func removeStaleSocket(endpoint string) error {
 	if conn, err := net.DialTimeout("unix", endpoint, dialProbeTimeout); err == nil {
 		conn.Close()
 		return fmt.Errorf("已有服务进程在监听 %s（同一台机器上跑多个实例时，每份配置要用不同的 -config 路径，或显式设置 ipc.endpoint）", endpoint)
+	} else if probeAlive(err) {
+		// 探测超时按"仍在运行"处理：服务进程的命令是串行的，正忙着登录、
+		// 登出或发验证码时，300ms 的探测可能超时。删掉一个活着的套接字会
+		// 让两个进程各自以为自己是唯一实例：旧的那个此后收不到命令，也没人
+		// 负责登出，服务端名额要等它自己超时才释放。
+		return fmt.Errorf("端点 %s 上的服务进程没有在 %s 内回应探测，按仍在运行处理；确认它已退出后再启动，或换一份配置路径", endpoint, dialProbeTimeout)
 	}
 
 	if err := os.Remove(endpoint); err != nil {
 		return fmt.Errorf("清理旧套接字 %s: %w", endpoint, err)
 	}
 	return nil
+}
+
+// probeAlive 判断一次探测失败是否意味着"还有活实例"。
+//
+// 超时算活着：连接迟迟建不起来说明有进程在监听、只是忙。只有明确的
+// "没人监听"（连接被拒、套接字文件残留）才允许当作陈旧清掉。
+func probeAlive(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // ownerUID 取出文件属主。

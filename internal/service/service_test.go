@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -543,6 +545,46 @@ func TestLateTunnelReportIgnoredAfterTeardown(t *testing.T) {
 	}
 	if strings.Contains(svc.Status().Detail, "正在重连") {
 		t.Errorf("过期代次的汇报改掉了状态说明: %q", svc.Status().Detail)
+	}
+}
+
+// TestHandleBadRequestGets400 回归：超长与畸形请求要回一条 400 再断开。
+//
+// 以前无论什么错误都直接 return：调用方读到 0 字节 + EOF，与"服务进程已经
+// 退出"或"命令打到了别的实例"完全同形，也拿不到可重试的信号。
+func TestHandleBadRequestGets400(t *testing.T) {
+	srv := newFakeServer(t, ztnatest.Options{})
+	svc := newTestService(t, srv, newTestConfig(t, srv))
+	s := &Server{svc: svc, closing: make(chan struct{}), quit: make(chan struct{})}
+
+	cases := []struct {
+		name string
+		send string
+	}{
+		{"超长行", strings.Repeat("x", ipc.MaxLineBytes+8192)},
+		{"空请求", "\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			go s.handle(server)
+
+			// net.Pipe 是同步的：写要放到另一条协程里，主协程才能读到响应。
+			go func() { _, _ = io.WriteString(client, c.send) }()
+			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			line, err := bufio.NewReader(client).ReadString('\n')
+			if err != nil {
+				t.Fatalf("没有读到响应（应当回 400）: %v", err)
+			}
+			resp, err := ipc.ParseResponse(line)
+			if err != nil {
+				t.Fatalf("响应无法解析: %v（%q）", err, line)
+			}
+			if resp.Code != ipc.CodeBadRequest {
+				t.Fatalf("状态码 = %d（%q），期望 400", resp.Code, line)
+			}
+		})
 	}
 }
 
