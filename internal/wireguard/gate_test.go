@@ -120,3 +120,23 @@ func TestMapperFollowsAddressChange(t *testing.T) {
 		t.Fatal("旧地址的下行包应当被拒（映射已经切到新地址）")
 	}
 }
+
+// TestProbeIntervalBacksOff 钉住探测节奏。
+//
+// 只有"有会话、还没见到握手"这一段才短间隔探测；闩锁开着（没有会话，或客户
+// 端已经露面）时一律用上限等着——老实现把这两种情况都重置回 200ms，于是稳态
+// 下每秒醒五次，读到进程结束。
+func TestProbeIntervalBacksOff(t *testing.T) {
+	if got := probeInterval(false, false, handshakeSettleMax); got != handshakeSettleMax {
+		t.Errorf("没有会话时下一次探测间隔 %v，期望 %v", got, handshakeSettleMax)
+	}
+	if got := probeInterval(true, true, handshakeSettleMax); got != handshakeSettleMax {
+		t.Errorf("客户端已露面时 %v，期望 %v", got, handshakeSettleMax)
+	}
+	if got := probeInterval(true, false, handshakeSettleInterval); got != 2*handshakeSettleInterval {
+		t.Errorf("探测阶段应当退避，得到 %v", got)
+	}
+	if got := probeInterval(true, false, handshakeSettleMax); got != handshakeSettleMax {
+		t.Errorf("退避不该超过上限，得到 %v", got)
+	}
+}

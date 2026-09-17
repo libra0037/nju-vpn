@@ -282,22 +282,34 @@ func (d *Device) watchPeerHandshake() {
 		select {
 		case <-d.closed:
 			return
+		case <-d.relay.holdWake:
+			// 会话刚接上（或刚摘掉）：立刻看一眼，客户端可能已经握好手了。
+			interval = handshakeSettleInterval
+			timer.Reset(interval)
+			continue
 		case <-timer.C:
 		}
-		// 闩锁开着（客户端已经露面，或设备里根本没配 peer）时不必探测。
-		if !d.relay.hold.Load() || d.relay.peerSeen.Load() {
-			interval = handshakeSettleInterval
-			timer.Reset(interval)
-			continue
+		hold, seen := d.relay.hold.Load(), d.relay.peerSeen.Load()
+		if hold && !seen {
+			cfg, err := d.config()
+			if err == nil && cfg.lastHandshakeSec > 0 {
+				d.relay.peerSeen.Store(true)
+				seen = true
+			}
 		}
-		cfg, err := d.config()
-		if err == nil && cfg.lastHandshakeSec > 0 {
-			d.relay.peerSeen.Store(true)
-			interval = handshakeSettleInterval
-			timer.Reset(interval)
-			continue
-		}
-		interval = min(interval*2, handshakeSettleMax)
+		interval = probeInterval(hold, seen, interval)
 		timer.Reset(interval)
 	}
+}
+
+// probeInterval 决定下一次探测的间隔。
+//
+// 只在"有会话、还没见到握手"这一段退避着探测；闩锁开着（没有会话，或客户端
+// 已经露面）时用上限等着——这两段时间不会自己变回来，会话接上时由 holdWake
+// 叫醒，不必每秒读几次 UAPI。
+func probeInterval(hold, seen bool, current time.Duration) time.Duration {
+	if !hold || seen {
+		return handshakeSettleMax
+	}
+	return min(current*2, handshakeSettleMax)
 }

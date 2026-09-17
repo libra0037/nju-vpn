@@ -74,6 +74,11 @@ type Relay struct {
 	hold     atomic.Bool
 	peerSeen atomic.Bool
 
+	// holdWake 在每次装/摘 peer 时响一下，给 watchPeerHandshake 一个即时信号。
+	// 没有它，探测循环只能靠轮询发现"会话刚接上"，而那段空转要么费电要么
+	// 让下行闩锁慢几秒才松开。
+	holdWake chan struct{}
+
 	events    chan tun.Event
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -94,10 +99,11 @@ func NewRelay(opts RelayOptions) *Relay {
 		mtu = 1320
 	}
 	r := &Relay{
-		mtu:    mtu,
-		queue:  make(chan []byte, queueSize),
-		events: make(chan tun.Event, 8),
-		closed: make(chan struct{}),
+		mtu:      mtu,
+		queue:    make(chan []byte, queueSize),
+		events:   make(chan tun.Event, 8),
+		closed:   make(chan struct{}),
+		holdWake: make(chan struct{}, 1),
 	}
 
 	// 设备已经就绪，直接报告 Up。这里没有真正的网卡需要等待系统拉起。
@@ -130,6 +136,10 @@ func (r *Relay) InstallSession(ep *l3.Endpoint, mapper *Mapper) {
 func (r *Relay) HoldDownlink(hold bool) {
 	r.peerSeen.Store(false)
 	r.hold.Store(hold)
+	select {
+	case r.holdWake <- struct{}{}:
+	default:
+	}
 }
 
 // ClearSession 摘掉当前会话。设备继续监听，但不再有任何包进出隧道。
