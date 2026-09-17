@@ -18,17 +18,26 @@ const (
 )
 
 // flowKey 是一个方向的五元组标识。
+//
+// 地址用 4 字节数组而不是字符串：这个键在每条上行包上都要拼一次、查一次表，
+// 字符串版本每包要走两次 net.IP.String()（实测 2.00 次分配/包）。数组是值类型，
+// 可比较、能做 map 键，也不逃逸。
 type flowKey struct {
 	atype uint8
 	proto uint8
-	src   string
+	src   [4]byte
 	sport uint16
-	dst   string
+	dst   [4]byte
 	dport uint16
 }
 
+// srcString / dstString 各做一次字符串转换，只在建鉴权请求与写错误信息时用到，
+// 这两条路径都不是每包都走的。
+func (k flowKey) srcString() string { return net.IP(k.src[:]).String() }
+func (k flowKey) dstString() string { return net.IP(k.dst[:]).String() }
+
 func (k flowKey) String() string {
-	return fmt.Sprintf("%d:%d:%s:%d-%s:%d", k.atype, k.proto, k.src, k.sport, k.dst, k.dport)
+	return fmt.Sprintf("%d:%d:%s:%d-%s:%d", k.atype, k.proto, k.srcString(), k.sport, k.dstString(), k.dport)
 }
 
 // packetInfo 是从 IP 包里取出来的信息。
@@ -84,9 +93,10 @@ func parsePacket(pkt []byte) (packetInfo, error) {
 
 	info.key = flowKey{
 		atype: 4, proto: info.proto,
-		src: info.srcIP.String(), sport: info.srcPort,
-		dst: info.dstIP.String(), dport: info.dstPort,
+		sport: info.srcPort, dport: info.dstPort,
 	}
+	copy(info.key.src[:], pkt[12:16])
+	copy(info.key.dst[:], pkt[16:20])
 	return info, nil
 }
 

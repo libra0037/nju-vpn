@@ -500,15 +500,15 @@ func (t *tunnelConn) buildAuthRequest(f *flow) ([]byte, error) {
 	req := authRequestJSON{
 		Sid:           t.sid,
 		AppID:         f.appID,
-		URL:           fmt.Sprintf("%s:%s:%d", protoName(f.key.proto), f.key.dst, f.key.dport),
+		URL:           fmt.Sprintf("%s:%s:%d", protoName(f.key.proto), f.key.dstString(), f.key.dport),
 		DeviceID:      t.deviceID,
 		ConnectionID:  t.connectionID,
 		ConntrackHash: f.authID,
 		Lang:          "en-US",
 		IP: authIPJSON{
 			Atype: 0x0800, Protocol: ipProto,
-			DestAddr: f.key.dst, DestPort: int(f.key.dport),
-			SrcAddr: f.key.src, SrcPort: int(f.key.sport),
+			DestAddr: f.key.dstString(), DestPort: int(f.key.dport),
+			SrcAddr: f.key.srcString(), SrcPort: int(f.key.sport),
 		},
 		ProcHash: fmt.Sprintf("%X", sum),
 	}

@@ -217,8 +217,11 @@ func parsePortRange(spec string) (uint16, uint16, bool) {
 	return uint16(v), uint16(v), true
 }
 
-// match 找出目标命中的资源。只在新建一条流的时候调用一次，
-// 结果随流缓存，所以这里用线性扫描就够了——条目只有几百条。
+// match 找出目标命中的资源。
+//
+// 注意它是每条上行包都调用一次的（缓存下来的是鉴权状态，不是匹配结果），
+// 所以这里只做零分配的线性扫描：条目通常几百条。条目涨到千级、上行延迟
+// 可测时再谈索引——那之前做索引属于"没有测量的优化"。
 func (t *resourceTable) match(dst net.IP, proto string, port uint16) (appID, groupID string, ok bool) {
 	v, ok4 := ip4ToUint32(dst)
 	if !ok4 {

@@ -208,8 +208,8 @@ func TestParsePacketExtractsFiveTuple(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.key.src != "10.0.0.1" || info.key.dst != "10.1.2.3" {
-		t.Errorf("五元组地址 = %s -> %s", info.key.src, info.key.dst)
+	if src, dst := info.key.srcString(), info.key.dstString(); src != "10.0.0.1" || dst != "10.1.2.3" {
+		t.Errorf("五元组地址 = %s -> %s", src, dst)
 	}
 	if info.key.sport != 1234 || info.key.dport != 443 {
 		t.Errorf("五元组端口 = %d -> %d", info.key.sport, info.key.dport)
@@ -416,5 +416,35 @@ func TestResourceTableDropsMalformedNodes(t *testing.T) {
 	nodes := table.candidateNodes("g")
 	if len(nodes) != 2 || nodes[0] != "node-a:441" || nodes[1] != "node-c:441" {
 		t.Fatalf("候选节点 = %v，期望 [node-a:441 node-c:441]", nodes)
+	}
+}
+
+// TestParsePacketAllocations 钉住上行热路径的分配预算：每包解析不分配。
+//
+// 键原来用 net.IP.String() 拼字符串，实测 2.00 次分配/包；换成 4 字节数组之后
+// 这条路径不再分配任何东西。反向验证：把 parsePacket 改回字符串键，本用例红。
+func TestParsePacketAllocations(t *testing.T) {
+	pkt := ipv4TCP("10.0.0.1", "10.1.2.3", 1234, 443, []byte("payload"))
+	info, err := parsePacket(pkt)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	allocs := testing.AllocsPerRun(200, func() {
+		if _, err := parsePacket(pkt); err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("parsePacket 每包 %v 次分配，期望 0", allocs)
+	}
+
+	// 键是值类型：查流表（命中已有条目）同样不该分配。
+	flows := newFlowTable()
+	flows.sendState(info.key, "app", "group")
+	if allocs := testing.AllocsPerRun(200, func() {
+		flows.sendState(info.key, "app", "group")
+	}); allocs != 0 {
+		t.Errorf("流表查询每包 %v 次分配，期望 0", allocs)
 	}
 }
