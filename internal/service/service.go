@@ -738,7 +738,9 @@ func (s *Service) authTimeout(seq uint64) error {
 func (s *Service) stop() error {
 	// 标记到这里就完成了使命：这条 stop 之后到达的命令都是新意图。
 	s.stopPending.Store(false)
-	if s.status.Get().State == StateIdle && s.session == nil && s.pending == nil {
+	// idle 只由 runDeviceOp（自带登录的那次设备操作）与 teardown 落地，两者
+	// 走到那里时 session 与 pending 都已经清空，所以只看状态就够。
+	if s.status.Get().State == StateIdle {
 		return ErrNotRunning
 	}
 	s.teardown("隧道已断开")
@@ -842,14 +844,6 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 		log.Printf("忽略过期隧道协程的退出（第 %d 代，当前第 %d 代）: %v", gen, s.gen, err)
 		return nil
 	}
-	// 防御分支：按代次判定之后，能走到这里的状态本来就是 up（把状态改成
-	// 非 up 的路径都先经过 teardown，而 teardown 会推进代次）。留着它是
-	// 为了"状态与代次哪天不再同步"时留一条可见的线索。
-	if s.status.Get().State != StateUp {
-		log.Printf("隧道协程已退出（当前状态 %s）: %v", s.status.Get().State, err)
-		return nil
-	}
-
 	log.Printf("隧道断开: %v", err)
 	s.teardown("")
 	detail := "隧道已断开"
