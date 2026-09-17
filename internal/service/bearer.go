@@ -19,13 +19,6 @@ type bearer struct {
 	dev      *wireguard.Device
 	peerKey  wireguard.Key
 	peerAddr net.IP
-
-	// installedKey / installedAddr 记录设备上现在装的是哪一对。两者都没变
-	// 时 applyPeer 什么都不做：上游对 replace_peers 的语义是“清掉全部 peer
-	// 再装”，重建会作废客户端已经握好的会话密钥（它拿旧密钥发的包我们解不开，
-	// 要等它自己的密钥对到期才重新握手），表现是隧道 up 却长时间不通。
-	installedKey  wireguard.Key
-	installedAddr net.IP
 }
 
 func newBearer(cfg *config.Config) (*bearer, error) {
@@ -90,28 +83,22 @@ func (b *bearer) detach() {
 	if err := b.dev.ClearPeer(); err != nil {
 		log.Printf("摘除 WireGuard peer 时出错: %v", err)
 	}
-	b.installedKey = wireguard.Key{}
-	b.installedAddr = nil
 	b.dev.ClearSession()
 }
 
 // applyPeer 把接入方公钥装到设备上。
 //
 // 没配置 peer 公钥时什么都不做：设备照常监听，只是没人能接入。
+//
+// 挂载是无条件的：设备上现在是哪一对不留本地镜像——生产路径上 attach 之前
+// 必有 detach（它先摘 peer 再摘会话），"装的是哪一对"没有第二处真值可记。
 func (b *bearer) applyPeer() error {
 	if b.peerKey.IsZero() {
-		return nil
-	}
-	// 默认按“公钥不变”处理：设备上已经是这一对就一个字节都不下发，客户端
-	// 那边的密钥对、端点与下行闸门都原样保留。
-	if !b.installedKey.IsZero() && b.installedKey == b.peerKey && b.installedAddr.Equal(b.peerAddr) {
 		return nil
 	}
 	if err := b.dev.SetPeer(b.peerKey, b.peerAddr); err != nil {
 		return fmt.Errorf("配置接入公钥: %w", err)
 	}
-	b.installedKey = b.peerKey
-	b.installedAddr = append(net.IP(nil), b.peerAddr...)
 	return nil
 }
 

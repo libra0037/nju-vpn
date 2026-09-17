@@ -451,14 +451,12 @@ func TestConnectFailureStillLogsOut(t *testing.T) {
 	}
 }
 
-// TestAttachKeepsExistingPeer 验证公钥与地址都没变时不重装 peer。
+// TestAttachInstallsPeerEveryTime 验证挂载是无条件的。
 //
-// 重装（replace_peers）会清掉客户端已经握好的会话密钥：它拿旧密钥发的包我们
-// 解不开，要等自己的密钥对到期才重新握手，表现是隧道 up 却长时间不通。
-//
-// 判据是设备上的重装计数：公钥与地址都没变时它不该增长，真的换了
-// 公钥则必须增长（否则客户端接不进来）。
-func TestAttachKeepsExistingPeer(t *testing.T) {
+// 设备上现在是哪一对 peer 不留本地镜像：生产路径上 attach 之前必有 detach
+// （它先摘 peer 再摘会话），所以"公钥没变就跳过"这条早退在生产里永远不成立。
+// 判据是设备上的重装计数：每次挂载都该让它增长。
+func TestAttachInstallsPeerEveryTime(t *testing.T) {
 	srv := newFakeServer(t, ztnatest.Options{})
 	cfg := newTestConfig(t, srv)
 	// 配了 peer 公钥才会走到“装 peer”这一步。
@@ -486,12 +484,12 @@ func TestAttachKeepsExistingPeer(t *testing.T) {
 		t.Fatalf("第一次挂载应当装一次 peer，累计 %d 次", got)
 	}
 
-	// 公钥与地址都没变：不该再动设备。
+	// 同一会话再挂一次：没有镜像可对，仍然是一次真实下发。
 	if err := svc.br.attach(sess); err != nil {
 		t.Fatalf("重复挂载: %v", err)
 	}
-	if got := svc.br.dev.PeerInstalls(); got != 1 {
-		t.Fatalf("公钥与地址都没变却重装了 peer（累计 %d 次）——重装会作废客户端已经握好的会话密钥", got)
+	if got := svc.br.dev.PeerInstalls(); got != 2 {
+		t.Fatalf("重复挂载应当再装一次 peer，累计 %d 次", got)
 	}
 
 	// 真的换了公钥仍然要重装，否则客户端接不进来。
@@ -503,7 +501,7 @@ func TestAttachKeepsExistingPeer(t *testing.T) {
 	if err := svc.br.attach(sess); err != nil {
 		t.Fatalf("换公钥后挂载: %v", err)
 	}
-	if got := svc.br.dev.PeerInstalls(); got != 2 {
+	if got := svc.br.dev.PeerInstalls(); got != 3 {
 		t.Fatalf("换了公钥应当重装 peer，累计 %d 次", got)
 	}
 }
