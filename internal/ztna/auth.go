@@ -46,14 +46,13 @@ func encryptPassword(pub *rsa.PublicKey, plain string) (string, error) {
 // NewDeviceID 生成一个设备标识，供服务进程首次启动时持久化。
 //
 // 它必须跨启动稳定：服务端用它认出"还是那台设备"，授信终端就绑在它身上。
-func NewDeviceID() string { return randomDeviceID() }
-
-// randomDeviceID 生成一个设备标识。它由客户端生成并持久化：
-// 服务端用它把这次登录认出"还是那台设备"，授信终端就绑在它身上。
-func randomDeviceID() string {
+//
+// 熵源读不出来时报错，不退回固定值：一个写死的标识会让踩到同一分支的机器
+// 共用同一个设备身份（授信终端跟着串号），而日志里看不出任何征兆。
+func NewDeviceID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%032x", 0)
+		return "", fmt.Errorf("生成设备标识: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }

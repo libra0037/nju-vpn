@@ -41,7 +41,9 @@ func cmdRun(args []string) error {
 		log.Printf("出站路径: %s", config.RedactProxy(cfg.Proxy))
 	}
 
-	ensureIdentity(cfg)
+	if err := ensureIdentity(cfg); err != nil {
+		return err
+	}
 	logWireGuardPublicKey(cfg)
 
 	// 承载设备在这里就建起来：端口被占、密钥写错这类问题必须在启动时报
@@ -65,10 +67,14 @@ func cmdRun(args []string) error {
 // 换一个就得重新做一次二次验证；私钥换一个，所有客户端配置都会失效。
 //
 // 写回失败只记警告：配置可能是只读的，那种情况下进程仍然能跑，只是下次
-// 启动会换一个标识——用户需要知道这一点。
-func ensureIdentity(cfg *config.Config) {
+// 启动会换一个标识——用户需要知道这一点。设备标识生成不出来则是另一回事：
+// 那会与别的机器撞成同一台设备，必须让启动失败。
+func ensureIdentity(cfg *config.Config) error {
 	if cfg.DeviceID == "" {
-		id := ztna.NewDeviceID()
+		id, err := ztna.NewDeviceID()
+		if err != nil {
+			return err
+		}
 		cfg.DeviceID = id
 		if err := config.PersistDeviceID(cfg.SourcePath(), id); err != nil {
 			log.Printf("警告: 设备标识已生成但无法写回配置（%v）；下次启动会换一个，授信终端会跟着失效", err)
@@ -80,7 +86,7 @@ func ensureIdentity(cfg *config.Config) {
 		key, err := wireguard.GenerateKey()
 		if err != nil {
 			log.Printf("警告: 生成 WireGuard 私钥失败: %v", err)
-			return
+			return nil
 		}
 		cfg.WireGuard.PrivateKey = key.String()
 		if err := config.PersistPrivateKey(cfg.SourcePath(), key.String()); err != nil {
@@ -89,6 +95,7 @@ func ensureIdentity(cfg *config.Config) {
 			log.Printf("已生成 WireGuard 私钥并写回 %s", cfg.SourcePath())
 		}
 	}
+	return nil
 }
 
 // logWireGuardPublicKey 打印服务端公钥，用户需要把它填进客户端配置。
