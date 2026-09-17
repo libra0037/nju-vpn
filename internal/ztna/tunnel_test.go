@@ -158,3 +158,27 @@ func TestReadHandshakeRejectsEndlessFrames(t *testing.T) {
 		t.Fatalf("错误应当是帧数超限，得到 %v", err)
 	}
 }
+
+// TestAppendStreamCapsBuffer 验证下行累计缓冲有上限。
+//
+// 对端每帧都"比声明的少一字节"时，切剩的半包会一直攒下去：心跳判死之前有
+// 45 秒窗口，期间内存单向增长。判据是超过上限即报协议错误，而不是继续攒。
+func TestAppendStreamCapsBuffer(t *testing.T) {
+	stream, err := appendStream(nil, make([]byte, maxStreamBytes-1))
+	if err != nil {
+		t.Fatalf("上限之内的累计不该报错: %v", err)
+	}
+	_, err = appendStream(stream, make([]byte, 2))
+	if err == nil {
+		t.Fatal("超过上限应当报协议错误")
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) {
+		t.Fatalf("应当是协议错误，得到 %T: %v", err, err)
+	}
+
+	// 正常的一帧（声明长度与实际一致）不该被上限误伤。
+	if _, err := appendStream(nil, make([]byte, 1500)); err != nil {
+		t.Fatalf("正常帧不该报错: %v", err)
+	}
+}

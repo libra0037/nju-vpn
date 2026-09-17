@@ -37,6 +37,13 @@ const (
 	// 而杀进程会跳过登出、把服务端的名额留着。10 秒比首包往返宽松得多，不会
 	// 误伤慢链路。
 	defaultHandshakeTimeout = 10 * time.Second
+
+	// maxStreamBytes 是下行累计缓冲的上限。
+	//
+	// 单帧包长上限是 65535，而按声明长度切包时切剩的半个包要等下一帧补齐：
+	// 对端只要每帧都"比声明的少一字节"，这个缓冲就会一直长下去（心跳判死前
+	// 有 45 秒窗口，速率受 TCP 发送窗口限制）。给个上限，超过即按协议错误断开。
+	maxStreamBytes = 4 * 0xFFFF
 )
 
 // tunnelConn 是一条 L3 隧道连接：TLS 之上跑本协议的帧。
@@ -277,7 +284,11 @@ func (t *tunnelConn) readLoop() {
 		t.heartbeatGap.Store(0)
 		switch fr.cmd {
 		case cmdDataResp:
-			stream = append(stream, fr.payload...)
+			stream, err = appendStream(stream, fr.payload)
+			if err != nil {
+				t.close(err)
+				return
+			}
 			pkts, rest, err := splitPackets(stream)
 			if err != nil {
 				t.close(err)
@@ -293,6 +304,15 @@ func (t *tunnelConn) readLoop() {
 			t.handleVIPUpdate(fr.status, fr.payload)
 		}
 	}
+}
+
+// appendStream 把一帧的载荷接进下行累计缓冲，超过上限即报协议错误。
+func appendStream(stream, payload []byte) ([]byte, error) {
+	stream = append(stream, payload...)
+	if len(stream) > maxStreamBytes {
+		return nil, &ProtocolError{What: "下行累计缓冲超过上限", Got: fmt.Sprintf("%d 字节", len(stream))}
+	}
+	return stream, nil
 }
 
 // handleAuthResp 记录令牌并把该流缓存的包补发出去。
