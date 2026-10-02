@@ -47,14 +47,21 @@ type RelayOptions struct {
 // 不同，Mapper 就得跟着换一份。整个结构体原子替换，两个方向都不会看到
 // "上行已换新、下行还指着旧会话"这种中间状态。
 type relaySession struct {
-	ep     *l3.Endpoint
-	mapper *Mapper
+	ep         *l3.Endpoint
+	mapper     *Mapper
+	unregister func()
+}
+
+type queuedPacket struct {
+	owner *relaySession
+	data  []byte
 }
 
 // Relay 实现 tun.Device，把 WireGuard 和校园网隧道对接起来。
 type Relay struct {
-	mtu   int
-	queue chan []byte
+	mtu    int
+	queue  chan queuedPacket
+	bindMu sync.Mutex
 
 	// session 为 nil 表示当前没有校园网会话：对端发来的包直接丢弃。
 	session atomic.Pointer[relaySession]
@@ -96,7 +103,7 @@ type Relay struct {
 func NewRelay(opts RelayOptions) *Relay {
 	r := &Relay{
 		mtu:      opts.MTU,
-		queue:    make(chan []byte, queueSize),
+		queue:    make(chan queuedPacket, queueSize),
 		events:   make(chan tun.Event, 8),
 		closed:   make(chan struct{}),
 		holdWake: make(chan struct{}, 1),
@@ -118,9 +125,21 @@ func NewRelay(opts RelayOptions) *Relay {
 // 缓冲因此不存在——它防的是永远不会到达的半包，而且让"读者要记得它还留着
 // 半截字节"变成一个跨会话的状态。
 func (r *Relay) InstallSession(ep *l3.Endpoint, mapper *Mapper) {
+	r.bindMu.Lock()
+	defer r.bindMu.Unlock()
+	if old := r.session.Swap(nil); old != nil {
+		old.unregister()
+	}
 	r.dropStaleQueue()
-	r.session.Store(&relaySession{ep: ep, mapper: mapper})
-	ep.SetDownlink(r.deliver)
+	sess := &relaySession{ep: ep, mapper: mapper}
+	sess.unregister = ep.SetDownlink(func(pkt []byte) { r.deliverFrom(sess, pkt) })
+	select {
+	case <-r.closed:
+		sess.unregister()
+		return
+	default:
+	}
+	r.session.Store(sess)
 }
 
 // HoldDownlink 开关下行方向的等待：hold 为真表示设备里配好了 peer、对端
@@ -140,10 +159,12 @@ func (r *Relay) HoldDownlink(hold bool) {
 
 // ClearSession 摘掉当前会话。设备继续监听，但不再有任何包进出隧道。
 func (r *Relay) ClearSession() {
-	r.dropStaleQueue()
+	r.bindMu.Lock()
+	defer r.bindMu.Unlock()
 	if old := r.session.Swap(nil); old != nil {
-		old.ep.ClearDownlink()
+		old.unregister()
 	}
+	r.dropStaleQueue()
 }
 
 // dropStaleQueue 丢掉队列里属于上一个会话的下行包。
@@ -170,21 +191,20 @@ func (r *Relay) dropStaleQueue() {
 //
 // 调用方（隧道读循环）复用读缓冲，切出来的包是同一块内存的视图，所以入队
 // 前必须拷贝。
-func (r *Relay) deliver(pkt []byte) {
+func (r *Relay) deliverFrom(sess *relaySession, pkt []byte) {
 	select {
 	case <-r.closed:
 		return
 	default:
 	}
-	sess := r.session.Load()
-	if sess == nil {
+	if sess != r.session.Load() {
 		// 会话刚被摘掉，这是最后一瞬间漂进来的包。
 		r.countDrop(dropDownlinkNoSession)
 		return
 	}
 
 	total, err := ipv4TotalLength(pkt)
-	if err != nil || total != len(pkt) {
+	if err != nil || total != len(pkt) || total > r.mtu {
 		r.countDrop(dropDownlinkInvalid)
 		return
 	}
@@ -198,12 +218,22 @@ func (r *Relay) deliver(pkt []byte) {
 		}
 		out = rewritten
 	}
-	select {
-	case r.queue <- out:
-	case <-r.closed:
+	// 映射可与解绑交错；检查与入队在同一交接锁内，不能在排空后再入旧包。
+	r.bindMu.Lock()
+	if sess != r.session.Load() {
+		r.bindMu.Unlock()
+		r.countDrop(dropStaleQueue)
 		return
+	}
+	full := false
+	select {
+	case r.queue <- queuedPacket{owner: sess, data: out}:
+	case <-r.closed:
 	default:
-		// 队列满，丢弃。隧道里的 TCP 会重传，UDP 本来就允许丢。
+		full = true
+	}
+	r.bindMu.Unlock()
+	if full {
 		r.countDrop(dropDownlinkFull)
 	}
 }
@@ -279,10 +309,6 @@ var dropQuietInterval = [dropReasonCount]time.Duration{
 type dropCounter struct {
 	n       atomic.Uint64
 	lastLog atomic.Int64
-	// lastDetail 是上次打出来的整句文案（含具体原因）。原因变了就立刻打
-	// 一条：同一种丢包可能由多个调用点触发（目标不在资源表内、该流鉴权
-	// 失败……），限速窗口内共用第一句话等于把排查往回推给"猜"。
-	lastDetail atomic.Pointer[string]
 }
 
 // countDrop 记录一次丢包，并按原因限速打日志。
@@ -300,16 +326,8 @@ func (r *Relay) countDropDetail(reason dropReason, detail error) {
 	c := &r.drops[reason]
 	n := c.n.Add(1)
 	text := dropReasonText[reason]
-	if detail != nil {
-		text += ": " + detail.Error()
-	}
+	// 外部错误可能含地址或令牌；日志只记录有限的本地原因类别。
 	report := func() { log.Printf("wireguard: 丢弃 %s（累计 %d 个）", text, n) }
-	// 第一次出现、或原因文案变了：立刻打一条，不等限速窗口。
-	if old := c.lastDetail.Swap(&text); old == nil || *old != text {
-		c.lastLog.Store(time.Now().UnixNano())
-		report()
-		return
-	}
 	interval := dropLogInterval
 	if quiet := dropQuietInterval[reason]; quiet > 0 {
 		interval = quiet
@@ -339,7 +357,12 @@ func (r *Relay) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 
 	for {
 		select {
-		case pkt := <-r.queue:
+		case item := <-r.queue:
+			if item.owner != r.session.Load() {
+				r.countDrop(dropStaleQueue)
+				continue
+			}
+			pkt := item.data
 			if r.hold.Load() && !r.peerSeen.Load() {
 				// 配了 peer、对端还没露面：设备不知道它在哪儿，交上去也发不
 				// 出去，只会换来一行 "no known endpoint for peer"。
@@ -386,11 +409,15 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 
 	n := 0
 	for _, buf := range bufs {
+		if offset < 0 || offset > len(buf) {
+			r.countDrop(dropUplinkNotIPv4)
+			continue
+		}
 		pkt := buf[offset:]
 		if len(pkt) == 0 {
 			continue
 		}
-		if _, err := parseIPv4(pkt); err != nil {
+		if _, err := parseIPv4(pkt); err != nil || len(pkt) > r.mtu {
 			// WireGuard 解出来的应该是 IPv4 包，其它一律丢弃。
 			r.countDrop(dropUplinkNotIPv4)
 			continue
@@ -434,9 +461,9 @@ func (r *Relay) BatchSize() int { return 1 }
 // Close 停止设备并关闭事件通道。可安全重复调用。
 func (r *Relay) Close() error {
 	r.closeOnce.Do(func() {
+		close(r.closed)
 		// 先摘会话：之后隧道侧不会再往这个设备里投包。
 		r.ClearSession()
-		close(r.closed)
 		r.events <- tun.EventDown
 		close(r.events)
 	})

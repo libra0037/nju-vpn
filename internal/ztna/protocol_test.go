@@ -15,7 +15,10 @@ import (
 // 的线上契约：改一处常量就该有一处用例跟着变红。
 
 func TestHandshakeRequestBytes(t *testing.T) {
-	got := handshakeRequest("abc")
+	got, err := handshakeRequest("abc")
+	if err != nil {
+		t.Fatal(err)
+	}
 	payload := []byte(`{"sid":"abc"}`)
 	want := []byte{0x05, 0x01, 0xD0, 0x53, 0x00, 0x00, byte(len(payload))}
 	want = append(want, payload...)
@@ -26,8 +29,11 @@ func TestHandshakeRequestBytes(t *testing.T) {
 }
 
 func TestHandshakeRequestLengthTracksPayload(t *testing.T) {
-	short := handshakeRequest("a")
-	long := handshakeRequest(strings.Repeat("x", 300))
+	short, err := handshakeRequest("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	long, _ := handshakeRequest(strings.Repeat("x", 300))
 	if short[5] != 0 || short[6] != 11 {
 		t.Errorf("短 sid 的长度字段 = %d,%d，期望 0,9", short[5], short[6])
 	}
@@ -68,7 +74,7 @@ func TestHandshakeRejectsEnvelopeErrorCode(t *testing.T) {
 	if err == nil {
 		t.Fatal("code 非 0 的握手响应应被拒绝")
 	}
-	if !strings.Contains(err.Error(), "already online") {
+	if !strings.Contains(err.Error(), "75500006") || strings.Contains(err.Error(), "already online") {
 		t.Errorf("错误信息里应带上服务端说明，得到 %v", err)
 	}
 }
@@ -441,9 +447,11 @@ func TestParsePacketAllocations(t *testing.T) {
 
 	// 键是值类型：查流表（命中已有条目）同样不该分配。
 	flows := newFlowTable()
-	flows.sendState(info.key, "app", "group")
+	flows.queuePacket(info, "app", pkt)
+	auth := flows.pendingAuth(1)
+	flows.completeAuth(auth[0].authID, "tok", nil)
 	if allocs := testing.AllocsPerRun(200, func() {
-		flows.sendState(info.key, "app", "group")
+		flows.queuePacket(info, "app", pkt)
 	}); allocs != 0 {
 		t.Errorf("流表查询每包 %v 次分配，期望 0", allocs)
 	}

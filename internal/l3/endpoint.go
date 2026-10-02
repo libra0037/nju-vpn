@@ -13,12 +13,16 @@ import (
 // ErrNoUplink 表示上行通道尚未建立。
 var ErrNoUplink = errors.New("隧道上行通道尚未建立")
 
-// binding 是一次会话注册在端点上的两个回调，整体被原子替换：
-// 改方向时不会出现"上行换了新会话、下行还指着旧的"这种中间状态，
-// 读写双方也不需要任何锁。
+// MaxPacketBytes 是两层隧道交接的内层 IP 包上限。
+const MaxPacketBytes = 1400
+
+// 每次注册有独立身份；注销只能移除自己注册的回调。
+type uplinkBinding struct{ call func([]byte) error }
+type downlinkBinding struct{ call func([]byte) }
+
 type binding struct {
-	uplink   func([]byte) error
-	downlink func([]byte)
+	uplink   *uplinkBinding
+	downlink *downlinkBinding
 }
 
 // Endpoint 是隧道与承载之间的桥。
@@ -91,23 +95,29 @@ func (ep *Endpoint) update(change func(*binding)) {
 }
 
 // SetUplink 注册上行回调：把来自承载侧的裸 IP 包写进隧道。
-func (ep *Endpoint) SetUplink(f func([]byte) error) {
-	ep.update(func(b *binding) { b.uplink = f })
-}
-
-// ClearUplink 注销上行回调，立即返回，不等正在进行的写入结束。
-func (ep *Endpoint) ClearUplink() {
-	ep.update(func(b *binding) { b.uplink = nil })
+func (ep *Endpoint) SetUplink(f func([]byte) error) func() {
+	owner := &uplinkBinding{call: f}
+	ep.update(func(b *binding) { b.uplink = owner })
+	return func() {
+		ep.update(func(b *binding) {
+			if b.uplink == owner {
+				b.uplink = nil
+			}
+		})
+	}
 }
 
 // SetDownlink 注册下行回调：把隧道收到的裸 IP 包交给承载侧。
-func (ep *Endpoint) SetDownlink(f func([]byte)) {
-	ep.update(func(b *binding) { b.downlink = f })
-}
-
-// ClearDownlink 注销下行回调。
-func (ep *Endpoint) ClearDownlink() {
-	ep.update(func(b *binding) { b.downlink = nil })
+func (ep *Endpoint) SetDownlink(f func([]byte)) func() {
+	owner := &downlinkBinding{call: f}
+	ep.update(func(b *binding) { b.downlink = owner })
+	return func() {
+		ep.update(func(b *binding) {
+			if b.downlink == owner {
+				b.downlink = nil
+			}
+		})
+	}
 }
 
 // Send 把上行的裸 IP 包交给隧道。不在锁里调用回调，理由见类型注释。
@@ -116,7 +126,7 @@ func (ep *Endpoint) Send(buf []byte) error {
 	if b == nil || b.uplink == nil {
 		return ErrNoUplink
 	}
-	return b.uplink(buf)
+	return b.uplink.call(buf)
 }
 
 // Deliver 把隧道下行的裸 IP 包交给承载侧。
@@ -125,5 +135,5 @@ func (ep *Endpoint) Deliver(buf []byte) {
 	if b == nil || b.downlink == nil {
 		return
 	}
-	b.downlink(buf)
+	b.downlink.call(buf)
 }

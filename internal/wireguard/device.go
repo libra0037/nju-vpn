@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/device"
@@ -52,13 +51,7 @@ type Device struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
-
-	// peerInstalls 统计 SetPeer 成功下发的次数。
-	//
-	// 每次重装都会清掉设备上的 peer（replace_peers），对端已经握好的会话
-	// 密钥随之作废，表现是隧道 up 却长时间不通。这个计数是排查时唯一能直接
-	// 看出“有没有发生重装”的证据，服务层据此判断要不要动设备。
-	peerInstalls atomic.Int64
+	watchDone chan struct{}
 }
 
 // NewDevice 创建并启动承载设备。
@@ -70,10 +63,12 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 	if opts.ListenPort < 0 || opts.ListenPort > 65535 {
 		return nil, fmt.Errorf("监听端口超出范围: %d", opts.ListenPort)
 	}
-	// MTU 由调用方（配置）定下来：这里不再留一份 1320 的兜底默认值，
-	// 两份默认值改一边漏一边就是"帧大小按谁算"的静默分叉。
-	if opts.MTU <= 0 {
-		return nil, fmt.Errorf("缺少 MTU")
+	// 与校园网隧道交接同一裸 IP 包，不能减去另一层外部封装的长度。
+	if opts.MTU <= 0 || opts.MTU > l3.MaxPacketBytes {
+		return nil, fmt.Errorf("WireGuard MTU 须在 1-%d 之间", l3.MaxPacketBytes)
+	}
+	if opts.ListenHost != ListenLoopback && opts.ListenHost != ListenAll {
+		return nil, fmt.Errorf("非法 WireGuard 监听范围")
 	}
 
 	relay := NewRelay(RelayOptions{MTU: opts.MTU})
@@ -100,6 +95,7 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		listenPort: opts.ListenPort,
 		listenHost: opts.ListenHost,
 		closed:     make(chan struct{}),
+		watchDone:  make(chan struct{}),
 	}
 	go d.watchPeerHandshake()
 	return d, nil
@@ -154,17 +150,10 @@ func (d *Device) SetPeer(pub Key, addr net.IP) error {
 	if err := d.dev.IpcSet(conf); err != nil {
 		return fmt.Errorf("更新 peer: %w", err)
 	}
-	d.peerInstalls.Add(1)
 	// 换了 key 就等于重新开始：对端得重新握手，下行方向才再次放行。
 	d.relay.HoldDownlink(true)
 	return nil
 }
-
-// PeerInstalls 返回 peer 被成功下发（重装）的累计次数，供测试断言
-// "密钥没变就不再重装"（重装会作废对端已经握好的会话密钥）。
-//
-// 公钥没变时不该增长：每增长一次都意味着对端的会话密钥被作废。
-func (d *Device) PeerInstalls() int64 { return d.peerInstalls.Load() }
 
 // ClearPeer 摘掉接入方。
 //
@@ -255,6 +244,7 @@ func (d *Device) Close() error {
 		close(d.closed)
 		// device.Close 会顺带关闭 tun（也就是 Relay），不用再关一次。
 		d.dev.Close()
+		<-d.watchDone
 	})
 	return nil
 }
@@ -280,6 +270,7 @@ const handshakeSettleMax = 5 * time.Second
 // 这里读 UAPI 是安全的：早期版本在 Relay.Read（TUN 读取协程）里读，会和
 // wireguard-go 的状态机抢锁把设备锁死，所以探测必须跑在自己的协程里。
 func (d *Device) watchPeerHandshake() {
+	defer close(d.watchDone)
 	interval := handshakeSettleInterval
 	timer := time.NewTimer(interval)
 	defer timer.Stop()

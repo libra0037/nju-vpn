@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/config"
@@ -38,13 +40,7 @@ func serviceLogPath(configPath string) string {
 	if path == "" {
 		path = config.DefaultPath()
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		// 建不出目录时落到临时目录的绝对路径：相对路径会跟着命令行当时的
-		// 工作目录走，下次就找不到这份日志了（多实例还会互相覆盖）。
-		return filepath.Join(os.TempDir(), logFileName(path))
-	}
-	return filepath.Join(dir, logFileName(path))
+	return filepath.Join(filepath.Dir(path), logFileName(path))
 }
 
 // logFileName 给日志文件取名：njuvpn-<实例标识>-<配置名>.log。
@@ -97,6 +93,8 @@ func ensureService(configPath string) error {
 	}
 	if err := pingService(endpoint); err == nil {
 		return nil
+	} else if !errors.Is(err, ipc.ErrNotRunning) {
+		return err
 	}
 
 	logPath := serviceLogPath(configPath)
@@ -179,12 +177,13 @@ func spawnService(configPath, logPath string) (<-chan error, error) {
 		args = append(args, "-config", configPath)
 	}
 
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("打开服务进程日志 %s: %w", logPath, err)
 	}
 
 	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), daemonLogEnv+"="+logPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
@@ -267,7 +266,14 @@ func waitServiceGone(endpoint string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if err := pingService(endpoint); err != nil {
-			return nil
+			if errors.Is(err, ipc.ErrNotRunning) {
+				return nil
+			}
+			// shutdown 已获确认后，正在接入的连接可能被关闭。仍须再次确认
+			// 端点无人监听；重置连接本身不能证明旧进程已经退出。
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
+				return err
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

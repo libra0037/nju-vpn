@@ -40,7 +40,7 @@ func newBearer(cfg *config.Config) (*bearer, error) {
 	// 只承载 IPv4：地址映射与 allowed_ip 都按 /32 写。
 	peerAddr := net.ParseIP(cfg.WireGuard.PeerAddress)
 	if peerAddr == nil || peerAddr.To4() == nil {
-		return nil, fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址: %q", cfg.WireGuard.PeerAddress)
+		return nil, fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址")
 	}
 
 	dev, err := wireguard.NewDevice(wireguard.DeviceOptions{
@@ -77,13 +77,12 @@ func (b *bearer) attach(sess *ztna.Session) error {
 
 // detach 摘掉当前会话。
 //
-// 先摘 peer 再摘会话：设备还在监听，留着 peer 会让对端握手成功，而它的
-// 包其实已经没有隧道可走——从对端看是"连上了但什么都打不开"。
+// 调用方先关闭校园网隧道、打断上行写入；这里撤销绑定后再摘 peer。
 func (b *bearer) detach() {
+	b.dev.ClearSession()
 	if err := b.dev.ClearPeer(); err != nil {
 		log.Printf("摘除 WireGuard peer 时出错: %v", err)
 	}
-	b.dev.ClearSession()
 }
 
 // applyPeer 把接入方公钥装到设备上。
@@ -91,7 +90,7 @@ func (b *bearer) detach() {
 // 没配置 peer 公钥时什么都不做：设备照常监听，只是没人能接入。
 //
 // 挂载是无条件的：设备上现在是哪一对不留本地镜像——生产路径上 attach 之前
-// 必有 detach（它先摘 peer 再摘会话），"装的是哪一对"没有第二处真值可记。
+// 必有 detach，"装的是哪一对"没有第二处真值可记。
 func (b *bearer) applyPeer() error {
 	if b.peerKey.IsZero() {
 		return nil
@@ -114,7 +113,7 @@ func (b *bearer) summary() string {
 	if b.peerKey.IsZero() {
 		return fmt.Sprintf("UDP %d（%s）已就绪；未配置 wireguard.peer_public_key，任何对端都无法接入", port, scope)
 	}
-	return fmt.Sprintf("UDP %d（%s）已就绪，peer 地址 %s", port, scope, b.peerAddr)
+	return fmt.Sprintf("UDP %d（%s）已就绪，接入公钥已配置", port, scope)
 }
 
 // close 停止设备。可安全重复调用。

@@ -7,6 +7,7 @@ package dial
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -17,15 +18,16 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
 const dialTimeout = 20 * time.Second
 
-// DialFunc 与 net.Dialer.Dial 的签名一致。
-type DialFunc func(network, address string) (net.Conn, error)
+// DialFunc 必须在 ctx 取消后结束，并关闭尚未交出的连接。
+type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 // New 返回一个拨号函数。proxy 为空时直连，否则经由代理。
 //
@@ -38,15 +40,15 @@ type DialFunc func(network, address string) (net.Conn, error)
 func New(proxy string) (DialFunc, error) {
 	if proxy == "" {
 		d := &net.Dialer{Timeout: dialTimeout}
-		return d.Dial, nil
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := d.DialContext(ctx, network, addr)
+			return c, Wrap("连接目标", err)
+		}, nil
 	}
 
 	u, err := url.Parse(proxy)
 	if err != nil {
-		// 错误串会一路走到日志与 status 里，而代理地址可能带着口令。
-		// 原始错误（*url.Error）里带着整串 URL，%w 出去就等于泄露；
-		// 这里只取底层原因，并再抹一道形如 user:pass@ 的片段。
-		return nil, fmt.Errorf("解析代理地址失败（写法示例：http://127.0.0.1:7897）: %s", proxyParseReason(err))
+		return nil, errors.New("解析代理地址失败（写法示例：http://127.0.0.1:7897）")
 	}
 
 	switch u.Scheme {
@@ -65,7 +67,7 @@ func New(proxy string) (DialFunc, error) {
 	case "":
 		return nil, fmt.Errorf("代理地址缺少协议前缀（例如 http://127.0.0.1:7897）")
 	default:
-		return nil, fmt.Errorf("不支持的代理协议 %q", u.Scheme)
+		return nil, errors.New("不支持的代理协议")
 	}
 }
 
@@ -85,24 +87,7 @@ func warnCleartextCredentials(u *url.URL) {
 		return
 	}
 	// 连用户名一起不打印：u.Redacted() 只抹口令，用户名同样不该落到日志里。
-	log.Printf("警告: 代理 %s 的凭据是明文发送的，只应对本机代理使用", u.Host)
-}
-
-// credentialLike 匹配 URL 里 user:pass@ 形式的凭据片段。
-var credentialLike = regexp.MustCompile(`[^/\s@:]+:[^/\s@]*@`)
-
-// proxyParseReason 把 url.Parse 的错误变成可以外发的文案。
-//
-// *url.Error 带着整串原始 URL，而代理地址可能是 user:pass@host；直接回显
-// 等于把口令写进日志、状态与命令行输出。这里只取底层原因，并再抹一道
-// 凭据样式的片段——底层错误在极端输入下也可能带上 URL 片段。
-func proxyParseReason(err error) string {
-	var uerr *url.Error
-	reason := err.Error()
-	if errors.As(err, &uerr) && uerr.Err != nil {
-		reason = uerr.Err.Error()
-	}
-	return credentialLike.ReplaceAllString(reason, "****:****@")
+	log.Print("警告: 代理凭据是明文发送的，只应对本机代理使用")
 }
 
 // ValidHostPort 判断 "host:port" 能不能安全地交给拨号与 CONNECT 请求行。
@@ -153,7 +138,8 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 		auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+pass))
 	}
 
-	return func(network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (result net.Conn, resultErr error) {
+		defer func() { resultErr = Wrap("HTTP 代理连接", resultErr) }()
 		if network != "tcp" && network != "tcp4" && network != "tcp6" {
 			return nil, fmt.Errorf("HTTP 代理只支持 tcp，收到 %q", network)
 		}
@@ -164,7 +150,7 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 			return nil, fmt.Errorf("目标地址不能用于 CONNECT: %q", address)
 		}
 
-		conn, err := dialProxy(host, useTLS)
+		conn, err := dialProxy(ctx, host, useTLS)
 		if err != nil {
 			return nil, err
 		}
@@ -173,6 +159,8 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 			conn.Close()
 			return nil, err
 		}
+		stop := watchContext(ctx, conn)
+		defer stop()
 
 		req := "CONNECT " + address + " HTTP/1.1\r\nHost: " + address + "\r\n"
 		if auth != "" {
@@ -186,7 +174,23 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 		}
 
 		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+		var header []byte
+		for len(header) < 16<<10 {
+			line, err := br.ReadSlice('\n')
+			if err != nil {
+				conn.Close()
+				return nil, errors.New("代理响应头不完整或过长")
+			}
+			header = append(header, line...)
+			if string(line) == "\r\n" || string(line) == "\n" {
+				break
+			}
+		}
+		if len(header) >= 16<<10 {
+			conn.Close()
+			return nil, errors.New("代理响应头过长")
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(string(header))), &http.Request{Method: "CONNECT"})
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("读取代理响应: %w", err)
@@ -195,11 +199,16 @@ func httpProxyDialer(u *url.URL) (DialFunc, error) {
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			conn.Close()
-			return nil, fmt.Errorf("代理拒绝 CONNECT %s: %s", address, resp.Status)
+			return nil, fmt.Errorf("代理拒绝 CONNECT（HTTP %d）", resp.StatusCode)
 		}
 		// 成功时不再碰 resp：不合规的代理若在 200 里带 Content-Length，
 		// 关闭 body 会把隧道开头的字节一起吃掉，表现为握手时报"响应不符合协议"。
 
+		stop()
+		if err := ctx.Err(); err != nil {
+			conn.Close()
+			return nil, err
+		}
 		if err := conn.SetDeadline(time.Time{}); err != nil {
 			conn.Close()
 			return nil, err
@@ -216,15 +225,18 @@ func socks5ProxyDialer(u *url.URL) (DialFunc, error) {
 		host = net.JoinHostPort(u.Hostname(), "1080")
 	}
 
-	return func(network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (result net.Conn, resultErr error) {
+		defer func() { resultErr = Wrap("SOCKS5 代理连接", resultErr) }()
 		if network != "tcp" && network != "tcp4" && network != "tcp6" {
 			return nil, fmt.Errorf("SOCKS5 代理只支持 tcp，收到 %q", network)
 		}
 
-		conn, err := (&net.Dialer{Timeout: dialTimeout}).Dial("tcp", host)
+		conn, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", host)
 		if err != nil {
 			return nil, fmt.Errorf("连接代理 %s: %w", host, err)
 		}
+		stop := watchContext(ctx, conn)
+		defer stop()
 
 		if err := conn.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
 			conn.Close()
@@ -232,6 +244,11 @@ func socks5ProxyDialer(u *url.URL) (DialFunc, error) {
 		}
 
 		if err := socks5Handshake(conn, u, address); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		stop()
+		if err := ctx.Err(); err != nil {
 			conn.Close()
 			return nil, err
 		}
@@ -385,12 +402,12 @@ func socks5Status(code byte) string {
 }
 
 // dialProxy 建立到代理的连接。https 代理走 TLS，并校验证书。
-func dialProxy(host string, useTLS bool) (net.Conn, error) {
+func dialProxy(ctx context.Context, host string, useTLS bool) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	if !useTLS {
-		return dialer.Dial("tcp", host)
+		return dialer.DialContext(ctx, "tcp", host)
 	}
-	conn, err := tls.DialWithDialer(dialer, "tcp", host, &tls.Config{MinVersion: tls.VersionTLS12})
+	conn, err := (&tls.Dialer{NetDialer: dialer, Config: &tls.Config{MinVersion: tls.VersionTLS12}}).DialContext(ctx, "tcp", host)
 	if err != nil {
 		return nil, fmt.Errorf("建立到 https 代理的 TLS 连接 %s: %w", host, err)
 	}
@@ -401,6 +418,20 @@ func dialProxy(host string, useTLS bool) (net.Conn, error) {
 type bufferedConn struct {
 	net.Conn
 	r *bufio.Reader
+}
+
+func watchContext(ctx context.Context, conn net.Conn) func() {
+	stop, done := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	return func() { once.Do(func() { close(stop) }); <-done }
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) {

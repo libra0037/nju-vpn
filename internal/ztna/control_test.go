@@ -3,6 +3,7 @@ package ztna
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -46,8 +47,8 @@ func TestDecodeEnvelopeCodeClasses(t *testing.T) {
 			t.Errorf("code=%d 应报成被拒绝，得到 %v", c.code, err)
 			continue
 		}
-		if rejected.Code != c.code || rejected.Message != c.message {
-			t.Errorf("被拒绝的错误应原样带上 code 与 message，得到 %+v", rejected)
+		if rejected.Code != c.code || strings.Contains(rejected.Error(), c.message) {
+			t.Errorf("错误须保留 code 并隐藏服务端消息，得到 %+v", rejected)
 		}
 	}
 

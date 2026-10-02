@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // dialTimeout 是客户端连接服务进程的超时。
@@ -41,7 +40,8 @@ const (
 	CmdState = "state"
 	// CmdStatus 回报给人看的一行状态。带参数 check 时链路不在 up 就以
 	// 409 应答，给巡检脚本用。
-	CmdStatus = "status"
+	CmdStatus    = "status"
+	CmdResources = "resources"
 	// CmdStart 建立隧道：start <trust=0|1> [口令]。
 	CmdStart = "start"
 	// CmdAuth 提交二次验证码，继续上一次停下来的登录：auth <验证码>。
@@ -65,14 +65,21 @@ const (
 	CodeServerError  = 500
 )
 
-// MaxLineBytes 是单行请求或响应的长度上限。
+// MaxLineBytes 是请求与普通响应的单行长度上限。
 //
 // 没有上限时，一个只发不换行的连接就能让服务进程的内存无界增长：
 // bufio 的 ReadString 会一直扩容直到读到换行为止。
 const MaxLineBytes = 64 * 1024
 
-// ErrLineTooLong 表示收到的行超过 MaxLineBytes。
+// MaxResourcesResponseBytes 是完整资源响应（含状态码、分隔符、换行）的上限。
+// 资源表可接近控制面的 8 MiB 接收预算，不能受普通状态消息的 64 KiB 限制；
+// 服务进程须同时限制大响应的编码与发送并发，避免按连接数放大内存。
+const MaxResourcesResponseBytes = 8 * 1024 * 1024
+
+// ErrLineTooLong 表示收到的行超过对应请求或响应的上限。
 var ErrLineTooLong = errors.New("报文行超过长度上限")
+var ErrNotRunning = errors.New("服务进程未运行")
+var ErrUntrustedPeer = errors.New("本地 IPC 对端身份不可信")
 
 // Request 是一条解析后的请求。
 type Request struct {
@@ -82,8 +89,7 @@ type Request struct {
 
 // EncodeSecret 把口令之类不能在命令行与日志里露面的字段编成一行文本。
 //
-// 协议按空白切分参数，口令里可能有空格；base64 同时让口令原文不出现在
-// 任何报文转储里。
+// 协议按空白切分参数，口令里可能有空格；base64 仅用于编码，报文仍须保密。
 func EncodeSecret(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
 }
@@ -114,14 +120,16 @@ func ParseRequest(line string) (Request, error) {
 
 // FormatResponse 把响应编码成一行。
 func FormatResponse(r Response) string {
-	msg := sanitize(r.Message)
-	// 客户端会拒绝超长行，与其让对端收到一个与真实错误无关的提示
-	//（"报文行超过长度上限"），不如在这里截断并标出来。
-	const reserved = len("4294967295 ")
-	if max := MaxLineBytes - reserved; len(msg) > max {
-		msg = truncateUTF8(msg, max-len("…（已截断）")) + "…（已截断）"
+	return formatResponse(r, MaxLineBytes)
+}
+
+func formatResponse(r Response, limit int) string {
+	code := strconv.Itoa(r.Code)
+	// sanitize 只做等长替换；先拒绝超限消息，避免为了拒绝而分配整行。
+	if len(code)+len(r.Message)+2 > limit {
+		return fmt.Sprintf("%d 响应超过长度上限\n", CodeServerError)
 	}
-	return fmt.Sprintf("%d %s\n", r.Code, msg)
+	return code + " " + sanitize(r.Message) + "\n"
 }
 
 // ParseResponse 解析一行响应。
@@ -131,27 +139,16 @@ func ParseResponse(line string) (Response, error) {
 	// 再硬切第 5 列，"2000 x" 会被读成 code=200、msg="1 x"。
 	codeText, msg, ok := strings.Cut(line, " ")
 	if !ok {
-		return Response{}, fmt.Errorf("响应过短: %q", line)
+		return Response{}, errors.New("响应缺少状态码或分隔符")
 	}
 	if len(codeText) < 3 || len(codeText) > 4 {
-		return Response{}, fmt.Errorf("响应状态码位数不对: %q", line)
+		return Response{}, errors.New("响应状态码位数不对")
 	}
 	code, err := strconv.Atoi(codeText)
 	if err != nil {
-		return Response{}, fmt.Errorf("响应状态码非法: %q", line)
+		return Response{}, errors.New("响应状态码非法")
 	}
 	return Response{Code: code, Message: msg}, nil
-}
-
-// truncateUTF8 按字节上限截断，但不切断多字节字符。
-func truncateUTF8(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	for max > 0 && !utf8.RuneStart(s[max]) {
-		max--
-	}
-	return s[:max]
 }
 
 // sanitize 保证消息只占一行，避免破坏行协议。
@@ -162,11 +159,11 @@ func sanitize(s string) string {
 }
 
 // readLine 读一行，超过上限直接报错。
-func readLine(r *bufio.Reader) (string, error) {
+func readLine(r *bufio.Reader, limit int) (string, error) {
 	var sb strings.Builder
 	for {
 		chunk, err := r.ReadSlice('\n')
-		if sb.Len()+len(chunk) > MaxLineBytes {
+		if sb.Len()+len(chunk) > limit {
 			return "", ErrLineTooLong
 		}
 		sb.Write(chunk)
@@ -183,7 +180,7 @@ func readLine(r *bufio.Reader) (string, error) {
 
 // ReadRequest 从连接上读一条请求。
 func ReadRequest(r *bufio.Reader) (Request, error) {
-	line, err := readLine(r)
+	line, err := readLine(r, MaxLineBytes)
 	if err != nil {
 		return Request{}, err
 	}
@@ -198,17 +195,41 @@ func WriteResponse(w io.Writer, resp Response) error {
 
 // ReadResponse 从连接上读一条响应。
 func ReadResponse(r *bufio.Reader) (Response, error) {
-	line, err := readLine(r)
+	return readResponse(r, MaxLineBytes)
+}
+
+// ReadResourcesResponse 读取 resources 命令的响应；普通响应仍用 ReadResponse。
+func ReadResourcesResponse(r *bufio.Reader) (Response, error) {
+	return readResponse(r, MaxResourcesResponseBytes)
+}
+
+func readResponse(r *bufio.Reader, limit int) (Response, error) {
+	line, err := readLine(r, limit)
 	if err != nil {
 		return Response{}, err
 	}
 	return ParseResponse(line)
 }
 
+// WriteResourcesResponse 写出 resources 命令的完整响应，超限时整单失败。
+func WriteResourcesResponse(w io.Writer, resp Response) error {
+	_, err := io.WriteString(w, formatResponse(resp, MaxResourcesResponseBytes))
+	return err
+}
+
 // WriteRequest 向连接写一条请求。
 func WriteRequest(w io.Writer, req Request) error {
 	parts := append([]string{req.Command}, req.Args...)
-	_, err := io.WriteString(w, strings.Join(parts, " ")+"\n")
+	for _, part := range parts {
+		if part == "" || strings.IndexFunc(part, func(r rune) bool { return r <= ' ' || r == 127 }) >= 0 {
+			return errors.New("请求字段须为非空单行文本")
+		}
+	}
+	line := strings.Join(parts, " ") + "\n"
+	if len(line) > MaxLineBytes {
+		return ErrLineTooLong
+	}
+	_, err := io.WriteString(w, line)
 	return err
 }
 
@@ -230,7 +251,7 @@ func BoolArg(arg, name string) (bool, error) {
 	}
 	v, ok := strings.CutPrefix(arg, name+"=")
 	if !ok {
-		return false, fmt.Errorf("参数 %q 不是 %s=0/1", arg, name)
+		return false, fmt.Errorf("参数应为 %s=0/1", name)
 	}
 	switch v {
 	case "1":
@@ -238,6 +259,6 @@ func BoolArg(arg, name string) (bool, error) {
 	case "0":
 		return false, nil
 	default:
-		return false, fmt.Errorf("参数 %s 只能是 0 或 1，收到 %q", name, v)
+		return false, fmt.Errorf("参数 %s 只能是 0 或 1", name)
 	}
 }

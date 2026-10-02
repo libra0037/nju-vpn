@@ -1,117 +1,100 @@
 package ztna
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
-	"os"
-	"path/filepath"
-	"strings"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"errors"
+	"math/big"
+	"net"
 	"testing"
+	"time"
 )
 
-func derOf(s string) []byte { return []byte("DER:" + s) }
-
-func hashOf(s string) [sha256.Size]byte { return sha256.Sum256(derOf(s)) }
-
-func hexOf(s string) string {
-	sum := hashOf(s)
-	return hex.EncodeToString(sum[:])
-}
-
-// TestNodePinsAcceptsConfiguredFingerprint 验证配置里给的指纹直接放行。
-func TestNodePinsAcceptsConfiguredFingerprint(t *testing.T) {
-	pins := newNodePins([][sha256.Size]byte{hashOf("node-a")}, "", false, t.Logf)
-	if err := pins.verify("10.0.0.1:441", derOf("node-a")); err != nil {
-		t.Fatalf("配置里的指纹应当放行，得到 %v", err)
-	}
-}
-
-// TestNodePinsRemembersFirstUse 验证陌生节点按“首次记录、之后比对”处理：
-// 第一次接受并落盘，同一张证书再来仍然接受，换一张就报错并打印两边的指纹。
-func TestNodePinsRemembersFirstUse(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml.node-pins")
-	addr := "10.0.0.1:441"
-
-	first := newNodePins(nil, path, false, t.Logf)
-	if err := first.verify(addr, derOf("node-a")); err != nil {
-		t.Fatalf("第一次见到该节点应当接受（并记录），得到 %v", err)
-	}
-	if err := first.verify(addr, derOf("node-a")); err != nil {
-		t.Fatalf("同一张证书再来应当接受，得到 %v", err)
-	}
-
-	fi, err := os.Stat(path)
+func TestSPKIPinSurvivesCertificateRenewal(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("记录应当落盘: %v", err)
-	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Errorf("记录文件权限 = %04o，期望 0600", perm)
-	}
-
-	// 新进程（重新读状态文件）必须仍然认它。
-	second := newNodePins(nil, path, false, t.Logf)
-	if err := second.verify(addr, derOf("node-a")); err != nil {
-		t.Fatalf("记录应当跨进程生效，得到 %v", err)
-	}
-	err = second.verify(addr, derOf("node-b"))
-	if err == nil {
-		t.Fatal("换了一张证书应当拒绝")
-	}
-	msg := err.Error()
-	for _, want := range []string{addr, "pinned_node_sha256", strings.ToUpper(hexOf("node-a")), strings.ToUpper(hexOf("node-b"))} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("错误串应当包含 %q，得到: %s", want, msg)
-		}
-	}
-}
-
-// TestNodePinsStrictRejectsUnknown 验证用户在配置里写了指纹之后不再首次记录：
-// 陌生节点被拒绝，并把观测到的指纹打出来（那正是要填进配置的值）。
-func TestNodePinsStrictRejectsUnknown(t *testing.T) {
-	pins := newNodePins([][sha256.Size]byte{hashOf("other")}, "", true, t.Logf)
-	err := pins.verify("10.0.0.9:441", derOf("node-x"))
-	if err == nil {
-		t.Fatal("严格模式下陌生节点应当被拒绝")
-	}
-	if want := strings.ToUpper(hexOf("node-x")); !strings.Contains(err.Error(), want) {
-		t.Errorf("错误串应当带上观测到的指纹 %s，得到 %v", want, err)
-	}
-}
-
-// TestNodePinsRejectsMissingCertificate 验证对端不出示证书时直接拒绝。
-func TestNodePinsRejectsMissingCertificate(t *testing.T) {
-	pins := newNodePins(nil, "", false, t.Logf)
-	if err := pins.verify("10.0.0.1:441", nil); err == nil {
-		t.Fatal("没有证书应当拒绝")
-	}
-}
-
-// TestNodePinsSaveIgnoresPreplacedTempFile 验证写回不会被同目录里预置的临时
-// 文件牵着走。
-//
-// 旧实现用固定名 <path>.tmp 且不带 O_EXCL，别人预先放一个同名文件或符号链接
-// 就能让这次写落到他挑的目标上；这条用例把预置文件摆在那里，写回之后它必须
-// 一个字都没变。
-func TestNodePinsSaveIgnoresPreplacedTempFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml.node-pins")
-	squat := path + ".tmp"
-	const planted = "别人预置的内容\n"
-	if err := os.WriteFile(squat, []byte(planted), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	pins := newNodePins(nil, path, false, t.Logf)
-	if err := pins.verify("10.0.0.1:441", derOf("node-a")); err != nil {
-		t.Fatalf("首次记录应当接受: %v", err)
+	spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	got, err := os.ReadFile(squat)
-	if err != nil || string(got) != planted {
-		t.Fatalf("预置文件被改动了（内容 %q，错误 %v）——写回必须落在自己新建的文件上", got, err)
+	expected := sha256.Sum256(spki)
+	input := [][32]byte{expected}
+	verifier := newNodeSPKIPins(input)
+	input[0] = [32]byte{} // 配置输入发生变化不能改动已构造的信任快照。
+	for _, serial := range []int64{1, 2} {
+		start := time.Unix(1700000000, 0).AddDate(int(serial)-1, 0, 0)
+		tpl := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "sdp"}, NotBefore: start, NotAfter: start.AddDate(1, 0, 0)}
+		der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}, DidResume: true}
+		if err := verifier.verify(state); err != nil {
+			t.Fatal("同一公钥的续签证书被拒绝", err)
+		}
+		derPin := newNodeSPKIPins([][32]byte{sha256.Sum256(der)})
+		if !errors.Is(derPin.verify(state), ErrNodeUntrusted) {
+			t.Fatal("整张证书摘要不能充当 SPKI pin")
+		}
 	}
-	data, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(data), "10.0.0.1:441") {
-		t.Fatalf("指纹记录没有写进 %s: %v", path, err)
+	wrong := newNodeSPKIPins([][32]byte{{1}})
+	leaf := &x509.Certificate{RawSubjectPublicKeyInfo: spki}
+	if !errors.Is(wrong.verify(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}), ErrNodeUntrusted) {
+		t.Fatal("陌生公钥被接受")
+	}
+}
+
+func TestSPKIFixedSampleAndRevokedSnapshot(t *testing.T) {
+	const sample = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9Q=="
+	// 摘要由独立 Python hashlib 对上述固定字节计算，不由被测校验器推导。
+	const fingerprint = "XNJS+wzokyQ2+vjM0QQJgbie5K1rn+niorfnGqyyfNM="
+	spki, err := base64.StdEncoding.DecodeString(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := x509.ParsePKIXPublicKey(spki); err != nil {
+		t.Fatal("固定样例须为有效 DER SPKI", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pin [32]byte
+	copy(pin[:], decoded)
+	leaf := &x509.Certificate{RawSubjectPublicKeyInfo: spki}
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}, DidResume: true}
+	configured := newNodeSPKIPins([][32]byte{pin, {1}})
+	if err := configured.verify(state); err != nil {
+		t.Fatal("固定 SPKI 摘要对象错误", err)
+	}
+	revoked := newNodeSPKIPins([][32]byte{{1}})
+	if !errors.Is(revoked.verify(state), ErrNodeUntrusted) {
+		t.Fatal("新快照仍接受已撤销公钥")
+	}
+}
+
+func TestPinsCannotBeBypassed(t *testing.T) {
+	for _, p := range []*nodeSPKIPins{nil, newNodeSPKIPins(nil), newNodeSPKIPins([][32]byte{{1}})} {
+		if !errors.Is(p.verify(tls.ConnectionState{}), ErrNodeUntrusted) {
+			t.Fatal("无证书或无白名单仍通过")
+		}
+	}
+	calls := 0
+	_, err := dialTunnel(t.Context(), tunnelOptions{Dial: func(_ context.Context, _, _ string) (net.Conn, error) { calls++; return nil, errors.New("called") }})
+	if !errors.Is(err, ErrNodeUntrusted) || calls != 0 {
+		t.Fatal("nil 校验器仍拨号")
 	}
 }

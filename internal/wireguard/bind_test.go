@@ -1,26 +1,22 @@
 package wireguard
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 )
 
-// 这两个用例用"能不能在同一个端口的另一个地址上再绑一次"来判定监听范围，
-// 比发包探测可靠：绑到 0.0.0.0 时，再绑具体地址会得到 EADDRINUSE；
-// 只绑 127.0.0.1 时，绑其他本机地址仍然成功。
+// 默认回环绑定须独占回环端口，同时允许其他本机地址使用同一端口。
 
 // 回归：默认只监听回环。同一个局域网里的其他人不该能打到这个 UDP 端口。
 func TestLoopbackBindOnlyClaimsLoopbackAddress(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 走 ring bind，行为不同")
-	}
 	external := externalIPv4(t)
 	if external == "" {
 		t.Skip("本机没有非回环 IPv4 地址")
@@ -34,7 +30,8 @@ func TestLoopbackBindOnlyClaimsLoopbackAddress(t *testing.T) {
 	defer bind.Close()
 
 	// 回环上已经绑住了：同地址同端口再绑必须失败。
-	if _, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}); err == nil {
+	if probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}); err == nil {
+		probe.Close()
 		t.Error("回环地址上的端口没有被占住")
 	}
 
@@ -46,22 +43,67 @@ func TestLoopbackBindOnlyClaimsLoopbackAddress(t *testing.T) {
 	probe.Close()
 }
 
-// 配置成 all 时，端口应当占据全部网卡。
-func TestListenAllClaimsEveryAddress(t *testing.T) {
+// Windows 的 ring bind 允许更具体的地址绑定覆盖通配监听，不能以抢占端口
+// 推断监听范围；直接验证生产绑定在回环与非回环地址上都实际收到了数据。
+func TestListenAllReceivesOnEveryAddress(t *testing.T) {
 	external := externalIPv4(t)
 	if external == "" {
 		t.Skip("本机没有非回环 IPv4 地址")
 	}
 
 	bind := newBind(ListenAll)
-	_, port, err := bind.Open(0)
+	receivers, port, err := bind.Open(0)
 	if err != nil {
 		t.Fatalf("打开绑定失败: %v", err)
 	}
-	defer bind.Close()
-
-	if _, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(external), Port: int(port)}); err == nil {
-		t.Errorf("配置为 all 时 %s:%d 仍可被抢占，说明没有监听全部网卡", external, port)
+	received := make(chan []byte, 2)
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		bind.Close()
+		workers.Wait()
+	})
+	for _, receive := range receivers {
+		workers.Go(func() {
+			packets := make([][]byte, bind.BatchSize())
+			for i := range packets {
+				packets[i] = make([]byte, 2048)
+			}
+			sizes := make([]int, len(packets))
+			endpoints := make([]conn.Endpoint, len(packets))
+			for {
+				n, err := receive(packets, sizes, endpoints)
+				if err != nil {
+					return
+				}
+				for i := 0; i < n; i++ {
+					select {
+					case received <- bytes.Clone(packets[i][:sizes[i]]):
+					case <-t.Context().Done():
+						return
+					}
+				}
+			}
+		})
+	}
+	for i, address := range []string{"127.0.0.1", external} {
+		client, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(address), Port: int(port)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte{byte(i), 0xa5, 0x5a}
+		_, err = client.Write(payload)
+		client.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case got := <-received:
+			if !bytes.Equal(got, payload) {
+				t.Fatal("监听范围测试收到的载荷不一致")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("生产绑定未接收到指定本机地址的数据")
+		}
 	}
 }
 
@@ -225,9 +267,6 @@ func TestLoopbackBindReopenChangesPort(t *testing.T) {
 // 判据同样是"能不能在同一个端口的其他地址上再绑一次"：
 // 设备占住了回环，就不该占住非回环地址。
 func TestDeviceBindsOnlyLoopbackByDefault(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 走 ring bind，行为不同")
-	}
 	external := externalIPv4(t)
 	if external == "" {
 		t.Skip("本机没有非回环 IPv4 地址")
@@ -248,7 +287,7 @@ func TestDeviceBindsOnlyLoopbackByDefault(t *testing.T) {
 
 	port := freeUDPPort(t)
 	dev, err := NewDevice(DeviceOptions{
-		MTU:        1420,
+		MTU:        1400,
 		PrivateKey: priv,
 		ListenPort: port,
 		// ListenHost 留零值，即默认的 loopback。
@@ -262,7 +301,8 @@ func TestDeviceBindsOnlyLoopbackByDefault(t *testing.T) {
 	}
 
 	// 设备已经绑住了回环端口。
-	if _, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}); err == nil {
+	if probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}); err == nil {
+		probe.Close()
 		t.Error("设备没有绑住回环端口")
 	}
 	// 但非回环地址上仍然空着，说明没有监听全部网卡。
@@ -285,13 +325,9 @@ func TestDeviceBindsOnlyLoopbackByDefault(t *testing.T) {
 // 配置解析只接受两个明确的写法，避免拼错后静默放开监听范围。
 func TestParseListenHost(t *testing.T) {
 	cases := map[string]ListenHost{
-		"":          ListenLoopback,
-		"loopback":  ListenLoopback,
-		"local":     ListenLoopback,
-		"127.0.0.1": ListenLoopback,
-		"all":       ListenAll,
-		"any":       ListenAll,
-		"0.0.0.0":   ListenAll,
+		"":         ListenLoopback,
+		"loopback": ListenLoopback,
+		"all":      ListenAll,
 	}
 	for in, want := range cases {
 		got, err := ParseListenHost(in)
@@ -303,7 +339,7 @@ func TestParseListenHost(t *testing.T) {
 			t.Errorf("%q 解析为 %v，期望 %v", in, got, want)
 		}
 	}
-	for _, bad := range []string{"everyone", "0.0.0.0/0", "true"} {
+	for _, bad := range []string{"everyone", "0.0.0.0/0", "true", "any", "local", "0.0.0.0", "127.0.0.1"} {
 		if _, err := ParseListenHost(bad); err == nil {
 			t.Errorf("%q 应被拒绝（拼错时不能静默放开监听范围）", bad)
 		}

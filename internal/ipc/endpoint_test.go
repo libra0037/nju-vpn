@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+func writeConfig(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("server: vpn.example.edu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestEndpointForIsStableForSameConfig 验证同一份配置总是得到同一个端点。
 func TestEndpointForIsStableForSameConfig(t *testing.T) {
 	path := writeConfig(t, t.TempDir(), "config.yaml")
@@ -90,33 +99,4 @@ func TestEndpointForMissingFile(t *testing.T) {
 	if EndpointFor(missing) == EndpointFor(other) {
 		t.Fatal("不同的文件路径不该得到同一个端点")
 	}
-}
-
-// TestResolveEndpoint 验证"显式端点优先，否则按路径派生"这条规则。
-func TestResolveEndpoint(t *testing.T) {
-	path := writeConfig(t, t.TempDir(), "config.yaml")
-
-	if got, want := ResolveEndpoint("/tmp/custom.sock", path), "/tmp/custom.sock"; got != want {
-		t.Fatalf("显式端点应优先: %q != %q", got, want)
-	}
-	if got, want := ResolveEndpoint("", path), EndpointFor(path); got != want {
-		t.Fatalf("没写显式端点时应按路径派生: %q != %q", got, want)
-	}
-}
-
-// TestEndpointForEmpty 验证空路径得到固定标识。
-func TestEndpointForEmpty(t *testing.T) {
-	if got, want := EndpointFor(""), endpointPath("default"); got != want {
-		t.Fatalf("空路径应得到 default 端点，得到 %q", got)
-	}
-}
-
-// writeConfig 写一份最小配置并返回路径。
-func writeConfig(t *testing.T, dir, name string) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("server: vpn.example.edu\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }

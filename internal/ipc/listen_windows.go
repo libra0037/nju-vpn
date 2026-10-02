@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows"
 )
 
 // pipePrefix 是命名管道的命名空间前缀。
@@ -75,7 +76,48 @@ func Dial(endpoint string) (net.Conn, error) {
 	timeout := dialTimeout
 	conn, err := winio.DialPipe(endpoint, &timeout)
 	if err != nil {
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return nil, ErrNotRunning
+		}
 		return nil, fmt.Errorf("连接服务进程 %s: %w（服务进程是否在运行？）", endpoint, err)
 	}
+	current, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		conn.Close()
+		return nil, ErrUntrustedPeer
+	}
+	if err := verifyPipeServer(conn, current.User.Sid); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	return conn, nil
+}
+
+func verifyPipeServer(conn net.Conn, expectedSID *windows.SID) error {
+	f, ok := conn.(interface{ Fd() uintptr })
+	if !ok {
+		return ErrUntrustedPeer
+	}
+	var pid uint32
+	if err := windows.GetNamedPipeServerProcessId(windows.Handle(f.Fd()), &pid); err != nil {
+		return ErrUntrustedPeer
+	}
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return ErrUntrustedPeer
+	}
+	defer windows.CloseHandle(process)
+	var token windows.Token
+	if err := windows.OpenProcessToken(process, windows.TOKEN_QUERY, &token); err != nil {
+		return ErrUntrustedPeer
+	}
+	defer token.Close()
+	owner, err := token.GetTokenUser()
+	if err != nil {
+		return ErrUntrustedPeer
+	}
+	if expectedSID == nil || !owner.User.Sid.Equals(expectedSID) {
+		return ErrUntrustedPeer
+	}
+	return nil
 }

@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,6 +26,7 @@ const (
 	writeTimeout = 15 * time.Second
 	// shutdownWaitTimeout 是退出时等待在处理的请求写完响应的上限。
 	shutdownWaitTimeout = 3 * time.Second
+	maxConnections      = 64
 )
 
 // Server 在本地端点上提供服务，把 IPC 请求转成对 Service 的调用。
@@ -34,20 +34,26 @@ type Server struct {
 	svc      *Service
 	listener net.Listener
 
-	closing  chan struct{}
-	once     sync.Once
-	quit     chan struct{}
-	quitOnce sync.Once
-	wg       sync.WaitGroup
+	closing     chan struct{}
+	once        sync.Once
+	quit        chan struct{}
+	quitOnce    sync.Once
+	wg          sync.WaitGroup
+	mu          sync.Mutex
+	connections map[net.Conn]struct{}
+	// 编码与发送共用一个名额，包括客户端背压期间；普通请求不占用它。
+	resourceReply chan struct{}
 }
 
 // NewServer 构造服务端。
 func NewServer(svc *Service, listener net.Listener) *Server {
 	return &Server{
-		svc:      svc,
-		listener: listener,
-		closing:  make(chan struct{}),
-		quit:     make(chan struct{}),
+		svc:           svc,
+		listener:      listener,
+		closing:       make(chan struct{}),
+		quit:          make(chan struct{}),
+		connections:   make(map[net.Conn]struct{}),
+		resourceReply: make(chan struct{}, 1),
 	}
 }
 
@@ -56,6 +62,11 @@ func (s *Server) Shutdown() {
 	s.once.Do(func() {
 		close(s.closing)
 		s.listener.Close()
+		s.mu.Lock()
+		for conn := range s.connections {
+			_ = conn.SetReadDeadline(time.Now())
+		}
+		s.mu.Unlock()
 	})
 }
 
@@ -87,9 +98,18 @@ func (s *Server) Serve() error {
 			return err
 		}
 
+		s.mu.Lock()
+		if s.isClosing() || len(s.connections) >= maxConnections {
+			s.mu.Unlock()
+			conn.Close()
+			continue
+		}
+		s.connections[conn] = struct{}{}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
+			defer func() { s.mu.Lock(); delete(s.connections, conn); s.mu.Unlock() }()
 			s.handle(conn)
 		}()
 	}
@@ -107,7 +127,12 @@ func (s *Server) Wait(timeout time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		log.Printf("仍有请求在处理，等待超过 %s，继续退出", timeout)
+		s.mu.Lock()
+		for conn := range s.connections {
+			conn.Close()
+		}
+		s.mu.Unlock()
+		<-done
 	}
 }
 
@@ -118,9 +143,8 @@ func (s *Server) handle(conn net.Conn) {
 	// panic 边界：一个畸形请求不该带走整个服务进程——服务端的会话还开着，
 	// 进程直接死掉就没人登出了。
 	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("处理 IPC 请求时发生内部错误: %v", r)
-			log.Printf("%s", debug.Stack())
+		if recover() != nil {
+			log.Printf("处理 IPC 请求时发生内部错误")
 		}
 	}()
 
@@ -144,20 +168,40 @@ func (s *Server) handle(conn net.Conn) {
 				if errors.Is(err, ipc.ErrLineTooLong) {
 					msg = fmt.Sprintf("请求超过 %d 字节的长度上限", ipc.MaxLineBytes)
 				}
-				_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-				_ = ipc.WriteResponse(conn, ipc.Response{Code: ipc.CodeBadRequest, Message: msg})
+				_ = s.writeResponse(conn, "", ipc.Response{Code: ipc.CodeBadRequest, Message: msg})
 			}
 			return
 		}
 
-		resp := s.dispatch(req)
-		if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-			return
-		}
-		if err := ipc.WriteResponse(conn, resp); err != nil {
+		if err := s.reply(conn, req); err != nil {
 			return
 		}
 	}
+}
+
+// reply 的名额覆盖资源编码到写完响应，限制大响应的总分配与等待数量。
+func (s *Server) reply(conn net.Conn, req ipc.Request) error {
+	if req.Command == ipc.CmdResources && len(req.Args) == 0 {
+		select {
+		case s.resourceReply <- struct{}{}:
+			defer func() { <-s.resourceReply }()
+		default:
+			return s.writeResponse(conn, req.Command, ipc.Response{
+				Code: ipc.CodeRejected, Message: "资源查询正在进行，请稍后重试",
+			})
+		}
+	}
+	return s.writeResponse(conn, req.Command, s.dispatch(req))
+}
+
+func (s *Server) writeResponse(conn net.Conn, command string, resp ipc.Response) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	if command == ipc.CmdResources {
+		return ipc.WriteResourcesResponse(conn, resp)
+	}
+	return ipc.WriteResponse(conn, resp)
 }
 
 // dispatch 把一条请求映射成一个响应。
@@ -188,6 +232,19 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			return ipc.Response{Code: ipc.CodeRejected, Message: statusLine(st)}
 		}
 		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(st)}
+
+	case ipc.CmdResources:
+		if len(req.Args) != 0 {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: "resources 不接受参数"}
+		}
+		body, err := s.svc.ResourcesJSON(ipc.MaxResourcesResponseBytes - len("200 \n"))
+		if err != nil {
+			if errors.Is(err, ztna.ErrResourceSnapshotTooLarge) {
+				return ipc.Response{Code: ipc.CodeServerError, Message: fmt.Sprintf("资源列表超过 %d 字节的 IPC 响应上限", ipc.MaxResourcesResponseBytes)}
+			}
+			return ipc.Response{Code: ipc.CodeRejected, Message: ztna.ErrResourcesUnavailable.Error()}
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: string(body)}
 
 	case ipc.CmdStart:
 		trust, err := ipc.BoolArg(ipc.Arg(req.Args, 0), "trust")
@@ -265,7 +322,7 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		}
 
 	default:
-		return ipc.Response{Code: ipc.CodeBadRequest, Message: "未知命令: " + req.Command}
+		return ipc.Response{Code: ipc.CodeBadRequest, Message: "未知命令"}
 	}
 }
 
@@ -354,30 +411,23 @@ func statusLine(st Status) string {
 func identityText(id Identity) string {
 	parts := []string{fmt.Sprintf("pid=%d", id.PID)}
 	if id.Username != "" {
-		parts = append(parts, "账号="+id.Username)
+		parts = append(parts, fmt.Sprintf("账号=%q", id.Username))
 	}
 	if id.ConfigPath != "" {
-		parts = append(parts, "配置="+id.ConfigPath)
+		parts = append(parts, fmt.Sprintf("配置=%q", id.ConfigPath))
 	}
 	if id.Endpoint != "" {
-		parts = append(parts, "端点="+id.Endpoint)
+		parts = append(parts, fmt.Sprintf("端点=%q", id.Endpoint))
 	}
 	return strings.Join(parts, " ")
 }
 
 // RunServer 是服务进程的入口：监听本地端点并处理请求，返回时说明服务已停止。
-func RunServer(svc *Service, endpoint string) error {
+func RunServer(svc *Service, ln net.Listener) error {
 	// 端点由调用方按配置文件的身份解析好（见 ipc.EndpointFor）：这里不再有
 	// "默认端点"这个退路，否则配置读不出来时会静默地和另一个实例抢同一个
 	// 端点。
-	if endpoint == "" {
-		return ipc.ErrEmptyEndpoint
-	}
-	ln, err := ipc.Listen(endpoint)
-	if err != nil {
-		return err
-	}
-	log.Printf("服务进程已启动，监听 %s", endpoint)
+	log.Printf("服务进程已开始处理请求")
 
 	srv := NewServer(svc, ln)
 
@@ -385,7 +435,10 @@ func RunServer(svc *Service, endpoint string) error {
 	// shutdown 命令（njuvpn restart 用的就是它）。
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	stop, joined := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(joined)
 		select {
 		case sig := <-signals:
 			log.Printf("收到信号 %v，准备退出", sig)
@@ -393,6 +446,8 @@ func RunServer(svc *Service, endpoint string) error {
 			log.Printf("收到 shutdown 命令，准备退出")
 		case <-svc.Done():
 			log.Printf("服务对象已收尾，准备退出")
+		case <-stop:
+			return
 		}
 		// 先收尾（含登出）再关监听：CLI 的 restart 用"端点不再响应"判断旧
 		// 进程已经退干净。端点若先消失，新进程会和还没发完的登出抢同一个
@@ -400,15 +455,15 @@ func RunServer(svc *Service, endpoint string) error {
 		svc.Close()
 		srv.Shutdown()
 	}()
-	// 故意不 signal.Stop：收尾（登出）由 RunServer 返回之后做，这段时间里
-	// 第二个 Ctrl-C 必须被吞掉而不是立刻终止进程——默认动作会把登出请求
-	// 打断，服务端名额要等它自己超时才释放。
+	// 信号订阅保持到收尾完成才注销，第二个 Ctrl-C 不应中断登出请求。
 
-	err = srv.Serve()
+	err := srv.Serve()
 	// Serve 返回说明监听已经关闭；这里再收一次尾（Close 幂等），然后等
 	// 在处理的请求写完响应。
 	svc.Close()
 	srv.Shutdown()
 	srv.Wait(shutdownWaitTimeout)
+	close(stop)
+	<-joined
 	return err
 }

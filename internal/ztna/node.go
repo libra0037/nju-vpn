@@ -2,57 +2,88 @@ package ztna
 
 import (
 	"context"
-	"fmt"
+	"crypto/tls"
+	"sync"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/dial"
 )
 
-// 节点选择：所有候选地址并行探一次 TCP，取最快连上的那个。
-// 串行探测在第一个地址不可达时要白等一个超时，而节点列表里经常有
-// 明确连不通的地址（例如只有内网才通的 lan 地址）。
+const maxConcurrentProbes = 8
 
 type probeResult struct {
 	addr string
-	dur  time.Duration
+	conn *tls.Conn
 	err  error
 }
 
-func probeNodes(ctx context.Context, dialFn dial.DialFunc, addrs []string, timeout time.Duration) (string, error) {
+func (r probeResult) close() {
+	if r.conn != nil {
+		// 不发送节点 TLS 的 close_notify，直接释放未接纳连接的底层 I/O。
+		_ = r.conn.NetConn().Close()
+	}
+}
+
+// fn 返回已完成 TLS 与配置指纹校验的连接。选中的连接转移给调用者；
+// 其余连接均关闭，并等待全部工作者。结果只缓存一项，限制尚未接纳的连接。
+func probeNodes(ctx context.Context, fn func(context.Context, string) (*tls.Conn, error), addrs []string, timeout time.Duration) (string, *tls.Conn, error) {
 	if len(addrs) == 0 {
-		return "", &ProtocolError{What: "资源表里没有可用的隧道节点"}
+		return "", nil, &ProtocolError{What: "资源表里没有可用的隧道节点"}
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	ch := make(chan probeResult, len(addrs))
+	jobs := make(chan string, len(addrs))
 	for _, addr := range addrs {
-		go func(addr string) {
-			start := time.Now()
-			conn, err := dialWithContext(ctx, dialFn, "tcp", addr)
-			if err != nil {
-				ch <- probeResult{addr: addr, err: err}
-				return
-			}
-			_ = conn.Close()
-			ch <- probeResult{addr: addr, dur: time.Since(start)}
-		}(addr)
+		jobs <- addr
 	}
-
-	var lastErr error
+	close(jobs)
+	results := make(chan probeResult, 1)
+	var wg sync.WaitGroup
+	for range min(maxConcurrentProbes, len(addrs)) {
+		wg.Go(func() {
+			for addr := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				conn, err := fn(ctx, addr)
+				r := probeResult{addr: addr, conn: conn, err: err}
+				if ctx.Err() != nil {
+					r.close()
+					return
+				}
+				select {
+				case results <- r:
+					// 结果接收者负责连接；发送后工作者不再访问它。
+				case <-ctx.Done():
+					r.close()
+					return
+				}
+			}
+		})
+	}
+	defer func() {
+		cancel()
+		wg.Wait()
+		for len(results) > 0 {
+			r := <-results
+			r.close()
+		}
+	}()
+	var last error
 	for range addrs {
 		select {
-		case r := <-ch:
+		case r := <-results:
+			if err := ctx.Err(); err != nil {
+				r.close()
+				return "", nil, dial.Wrap("探测隧道节点", err)
+			}
 			if r.err == nil {
-				return r.addr, nil
+				return r.addr, r.conn, nil
 			}
-			lastErr = r.err
+			r.close()
+			last = r.err
 		case <-ctx.Done():
-			if lastErr != nil {
-				return "", fmt.Errorf("隧道节点均不可达（最后一个错误: %w）", lastErr)
-			}
-			return "", fmt.Errorf("探测隧道节点超时: %w", ctx.Err())
+			return "", nil, dial.Wrap("探测隧道节点", ctx.Err())
 		}
 	}
-	return "", fmt.Errorf("隧道节点均不可达: %w", lastErr)
+	return "", nil, dial.Wrap("探测隧道节点", last)
 }

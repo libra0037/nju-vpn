@@ -2,11 +2,23 @@
 # 本地与 CI 共用的一套检查：格式、vet、打包平台、测试、静态分析、不可达分析，
 # 外加文档命令与代码的一致性。
 #
-# 用法: scripts/check.sh
+# 用法: scripts/check.sh [--code-only]
 #
 # 工具不在 PATH 里时会再到 $(go env GOPATH)/bin 找一次：go install 的默认落点
 # 就在那里，漏掉这一条会把"其实装着"误判成"没装"而静默跳过检查。
 set -uo pipefail
+cd "$(dirname "$0")/.."
+source scripts/toolchain.sh
+code_only=false
+case "${1:-}" in
+  '') ;;
+  --code-only) code_only=true ;;
+  *) echo '用法：scripts/check.sh [--code-only]' >&2; exit 2 ;;
+esac
+if [[ $(go env GOVERSION) != "go$GO_VERSION" ]]; then
+  echo "要求 Go $GO_VERSION（与 go.mod 一致）" >&2
+  exit 1
+fi
 
 fail=0
 
@@ -66,7 +78,7 @@ terminology_check() {
     return 1
   fi
 }
-run terminology_check
+if ! $code_only; then run terminology_check; fi
 
 # gofmt -l 有输出就算失败（它列出的是没格式化的文件）。
 fmt_out=$(gofmt -l . 2>&1)
@@ -76,14 +88,20 @@ if [ -n "$fmt_out" ]; then
   fail=1
 fi
 
-run go vet ./...
-run go build ./...
+run go run scripts/check-enums.go
+run go vet -tags "$BUILD_TAGS" ./...
+run go build -tags "$BUILD_TAGS" ./...
 # 发布脚本给的六个组合都要能编译：Windows 与 macOS 的分支在 Linux 上编译不到，
 # 交叉编译是它们唯一的守门人（曾经漏掉 windows/amd64 的一次改坏就是这么发现的）。
-for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
-  run env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build ./...
+for entry in "${PLATFORMS[@]}"; do
+  target=${entry%:*}
+  run env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -tags "$BUILD_TAGS" ./...
 done
-run go test ./... -race
+native="$(go env GOOS)/$(go env GOARCH)"
+case "$native" in
+  windows/arm64) run go test -tags "$BUILD_TAGS" -count=1 ./... ;;
+  *) run env CGO_ENABLED=1 go test -tags "$BUILD_TAGS" -race -count=1 ./... ;;
+esac
 # 依赖面不许悄悄回涨：tidy 之后应当没有任何差异（悬空依赖、漏写的 require）。
 run go mod tidy -diff
 
@@ -127,21 +145,42 @@ doc_check() {
   rm -rf "$tmp"
   return $rc
 }
-run doc_check
+if ! $code_only; then run doc_check; fi
 
 sc=$(tool staticcheck)
 if [ -n "$sc" ]; then
-  run "$sc" ./...
+  if [[ $($sc -version) != "staticcheck $STATICCHECK_VERSION "* ]]; then
+    echo "staticcheck 版本须为 $STATICCHECK_VERSION"
+    fail=1
+  else
+    run "$sc" -tags "$BUILD_TAGS" ./...
+  fi
 else
-  echo "== staticcheck 未安装，跳过（go install honnef.co/go/tools/cmd/staticcheck@2026.2.1）"
+  echo "缺少工具：go install honnef.co/go/tools/cmd/staticcheck@$STATICCHECK_VERSION"
+  fail=1
 fi
 
 dc=$(tool deadcode)
 if [ -n "$dc" ]; then
-  # -test 让测试引用的符号也算可达：测试替身不该被当成死代码。
-  run "$dc" -test ./...
+  dc_version=$(go version -m "$dc" | awk '$1 == "mod" {print $3}')
+  if [[ $dc_version != "$DEADCODE_VERSION" ]]; then
+    echo "deadcode 版本须为 $DEADCODE_VERSION"
+    fail=1
+  else
+    # 含测试分析必须无输出；生产入口另行列出只被测试使用的符号。
+    for entry in "${PLATFORMS[@]}"; do
+      target=${entry%:*}
+      echo "== deadcode（含测试入口）$target，tags=$BUILD_TAGS"
+      if ! dc_out=$(env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" "$dc" -tags "$BUILD_TAGS" -test ./... 2>&1); then
+        fail=1
+      fi
+      if [[ -n $dc_out ]]; then echo "$dc_out"; fail=1; fi
+      run env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" "$dc" -tags "$BUILD_TAGS" ./cmd/njuvpn
+    done
+  fi
 else
-  echo "== deadcode 未安装，跳过（go install golang.org/x/tools/cmd/deadcode@latest）"
+  echo "缺少工具：go install golang.org/x/tools/cmd/deadcode@$DEADCODE_VERSION"
+  fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then

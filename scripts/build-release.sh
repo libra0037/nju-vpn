@@ -8,6 +8,12 @@
 #   -X main.version 把版本号注入 binary，用户可用 `njuvpn version` 确认
 # CGO_ENABLED=0 让 Linux 产物静态链接，换台机器直接能跑。
 set -euo pipefail
+cd "$(dirname "$0")/.."
+source scripts/toolchain.sh
+if [[ $(go env GOVERSION) != "go$GO_VERSION" ]]; then
+  echo "要求 Go $GO_VERSION" >&2
+  exit 1
+fi
 
 VERSION=${1:?用法: scripts/build-release.sh v0.1.0}
 OUT=dist
@@ -20,19 +26,19 @@ build() {
   local goos=$1 goarch=$2 ext=${3:-}
   local name="njuvpn-${goos}-${goarch}${ext}"
   GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go build \
+    -tags "$BUILD_TAGS" \
     -trimpath -ldflags "-s -w -X main.version=$VERSION" \
     -o "$OUT/$name" "$PKG"
   echo "  $name"
 }
 
 echo "构建 $VERSION"
-build linux   amd64
-build linux   arm64
-build windows amd64 .exe
-build windows arm64 .exe
-# macOS 只保证能编译：本地没有机器实测过，遇到问题请开 issue。
-build darwin  amd64
-build darwin  arm64
+for entry in "${PLATFORMS[@]}"; do
+  target=${entry%:*}
+  ext=''
+  if [[ ${target%/*} == windows ]]; then ext=.exe; fi
+  build "${target%/*}" "${target#*/}" "$ext"
+done
 
 ( cd "$OUT" && sha256sum njuvpn-* > SHA256SUMS )
 

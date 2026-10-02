@@ -5,8 +5,18 @@
 /dist/
 
 # 真实配置（含密码和 TOTP 密钥）
-/config.yaml
+config.yaml
 *.local.yaml
+
+# 实机测试的私有配置、密钥、日志与结果不入库。
+private-*/
+results-*/
+results-*.zip
+*.key
+*.log
+*.log.[0-9]
+__pycache__/
+*.pyc
 
 # 独立审查报告（本地产物，不入库）
 /REVIEW.md

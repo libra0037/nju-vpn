@@ -28,9 +28,9 @@ func TestControlPlaneTreatsRedirectAsFailure(t *testing.T) {
 	}
 	c, err := newControl(controlOptions{
 		Server: u.Hostname(), DialAddr: u.Host,
-		Dial: func(network, addr string) (net.Conn, error) {
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			var d net.Dialer
-			return d.Dial(network, addr)
+			return d.DialContext(ctx, network, addr)
 		},
 		// 生产走系统信任链；这里对着自签的测试服务端，显式关掉。
 		InsecureSkipVerify: true,

@@ -12,18 +12,25 @@ import (
 // 口令用服务端下发的 RSA 公钥加密：明文是"口令_反重放随机数"，
 // 公钥装不下时分段，密文拼起来转小写十六进制。
 func parseRSAPublicKey(modulusHex, exponentStr string) (*rsa.PublicKey, error) {
+	// 限制大整数解析与模幂成本；控制面整体字节上限不能替代运算预算。
+	if len(modulusHex) > 2048 || len(exponentStr) > 10 {
+		return nil, &ProtocolError{What: "服务端 RSA 公钥超过运算预算"}
+	}
 	n, ok := new(big.Int).SetString(modulusHex, 16)
 	if !ok || n.Sign() <= 0 {
 		return nil, &ProtocolError{What: "服务端公钥模数非法"}
 	}
 	e, err := strconv.Atoi(exponentStr)
-	if err != nil || e <= 0 {
-		return nil, &ProtocolError{What: "服务端公钥指数非法", Got: exponentStr}
+	if err != nil || e < 3 || e%2 == 0 || uint64(e) > 1<<31-1 {
+		return nil, &ProtocolError{What: "服务端公钥指数非法"}
 	}
 	return &rsa.PublicKey{N: n, E: e}, nil
 }
 
 func encryptPassword(pub *rsa.PublicKey, plain string) (string, error) {
+	if len(plain) > 8192 {
+		return "", &ProtocolError{What: "口令加密输入超过 8192 字节"}
+	}
 	max := pub.Size() - 11
 	if max <= 0 {
 		return "", &ProtocolError{What: "服务端公钥过小"}

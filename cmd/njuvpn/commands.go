@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -15,12 +16,22 @@ import (
 )
 
 // cmdRun 是服务进程入口：由命令行按需拉起，也可以直接在终端里跑。
-func cmdRun(args []string) error {
+func cmdRun(args []string) (resultErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
+	closeLogger, err := daemonLogger()
+	if err != nil {
+		return err
+	}
+	defer closeLogger()
+	defer func() {
+		if resultErr != nil && os.Getenv(daemonLogEnv) != "" {
+			log.Printf("服务进程启动或运行失败: %v", resultErr)
+		}
+	}()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -28,17 +39,21 @@ func cmdRun(args []string) error {
 	}
 
 	endpoint := endpointOf(cfg)
+	ln, err := ipc.Listen(endpoint)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
 	log.SetFlags(log.LstdFlags)
 	// 第一行就报出身份：同机多实例时日志几乎逐字相同，没有这一行就分不清
 	// 眼前这份日志属于哪个实例。
-	log.Printf("%s 服务进程启动 pid=%d 账号=%s 配置=%s 端点=%s",
+	log.Printf("%s 服务进程启动 pid=%d 账号=%q 配置=%q 端点=%q",
 		prog, os.Getpid(), cfg.Username, cfg.SourcePath(), endpoint)
-	log.Printf("目标 %s", cfg.ConnectAddr())
 	for _, w := range cfg.Warnings() {
 		log.Printf("警告: %s", w)
 	}
 	if cfg.Proxy != "" {
-		log.Printf("出站路径: %s", config.RedactProxy(cfg.Proxy))
+		log.Printf("已配置出站代理")
 	}
 
 	if err := ensureIdentity(cfg); err != nil {
@@ -58,43 +73,26 @@ func cmdRun(args []string) error {
 	// 后续建隧道被拒。这里相当于 atexit。
 	defer svc.Close()
 
-	return service.RunServer(svc, endpoint)
+	return service.RunServer(svc, ln)
 }
 
-// ensureIdentity 保证设备标识与 WireGuard 私钥存在，并尽量写回配置文件。
-//
-// 两者都必须在服务进程启动时定下来：设备标识决定授信终端绑的是哪台设备，
-// 换一个就得重新做一次二次验证；私钥换一个，所有对端配置都会失效。
-//
-// 写回失败只记警告：配置可能是只读的，那种情况下进程仍然能跑，只是下次
-// 启动会换一个标识——用户需要知道这一点。设备标识生成不出来则是另一回事：
-// 那会与别的机器撞成同一台设备，必须让启动失败。
+// 实例端点已被当前进程独占；身份自举必须持久化成功后才采用。
 func ensureIdentity(cfg *config.Config) error {
-	if cfg.DeviceID == "" {
+	saved, err := config.InitializeIdentity(cfg.SourcePath(), func() (string, string, error) {
 		id, err := ztna.NewDeviceID()
 		if err != nil {
-			return err
+			return "", "", err
 		}
-		cfg.DeviceID = id
-		if err := config.PersistDeviceID(cfg.SourcePath(), id); err != nil {
-			log.Printf("警告: 设备标识已生成但无法写回配置（%v）；下次启动会换一个，授信终端会跟着失效", err)
-		} else {
-			log.Printf("已生成设备标识并写回 %s", cfg.SourcePath())
-		}
-	}
-	if cfg.WireGuard.PrivateKey == "" {
 		key, err := wireguard.GenerateKey()
 		if err != nil {
-			log.Printf("警告: 生成 WireGuard 私钥失败: %v", err)
-			return nil
+			return "", "", err
 		}
-		cfg.WireGuard.PrivateKey = key.String()
-		if err := config.PersistPrivateKey(cfg.SourcePath(), key.String()); err != nil {
-			log.Printf("警告: 私钥已生成但无法写回配置（%v）；重启后公钥会变，对端需要重新配置", err)
-		} else {
-			log.Printf("已生成 WireGuard 私钥并写回 %s", cfg.SourcePath())
-		}
+		return id, key.String(), nil
+	})
+	if err != nil {
+		return err
 	}
+	*cfg = *saved
 	return nil
 }
 
@@ -250,7 +248,9 @@ func cmdRestart(args []string) error {
 		return err
 	}
 	if err := shutdownService(endpoint); err != nil {
-		log.Printf("服务进程未在运行（%v），直接拉起", err)
+		if !errors.Is(err, ipc.ErrNotRunning) {
+			return err
+		}
 	} else if err := waitServiceGone(endpoint, serviceStopTimeout); err != nil {
 		return err
 	}

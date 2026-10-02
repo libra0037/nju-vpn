@@ -3,6 +3,7 @@ package service
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -67,10 +68,10 @@ func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 		Username: testUser,
 		Password: testPass,
 		DeviceID: "device-test-1",
-		MTU:      1320,
+		MTU:      1400,
 		// 假服务端用自签证书：控制面的系统信任链校验在这里必然失败，
 		// 这条通道的校验由 internal/ztna 的用例单独覆盖。
-		TLS: config.TLS{InsecureSkipVerify: true},
+		TLS: config.TLS{InsecureSkipVerify: true, PinnedNodeSPKISHA256: []string{pinText(srv)}},
 		WireGuard: config.WireGuard{
 			ListenPort:  0,
 			PrivateKey:  key.String(),
@@ -82,13 +83,20 @@ func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 	return cfg
 }
 
-func newTestService(t *testing.T, srv *ztnatest.Server, cfg *config.Config) *Service {
+func newTestService(t *testing.T, srv *ztnatest.Server, cfg *config.Config, options ...Options) *Service {
 	t.Helper()
-	svc, err := New(cfg)
+	opts := Options{Dial: srv.Dial, ReconnectBackoff: time.Millisecond}
+	if len(options) > 0 {
+		opts.AuthWaitTimeout = options[0].AuthWaitTimeout
+		opts.CommandTimeout = options[0].CommandTimeout
+		if options[0].Dial != nil {
+			opts.Dial = options[0].Dial
+		}
+	}
+	svc, err := New(cfg, opts)
 	if err != nil {
 		t.Fatalf("启动服务对象失败: %v", err)
 	}
-	svc.SetDialer(srv.Dial)
 	t.Cleanup(svc.Close)
 	return svc
 }
@@ -144,7 +152,7 @@ func TestStartWithSecondFactorThenTrustAndStop(t *testing.T) {
 	if st.State != StateAuthPending {
 		t.Fatalf("状态 = %s，期望 auth_pending", st.State)
 	}
-	if !strings.Contains(st.Detail, "138****0000") {
+	if !strings.Contains(st.Detail, "***0000") {
 		t.Errorf("状态里应带上脱敏手机号，得到 %q", st.Detail)
 	}
 	if srv.SMSSends() != 1 {
@@ -267,11 +275,7 @@ func TestTrustAndUntrustLogInOnlyWhenNeeded(t *testing.T) {
 
 func TestAuthWaitTimeoutReleasesSession(t *testing.T) {
 	srv := newFakeServer(t, ztnatest.Options{RequireSMS: true, VerifyCode: testCode})
-	svc := newTestService(t, srv, newTestConfig(t, srv))
-
-	old := authWaitTimeout
-	authWaitTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { authWaitTimeout = old })
+	svc := newTestService(t, srv, newTestConfig(t, srv), Options{AuthWaitTimeout: 300 * time.Millisecond})
 
 	if err := svc.Start(false, testPass); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("应停在等验证码这一步，得到 %v", err)
@@ -413,7 +417,7 @@ func TestServerMapsAuthRequiredToPrompt(t *testing.T) {
 	if resp.Code != ipc.CodeAuthRequired {
 		t.Fatalf("start = %d %s，期望 428", resp.Code, resp.Message)
 	}
-	if !strings.Contains(resp.Message, "138****0000") {
+	if !strings.Contains(resp.Message, "***0000") {
 		t.Errorf("428 的文案应带上验证码发到哪了，得到 %q", resp.Message)
 	}
 	if resp = s.dispatch(ipc.Request{Command: ipc.CmdAuth, Args: []string{testCode}}); resp.Code != ipc.CodeOK {
@@ -449,61 +453,6 @@ func TestConnectFailureStillLogsOut(t *testing.T) {
 	}
 	if st := svc.Status(); st.State != StateError {
 		t.Errorf("状态 = %s，期望 error", st.State)
-	}
-}
-
-// TestAttachInstallsPeerEveryTime 验证挂载是无条件的。
-//
-// 设备上现在是哪一对 peer 不留本地镜像：生产路径上 attach 之前必有 detach
-// （它先摘 peer 再摘会话），所以"公钥没变就跳过"这条早退在生产里永远不成立。
-// 判据是设备上的重装计数：每次挂载都该让它增长。
-func TestAttachInstallsPeerEveryTime(t *testing.T) {
-	srv := newFakeServer(t, ztnatest.Options{})
-	cfg := newTestConfig(t, srv)
-	// 配了 peer 公钥才会走到“装 peer”这一步。
-	peer, err := wireguard.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.WireGuard.PeerPublicKey = peer.String()
-	svc := newTestService(t, srv, cfg)
-
-	client, err := svc.clientFor()
-	if err != nil {
-		t.Fatalf("构造协议客户端: %v", err)
-	}
-	sess, err := client.Connect(context.Background(), ztna.ConnectOptions{Password: testPass})
-	if err != nil {
-		t.Fatalf("登录应当成功: %v", err)
-	}
-	defer func() { _ = sess.Close(context.Background()) }()
-
-	if err := svc.br.attach(sess); err != nil {
-		t.Fatalf("第一次挂载: %v", err)
-	}
-	if got := svc.br.dev.PeerInstalls(); got != 1 {
-		t.Fatalf("第一次挂载应当装一次 peer，累计 %d 次", got)
-	}
-
-	// 同一会话再挂一次：没有镜像可对，仍然是一次真实下发。
-	if err := svc.br.attach(sess); err != nil {
-		t.Fatalf("重复挂载: %v", err)
-	}
-	if got := svc.br.dev.PeerInstalls(); got != 2 {
-		t.Fatalf("重复挂载应当再装一次 peer，累计 %d 次", got)
-	}
-
-	// 真的换了公钥仍然要重装，否则客户端接不进来。
-	other, err := wireguard.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc.br.peerKey = other
-	if err := svc.br.attach(sess); err != nil {
-		t.Fatalf("换公钥后挂载: %v", err)
-	}
-	if got := svc.br.dev.PeerInstalls(); got != 3 {
-		t.Fatalf("换了公钥应当重装 peer，累计 %d 次", got)
 	}
 }
 
@@ -644,10 +593,15 @@ func TestListenHostTablesAgree(t *testing.T) {
 func loadWithListenHost(t *testing.T, value string) error {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	content := "server: vpn.example\nusername: u\nmtu: 1320\nwireguard:\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
+	content := "server: vpn.example\nusername: u\nmtu: 1400\ntls:\n  pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\nwireguard:\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := config.Load(path)
 	return err
+}
+
+func pinText(srv *ztnatest.Server) string {
+	pin := srv.SPKIPin()
+	return base64.StdEncoding.EncodeToString(pin[:])
 }

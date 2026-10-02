@@ -73,7 +73,7 @@ func TestHeartbeatGapOnlyClearedOnReceivedFrames(t *testing.T) {
 	// 的字节读掉，模拟“对端还在收，但什么都不回”。
 	go func() { _, _ = io.Copy(io.Discard, server) }()
 
-	tc.setVIP(net.ParseIP("172.16.0.9"))
+	tc.ep.SetLocalAddr(net.ParseIP("172.16.0.9"))
 	tc.heartbeatGap.Store(2)
 
 	// 写成功不清零。
@@ -122,7 +122,7 @@ func TestParseVIPListPayload(t *testing.T) {
 		{"同时含 IPv6", formDualStack, []string{"172.16.0.9", "2001:db8::1"}},
 		{"顶层 vip", formTopVIP, []string{"172.16.1.1"}},
 		{"数组", formArray, []string{"172.16.2.1", "10.0.0.1"}},
-		{"嵌套结构", formNested, []string{"172.16.3.1", "172.16.3.2"}},
+		{"未知嵌套结构不猜测地址", formNested, nil},
 		{"没有地址", formNoAddr, nil},
 		{"不是 JSON", "not-json", nil},
 	}

@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sort"
-	"strings"
 )
 
-// 线上格式。这些常量是与服务端的契约，改动前先看 wire_format_test.go：
+// 线上格式。这些常量是与服务端的契约，改动前先看 protocol_test.go：
 // 里面把握手信封、VIP 帧、数据帧逐字节钉死了。
 const (
 	// Version 是隧道帧的版本字节，所有帧都以它开头。
@@ -25,6 +23,8 @@ const (
 	// 逐流鉴权：请求 05 13，响应 05 93。
 	cmdAuthReq  byte = 0x13
 	cmdAuthResp byte = 0x93
+	// 2026-10-01 实测此状态表示临时鉴权；仅为已观测的状态安排一次重试。
+	authRetryStatus byte = 0x86
 
 	// 数据：请求 05 14，响应 05 94。
 	cmdDataReq  byte = 0x14
@@ -50,44 +50,39 @@ const (
 	handshakeFrameLimit = 32
 )
 
-// parseVIPListPayload 从 0x96 的载荷里尽力取出地址列表。
-//
-// 三家参考实现都把它命名为 second VIP，但载荷形态并不统一：见过
-// {"data":{"vip":…,"vip6":…}}，也见过地址数组。这里不猜结构，直接把 JSON
-// 里所有字符串值递归收集起来，能解析成 IP 的就算地址。取不到就当这一帧没
-// 发生——服务端将来换形态也不会把连接搞坏。
-//
-// 对象里的键按字典序走：Go 的 map 迭代顺序是随机的，不排的话同一份载荷可能
-// 给出不同的顺序，而调用方取的是"第一个 IPv4"。
+// parseVIPListPayload 只接受已有样例中的 vip/vip6 对象或地址数组；
+// 未知形状忽略，DNS 等无关字段不得推进当前地址。
 func parseVIPListPayload(payload []byte) []net.IP {
-	var value any
-	if err := json.Unmarshal(payload, &value); err != nil {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return nil
+	}
+	data := envelope.Data
+	if len(data) == 0 {
+		data = payload
+	}
+	var values []string
+	if err := json.Unmarshal(data, &values); err != nil {
+		var addresses struct {
+			VIP  string `json:"vip"`
+			VIP6 string `json:"vip6"`
+		}
+		if err := json.Unmarshal(data, &addresses); err != nil {
+			return nil
+		}
+		values = []string{addresses.VIP, addresses.VIP6}
+	}
+	if len(values) > 16 {
 		return nil
 	}
 	var out []net.IP
-	var walk func(v any)
-	walk = func(v any) {
-		switch typed := v.(type) {
-		case string:
-			if ip := net.ParseIP(strings.TrimSpace(typed)); ip != nil {
-				out = append(out, ip)
-			}
-		case []any:
-			for _, child := range typed {
-				walk(child)
-			}
-		case map[string]any:
-			keys := make([]string, 0, len(typed))
-			for k := range typed {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				walk(typed[k])
-			}
+	for _, value := range values {
+		if ip := net.ParseIP(value); ip != nil {
+			out = append(out, ip)
 		}
 	}
-	walk(value)
 	return out
 }
 
@@ -104,7 +99,7 @@ func vipBodyLen(addrType byte) (int, error) {
 	case 5:
 		return 22, nil
 	default:
-		return 0, &ProtocolError{What: "未知的虚拟地址类型", Got: fmt.Sprintf("0x%02x", addrType)}
+		return 0, &ProtocolError{What: "未知的虚拟地址类型"}
 	}
 }
 
@@ -124,8 +119,19 @@ func parseVIP(addrType byte, body []byte) net.IP {
 //	05 01 D0 | 53 00 <u16 len> {"sid":"..."} | 05 04 00 <addrType> 00*6
 //
 // 长度按实际 JSON 字节数计算——服务端不认写死的值。
-func handshakeRequest(sid string) []byte {
-	payload := []byte(fmt.Sprintf("{%q:%q}", "sid", sid))
+func handshakeRequest(sid string) ([]byte, error) {
+	if sid == "" {
+		return nil, &ProtocolError{What: "隧道握手缺少 SID"}
+	}
+	payload, err := json.Marshal(struct {
+		SID string `json:"sid"`
+	}{sid})
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > 65535 {
+		return nil, &ProtocolError{What: "握手 SID 超过帧长上限"}
+	}
 	out := make([]byte, 0, 3+2+2+len(payload)+10)
 	out = append(out, Version, cmdHandshake, methodHandshake, envelopeVersion, 0x00)
 	var l [2]byte
@@ -133,7 +139,7 @@ func handshakeRequest(sid string) []byte {
 	out = append(out, l[:]...)
 	out = append(out, payload...)
 	out = append(out, Version, 0x04, 0x00, addrTypeIPv4, 0, 0, 0, 0, 0, 0)
-	return out
+	return out, nil
 }
 
 // handshakeResult 是握手成功后服务端给出的东西。
@@ -152,12 +158,12 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 		return res, fmt.Errorf("读方法响应: %w", err)
 	}
 	if method[0] != Version || method[1] != methodHandshake {
-		return res, &ProtocolError{What: "非预期的方法响应", Got: hex2(method)}
+		return res, &ProtocolError{What: "非预期的方法响应"}
 	}
 
 	for frames := 0; ; frames++ {
 		if frames >= handshakeFrameLimit {
-			return res, &ProtocolError{What: "握手帧数超过上限", Got: fmt.Sprintf("%d 帧", frames)}
+			return res, &ProtocolError{What: "握手帧数超过上限"}
 		}
 		head := make([]byte, 4)
 		if _, err := io.ReadFull(r, head); err != nil {
@@ -173,16 +179,23 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 				return res, fmt.Errorf("读信封体: %w", err)
 			}
 			if status != 0 {
-				return res, &ProtocolError{What: "握手被拒", Got: fmt.Sprintf("status=%d %s", status, truncateForError(payload))}
+				return res, &ProtocolError{What: "握手被拒"}
 			}
-			if code, msg, ok := parseEnvelopeCode(payload); ok && code != 0 {
+			if len(payload) == 0 {
+				continue
+			} // 实测允许先发空信封。
+			code, _, ok := parseEnvelopeCode(payload)
+			if !ok {
+				return res, &ProtocolError{What: "握手信封缺少整数 code"}
+			}
+			if code != 0 {
 				// 状态字节为 0 也可能是失败：会话失效时服务端正是这么回的。
 				// 会话失效码按"需要重新登录"归类，别包成协议错误——那会让调用方
 				// 按通用失败重试三次，而不是直接告诉用户重新登录。
 				if code == codeSessionGone {
-					return res, &ErrSessionGone{Code: code, Message: msg}
+					return res, &ErrSessionGone{Code: code}
 				}
-				return res, &ProtocolError{What: fmt.Sprintf("握手被拒（%d）", code), Got: msg}
+				return res, &ProtocolError{What: fmt.Sprintf("握手被拒（%d）", code)}
 			}
 		case Version:
 			// 05 <status> <reserved> <addrType> <body>：虚拟地址。
@@ -196,7 +209,7 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 				return res, fmt.Errorf("读虚拟地址: %w", err)
 			}
 			if head[1] != 0 {
-				return res, &ProtocolError{What: "虚拟地址下发失败", Got: fmt.Sprintf("status=%d", head[1])}
+				return res, &ProtocolError{What: "虚拟地址下发失败"}
 			}
 			res.VIP = parseVIP(addrType, body)
 			if res.VIP == nil {
@@ -204,7 +217,7 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 			}
 			return res, nil
 		default:
-			return res, &ProtocolError{What: "未知的握手帧", Got: hex2(head[:1])}
+			return res, &ProtocolError{What: "未知的握手帧"}
 		}
 	}
 }
@@ -216,14 +229,17 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 // 前提：count 是单字节，调用方每次最多传 authBatchSize（32）个包；在调用点
 // 提高批量之前先改这里，否则计数会被截断。
 func encodeDataFrame(token string, pkts ...[]byte) ([]byte, error) {
-	if len(token) > 0xFF {
-		return nil, &ProtocolError{What: "会话令牌过长", Got: fmt.Sprintf("%d", len(token))}
+	if len(token) == 0 || len(token) > 0xFF {
+		return nil, &ProtocolError{What: "会话令牌长度非法"}
+	}
+	if len(pkts) == 0 || len(pkts) > 255 {
+		return nil, &ProtocolError{What: "数据帧包数量非法"}
 	}
 	size := 3 + len(token) + 2 + 1
 	for _, p := range pkts {
 		size += 2 + len(p)
 		if len(p) == 0 || len(p) > 0xFFFF {
-			return nil, &ProtocolError{What: "IP 包长度非法", Got: fmt.Sprintf("%d", len(p))}
+			return nil, &ProtocolError{What: "IP 包长度非法"}
 		}
 	}
 	out := make([]byte, 0, size)
@@ -268,7 +284,7 @@ func readFrame(r *bufio.Reader) (frame, error) {
 		return f, err
 	}
 	if head[0] != Version {
-		return f, &ProtocolError{What: "帧版本非 0x05", Got: hex2(head[:1])}
+		return f, &ProtocolError{What: "帧版本非 0x05"}
 	}
 	f.cmd = head[1]
 	switch f.cmd {
@@ -292,7 +308,7 @@ func readFrame(r *bufio.Reader) (frame, error) {
 			return f, err
 		}
 	default:
-		return f, &ProtocolError{What: "未知的隧道帧", Got: hex2(head)}
+		return f, &ProtocolError{What: "未知的隧道帧"}
 	}
 	return f, nil
 }
@@ -302,14 +318,14 @@ func readFrame(r *bufio.Reader) (frame, error) {
 func splitPackets(stream []byte) (pkts [][]byte, rest []byte, err error) {
 	for len(stream) > 0 {
 		if stream[0]>>4 != 4 {
-			return nil, nil, &ProtocolError{What: "隧道里出现非 IPv4 数据", Got: hex2(stream[:1])}
+			return nil, nil, &ProtocolError{What: "隧道里出现非 IPv4 数据"}
 		}
 		if len(stream) < 4 {
 			return pkts, stream, nil
 		}
 		n := int(binary.BigEndian.Uint16(stream[2:4]))
 		if n < 20 {
-			return nil, nil, &ProtocolError{What: "IP 包长度非法", Got: fmt.Sprintf("%d", n)}
+			return nil, nil, &ProtocolError{What: "IP 包长度非法"}
 		}
 		if len(stream) < n {
 			return pkts, stream, nil
@@ -318,14 +334,4 @@ func splitPackets(stream []byte) (pkts [][]byte, rest []byte, err error) {
 		stream = stream[n:]
 	}
 	return pkts, nil, nil
-}
-
-func hex2(b []byte) string { return fmt.Sprintf("%02x", b) }
-
-func truncateForError(b []byte) string {
-	const max = 120
-	if len(b) <= max {
-		return string(b)
-	}
-	return string(b[:max]) + "..."
 }

@@ -29,7 +29,7 @@ func ipv4Pkt(src, dst [4]byte, payload int) []byte {
 func newTestRelay(t *testing.T) (*Relay, *l3.Endpoint) {
 	t.Helper()
 	ep := l3.New()
-	r := NewRelay(RelayOptions{MTU: 1320})
+	r := NewRelay(RelayOptions{MTU: 1400})
 	r.InstallSession(ep, nil)
 	t.Cleanup(func() { r.Close() })
 	return r, ep
@@ -102,6 +102,7 @@ func TestRelaySessionSwapDropsQueuedPackets(t *testing.T) {
 	t.Run("摘掉会话", func(t *testing.T) {
 		r, ep := newTestRelay(t)
 		ep.Deliver(full)
+		old := r.session.Load()
 		r.ClearSession()
 		if n := len(r.queue); n != 0 {
 			t.Fatalf("摘掉会话之后队列里还剩 %d 个包", n)
@@ -111,7 +112,7 @@ func TestRelaySessionSwapDropsQueuedPackets(t *testing.T) {
 		// 会话摘掉之后才漂进来的包也要计数，而不是静默丢掉：断开窗口里
 		// 丢了多少，日志里得有数。这里直接调回调——真实场景是 Deliver 与
 		// 会话切换撞在一起，端点那一侧的回调此时还没摘。
-		r.deliver(full)
+		r.deliverFrom(old, full)
 		waitCount(t, r, dropDownlinkNoSession, 1)
 	})
 }
@@ -214,7 +215,7 @@ func TestRelayWriteWithoutUplink(t *testing.T) {
 // 没有会话时同样静默丢弃：设备比任何一次校园网会话都活得久，
 // 隧道没建时对端可能已经握手并发包了。
 func TestRelayWriteWithoutSession(t *testing.T) {
-	r := NewRelay(RelayOptions{MTU: 1320})
+	r := NewRelay(RelayOptions{MTU: 1400})
 	defer r.Close()
 
 	peer := [4]byte{10, 66, 66, 2}
@@ -240,7 +241,7 @@ func TestRelayAppliesMapperOnUplink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRelay(RelayOptions{MTU: 1320})
+	r := NewRelay(RelayOptions{MTU: 1400})
 	r.InstallSession(ep, mapper)
 	defer r.Close()
 
@@ -271,7 +272,7 @@ func TestRelayAppliesMapperOnDownlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRelay(RelayOptions{MTU: 1320})
+	r := NewRelay(RelayOptions{MTU: 1400})
 	r.InstallSession(ep, mapper)
 	defer r.Close()
 
@@ -297,7 +298,7 @@ func TestDropReasonsAreDistinguished(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRelay(RelayOptions{MTU: 1320})
+	r := NewRelay(RelayOptions{MTU: 1400})
 	r.InstallSession(ep, mapper)
 	defer r.Close()
 

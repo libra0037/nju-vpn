@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"runtime"
 	"testing"
 	"time"
 
@@ -19,9 +18,6 @@ import (
 // 对端只发保活（空包不进 TUN）时，老判据永远等不到那一刻：纯下载的对端
 // 会一直卡在闩锁前面，表现是隧道 up 但什么都不通。
 func TestDownlinkGateOpensOnHandshake(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 的 ring bind 需要管理员权限，跳过回环测试")
-	}
 
 	serverPriv, err := GenerateKey()
 	if err != nil {
@@ -42,7 +38,7 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 
 	// 承载层：承载设备。会话与映射先不挂，只验证闩锁。
 	port := freeUDPPort(t)
-	server, err := NewDevice(DeviceOptions{MTU: 1420, PrivateKey: serverPriv, ListenPort: port})
+	server, err := NewDevice(DeviceOptions{MTU: 1400, PrivateKey: serverPriv, ListenPort: port})
 	if err != nil {
 		t.Fatalf("创建承载设备失败: %v", err)
 	}

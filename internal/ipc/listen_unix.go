@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -45,19 +46,71 @@ func Listen(endpoint string) (net.Listener, error) {
 	if err := ensurePrivateDir(filepath.Dir(endpoint)); err != nil {
 		return nil, err
 	}
+	// 监听之前持有跨进程租约：否则两个首启进程可能同时确认旧 socket
+	// 已失效，再由后执行的 Remove 摘掉刚绑定的赢家。
+	lease, err := claimEndpoint(endpoint)
+	if err != nil {
+		return nil, err
+	}
 	if err := removeStaleSocket(endpoint); err != nil {
+		lease.Close()
 		return nil, err
 	}
 
 	ln, err := net.Listen("unix", endpoint)
 	if err != nil {
+		lease.Close()
 		return nil, fmt.Errorf("监听 %s: %w", endpoint, err)
 	}
 	if err := os.Chmod(endpoint, 0o600); err != nil {
 		ln.Close()
+		lease.Close()
 		return nil, fmt.Errorf("设置套接字权限: %w", err)
 	}
-	return ln, nil
+	return &leasedListener{Listener: ln, lease: lease}, nil
+}
+
+type leasedListener struct {
+	net.Listener
+	lease *os.File
+	once  sync.Once
+	err   error
+}
+
+func (l *leasedListener) Close() error {
+	l.once.Do(func() {
+		l.err = l.Listener.Close()
+		if err := l.lease.Close(); l.err == nil {
+			l.err = err
+		}
+	})
+	return l.err
+}
+
+func claimEndpoint(endpoint string) (*os.File, error) {
+	f, err := os.OpenFile(endpoint+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err == nil {
+		uid, ok := ownerUID(fi)
+		if !fi.Mode().IsRegular() || !ok || uid != os.Getuid() {
+			err = ErrUntrustedPeer
+		}
+	}
+	if err == nil {
+		err = f.Chmod(0600)
+	}
+	if err == nil {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	}
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("无法独占实例端点：%w", err)
+	}
+	// 不删除锁文件；删除会允许另一个进程锁住新的 inode，与当前租约并存。
+	return f, nil
 }
 
 // ensurePrivateDir 创建并校验套接字目录。
@@ -77,7 +130,7 @@ func ensurePrivateDir(dir string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("套接字目录 %s 不是目录", dir)
 	}
-	if uid, ok := ownerUID(fi); ok && uid != os.Getuid() {
+	if uid, ok := ownerUID(fi); !ok || uid != os.Getuid() {
 		return fmt.Errorf("套接字目录 %s 属于其他用户，拒绝使用", dir)
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
@@ -106,14 +159,14 @@ func removeStaleSocket(endpoint string) error {
 	if fi.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("端点 %s 已存在且不是套接字，拒绝覆盖", endpoint)
 	}
-	if uid, ok := ownerUID(fi); ok && uid != os.Getuid() {
+	if uid, ok := ownerUID(fi); !ok || uid != os.Getuid() {
 		return fmt.Errorf("端点 %s 属于其他用户", endpoint)
 	}
 
 	if conn, err := net.DialTimeout("unix", endpoint, dialProbeTimeout); err == nil {
 		conn.Close()
-		return fmt.Errorf("已有服务进程在监听 %s（同一台机器上跑多个实例时，每份配置要用不同的 -config 路径，或显式设置 ipc.endpoint）", endpoint)
-	} else if probeAlive(err) {
+		return fmt.Errorf("已有服务进程在监听 %s（同一台机器上跑多个实例时，每份配置要用不同的 -config 路径）", endpoint)
+	} else if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ENOENT) {
 		// 探测超时按"仍在运行"处理：服务进程的命令是串行的，正忙着登录、
 		// 登出或发验证码时，300ms 的探测可能超时。删掉一个活着的套接字会
 		// 让两个进程各自以为自己是唯一实例：旧的那个此后收不到命令，也没人
@@ -125,15 +178,6 @@ func removeStaleSocket(endpoint string) error {
 		return fmt.Errorf("清理旧套接字 %s: %w", endpoint, err)
 	}
 	return nil
-}
-
-// probeAlive 判断一次探测失败是否意味着"还有活实例"。
-//
-// 超时算活着：连接迟迟建不起来说明有进程在监听、只是忙。只有明确的
-// "没人监听"（连接被拒、套接字文件残留）才允许当作陈旧清掉。
-func probeAlive(err error) bool {
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // ownerUID 取出文件属主。
@@ -150,11 +194,57 @@ func Dial(endpoint string) (net.Conn, error) {
 	if endpoint == "" {
 		return nil, ErrEmptyEndpoint
 	}
+	if err := validateClientPath(endpoint); err != nil {
+		return nil, err
+	}
 	// 带超时：服务进程活着但不再 accept 时，没有超时的 connect 会永久挂住，
 	// 客户端连 SetDeadline 都执行不到。
 	conn, err := net.DialTimeout("unix", endpoint, dialTimeout)
 	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+			return nil, fmt.Errorf("%w", ErrNotRunning)
+		}
 		return nil, fmt.Errorf("连接服务进程 %s: %w（服务进程是否在运行？）", endpoint, err)
 	}
+	if err := verifyPeer(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	return conn, nil
+}
+
+func validateClientPath(endpoint string) error {
+	for i, path := range []string{filepath.Dir(endpoint), endpoint} {
+		fi, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return ErrNotRunning
+		}
+		if err != nil {
+			return ErrUntrustedPeer
+		}
+		uid, ok := ownerUID(fi)
+		if !ok || uid != os.Getuid() || fi.Mode().Perm()&0o077 != 0 || fi.Mode()&os.ModeSymlink != 0 {
+			return ErrUntrustedPeer
+		}
+		if i == 0 && !fi.IsDir() || i == 1 && fi.Mode()&os.ModeSocket == 0 {
+			return ErrUntrustedPeer
+		}
+	}
+	return nil
+}
+
+func verifyPeer(conn net.Conn) error {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return ErrUntrustedPeer
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return ErrUntrustedPeer
+	}
+	var check error
+	if err := raw.Control(func(fd uintptr) { check = verifyPeerFD(fd, uint32(os.Getuid())) }); err != nil {
+		return ErrUntrustedPeer
+	}
+	return check
 }

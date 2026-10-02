@@ -4,16 +4,17 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
+	"github.com/libra0037/nju-vpn/internal/l3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,7 +41,6 @@ type Config struct {
 	Proxy     string    `yaml:"proxy"`
 	WireGuard WireGuard `yaml:"wireguard"`
 	TLS       TLS       `yaml:"tls"`
-	IPC       IPC       `yaml:"ipc"`
 	MTU       int       `yaml:"mtu"`
 	Log       Log       `yaml:"log"`
 }
@@ -55,11 +55,9 @@ type TLS struct {
 	// InsecureSkipVerify 关闭控制面的证书校验。默认关闭校验=false，也就是
 	// 正常校验；只有网关换成系统不认的证书（自签、内网 CA）时才需要打开。
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
-	// PinnedNodeSHA256 是隧道节点证书的 SHA-256 指纹（叶子证书），可写多个。
-	// 分隔符（冒号、空格）与大小写都不敏感。留空时用内置的已知值，其余节点
-	// 按“首次记录、之后比对”处理；一旦在这里写了指纹，就只认这些值——
-	// 陌生节点会被拒绝并打印观测到的指纹，由你确认后加进来。
-	PinnedNodeSHA256 []string `yaml:"pinned_node_sha256"`
+	// PinnedNodeSPKISHA256 是自签节点唯一的信任来源；程序只读，不自动补录。
+	// 每项为 DER SubjectPublicKeyInfo 的 SHA-256 摘要，使用标准 Base64。
+	PinnedNodeSPKISHA256 []string `yaml:"pinned_node_spki_sha256"`
 }
 
 type WireGuard struct {
@@ -71,72 +69,40 @@ type WireGuard struct {
 	PeerAddress   string `yaml:"peer_address"`
 }
 
-type IPC struct {
-	Endpoint string `yaml:"endpoint"`
-}
-
 type Log struct {
 	Level string `yaml:"level"`
 }
 
-// MTU 的允许区间。隧道自身的 MTU 是 1400，再减去 WireGuard 的封装开销，
-// 留给承载层的空间不该超过这个上限；下限则取 IPv4 的最小可行值。
+// 两层隧道交接同一个内层 IP 包，不能在这里再扣 WireGuard 外层开销。
 const (
-	MinMTU = 576
-	MaxMTU = 1400
+	MinMTU         = 576
+	MaxMTU         = l3.MaxPacketBytes
+	maxNodePins    = 16
+	maxConfigBytes = 256 * 1024
 )
 
-// defaultPinnedNodeSHA256 是本部署实测过的隧道节点证书指纹。
-//
-// 节点用自签证书（CN=sdp，与节点地址无关），链与名称都校验不了，指纹是唯一
-// 可行的判据。内置已知值的好处是第一次连接就不必依赖“首次记录”，代价是换
-// 证书后要更新一次：失败信息会打印观测到的指纹与改法。
-//
-// 这里放了两条：同一个节点地址背后不止一台设备，两次实测拿到的是不同设备
-// 的证书（自签证书的 notBefore 相差 71 秒，都是出厂模板、密钥各自生成）。
-// 多写一条不会削弱校验，只是多认一台；遇到列表外的设备会按“首次记录”处理
-// （配置里显式写了指纹则改为严格模式，见 TLS.PinnedNodeSHA256）。
-var defaultPinnedNodeSHA256 = []string{
-	"53:BE:18:61:F1:94:D0:CB:2A:96:54:70:F8:B8:7E:4D:99:9D:82:B8:7C:78:29:28:5F:60:63:B4:D1:28:53:A4",
-	"21:54:05:9D:C8:84:4C:72:D8:F9:32:95:2C:D2:2E:04:9A:37:15:46:C4:E6:D1:DE:EB:5E:D1:BB:47:D1:57:54",
-}
-
-// ParseSHA256Fingerprints 把配置里的证书指纹文本解析成 32 字节。
-//
-// 允许 "AA:BB:…"、"AA BB …" 与不带分隔符三种写法，大小写不敏感。指纹不是
-// 秘密（它随每次握手发出去），但写错一个字符就永远连不上，所以错误里带上
-// 原值，让用户看得出是哪一条写坏了。
-func ParseSHA256Fingerprints(list []string) ([][sha256.Size]byte, error) {
+// NodeSPKIPins 在配置边界验证指纹并交出独立的不可变值副本。
+func (c *Config) NodeSPKIPins() ([][sha256.Size]byte, error) {
+	list := c.TLS.PinnedNodeSPKISHA256
+	if len(list) == 0 || len(list) > maxNodePins {
+		return nil, fmt.Errorf("tls.pinned_node_spki_sha256 必须包含 1-%d 项", maxNodePins)
+	}
 	out := make([][sha256.Size]byte, 0, len(list))
-	for _, raw := range list {
-		cleaned := strings.Map(func(r rune) rune {
-			switch r {
-			case ':', ' ', '\t', '-':
-				return -1
-			default:
-				return r
-			}
-		}, raw)
-		decoded, err := hex.DecodeString(cleaned)
-		if err != nil || len(decoded) != sha256.Size {
-			return nil, fmt.Errorf("证书指纹 %q 不是合法的 SHA-256（形如 AA:BB:…，共 32 字节）", raw)
+	seen := make(map[[sha256.Size]byte]bool, len(list))
+	for i, raw := range list {
+		decoded, err := base64.StdEncoding.Strict().DecodeString(raw)
+		if err != nil || len(decoded) != sha256.Size || base64.StdEncoding.EncodeToString(decoded) != raw {
+			return nil, fmt.Errorf("tls.pinned_node_spki_sha256 第 %d 项须为 32 字节摘要的标准 Base64", i+1)
 		}
 		var sum [sha256.Size]byte
 		copy(sum[:], decoded)
+		if seen[sum] {
+			return nil, fmt.Errorf("tls.pinned_node_spki_sha256 第 %d 项重复", i+1)
+		}
+		seen[sum] = true
 		out = append(out, sum)
 	}
 	return out, nil
-}
-
-// NodePinHashes 返回该信任的节点证书指纹。
-//
-// 配置留空时用内置的已知值：那是本部署实测的指纹，装上就能直接连。
-func (c *Config) NodePinHashes() ([][sha256.Size]byte, error) {
-	list := c.TLS.PinnedNodeSHA256
-	if len(list) == 0 {
-		list = defaultPinnedNodeSHA256
-	}
-	return ParseSHA256Fingerprints(list)
 }
 
 // SourcePath 返回这份配置的来源文件路径。
@@ -218,14 +184,7 @@ func restrictPermissions(path string) string {
 	return fmt.Sprintf("配置文件 %s 的权限是 %04o，已收紧为 0600", path, perm)
 }
 
-// LoadForClient 读取命令行客户端需要的部分（只有 IPC 端点）。
-//
-// 与 Load 的区别是它不动文件权限：CLI 只是要算 IPC 端点，没必要——
-// 也不该——替服务进程去 chmod 配置文件。
-//
-// 读不出来时返回 nil 加错误，由调用方决定怎么回退（CLI 的回落是"按默认
-// 路径派生端点"，因为端点只依赖路径，不依赖内容）。以前这里回一个空配置，
-// 而调用方自己另造回退值，那个返回值没有任何消费者。
+// LoadForClient 只读完整配置，供登录命令使用；管理命令仅凭路径定位实例。
 func LoadForClient(path string) (*Config, error) {
 	return load(path)
 }
@@ -254,20 +213,28 @@ func load(path string) (*Config, error) {
 		path = DefaultPath()
 	}
 
-	data, err := os.ReadFile(path)
+	path = CanonicalPath(path)
+	data, err := readConfig(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件 %s: %w", path, err)
 	}
 
+	return parseConfig(data, path)
+}
+
+func parseConfig(data []byte, path string) (*Config, error) {
+	if _, err := configDocument(data); err != nil {
+		return nil, err
+	}
 	var cfg Config
 	// 读的还是用户给的路径（会穿透链接），记下来的必须是真实路径，
 	// 否则写回落在链接上，与实例身份的口径分叉。
-	cfg.sourcePath = CanonicalPath(path)
+	cfg.sourcePath = path
 	// KnownFields 让键名写错时直接报错，而不是静默回落默认值。
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("解析配置文件 %s: %w", path, err)
+		return nil, fmt.Errorf("解析配置文件失败：检查键名和字段类型")
 	}
 	cfg.applyDefaults()
 
@@ -282,7 +249,7 @@ func (c *Config) applyDefaults() {
 		c.Port = 443
 	}
 	if c.MTU == 0 {
-		c.MTU = 1320
+		c.MTU = MaxMTU
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
@@ -304,7 +271,7 @@ func (c *Config) validate() error {
 	}
 	if c.ServerIP != "" {
 		if net.ParseIP(c.ServerIP) == nil {
-			return fmt.Errorf("server_ip 不是合法地址: %q", c.ServerIP)
+			return errors.New("server_ip 不是合法地址")
 		}
 	}
 	if c.Port < 1 || c.Port > 65535 {
@@ -316,7 +283,7 @@ func (c *Config) validate() error {
 	// password 允许留空：此时由 `njuvpn start` 在终端现问，经本地套接字
 	// 交给服务进程，只留在内存里（不落盘、不进 argv、不进日志）。
 	if c.MTU < MinMTU || c.MTU > MaxMTU {
-		return fmt.Errorf("mtu 超出范围: %d（应在 %d-%d 之间，1320 适合默认隧道）", c.MTU, MinMTU, MaxMTU)
+		return fmt.Errorf("mtu 超出范围（应在 %d-%d 之间）", MinMTU, MaxMTU)
 	}
 	// 0 在 applyDefaults 里已经被换成默认端口，这里不会见到。
 	if p := c.WireGuard.ListenPort; p < 1 || p > 65535 {
@@ -327,69 +294,19 @@ func (c *Config) validate() error {
 	switch c.Log.Level {
 	case "info", "debug":
 	default:
-		return fmt.Errorf("log.level 只能是 info 或 debug，收到 %q", c.Log.Level)
+		return errors.New("log.level 只能是 info 或 debug")
 	}
 	if err := validateListenHost(c.WireGuard.ListenHost); err != nil {
 		return err
 	}
 	// 指纹写错一个字符就永远连不上，必须在加载时就报出来，而不是等建隧道。
-	if _, err := ParseSHA256Fingerprints(c.TLS.PinnedNodeSHA256); err != nil {
-		return fmt.Errorf("tls.pinned_node_sha256: %w", err)
+	if _, err := c.NodeSPKIPins(); err != nil {
+		return err
 	}
 	if ip := net.ParseIP(c.WireGuard.PeerAddress); ip == nil || ip.To4() == nil {
-		return fmt.Errorf("wireguard.peer_address 必须是 IPv4 地址: %q", c.WireGuard.PeerAddress)
-	}
-	if c.IPC.Endpoint != "" {
-		if err := validateEndpoint(c.IPC.Endpoint); err != nil {
-			return err
-		}
+		return errors.New("wireguard.peer_address 必须是 IPv4 地址")
 	}
 	return nil
-}
-
-// validateEndpoint 检查显式配置的 IPC 端点。
-//
-// 相对路径会随工作目录漂移：同一个实例从不同目录发起命令会被算成另一个
-// 端点，进而把一个跑着的实例当成"没在运行"，再拉起一个——两个进程抢同
-// 一个账号。留空表示按配置文件的路径派生，不需要写。
-func validateEndpoint(endpoint string) error {
-	if runtime.GOOS == "windows" {
-		if !strings.HasPrefix(endpoint, pipePrefixForConfig) {
-			return fmt.Errorf("ipc.endpoint 在 Windows 下必须是命名管道（以 %s 开头）: %q", pipePrefixForConfig, endpoint)
-		}
-		return nil
-	}
-	if !filepath.IsAbs(endpoint) {
-		return fmt.Errorf("ipc.endpoint 必须是绝对路径: %q", endpoint)
-	}
-	return nil
-}
-
-// pipePrefixForConfig 与 ipc 包里的管道前缀保持一致。
-//
-// 这里不引用 ipc 包：config 是叶子，被 ipc 之外的许多包依赖，反过来依赖
-// 会把依赖图绕成一团。取值只有这一个，重复一份的代价小于绕圈。
-const pipePrefixForConfig = `\\.\pipe\`
-
-// RedactProxy 把代理地址里的口令抹掉，供日志与状态输出使用。
-//
-// 代理地址支持 user:pass@host 写法，原文不该落到任何日志里（排查时经常
-// 整份贴出去）。解析不出来时也不回显原文：它可能就是一段带凭据的地址。
-func RedactProxy(proxy string) string {
-	if proxy == "" {
-		return ""
-	}
-	u, err := url.Parse(proxy)
-	if err != nil {
-		return "（无法解析的代理地址）"
-	}
-	// Opaque 非空或没有主机名时不可信："alice:pw@127.0.0.1:7897" 会被解析成
-	// scheme=alice + opaque 主体，Redacted() 只抹 User 与口令字段，对这两种
-	// 形式会原样返回含口令的字符串。
-	if u.Opaque != "" || u.Host == "" {
-		return "（无法安全显示的代理地址）"
-	}
-	return u.Redacted()
 }
 
 // Warnings 返回不影响启动、但用户应该知道的问题。
@@ -419,10 +336,10 @@ func (c *Config) Warnings() []string {
 // 而 vpn 的测试又要读配置。取值集合必须与 wireguard.ParseListenHost 一致。
 func validateListenHost(s string) error {
 	switch s {
-	case "", "loopback", "local", "127.0.0.1", "all", "any", "0.0.0.0":
+	case "", "loopback", "all":
 		return nil
 	default:
-		return fmt.Errorf("wireguard.listen_host 只能是 loopback 或 all，收到 %q", s)
+		return errors.New("wireguard.listen_host 只能是 loopback 或 all")
 	}
 }
 
@@ -433,226 +350,15 @@ func validateHost(field, host string) error {
 		return nil
 	}
 	if _, _, err := net.SplitHostPort(host); err == nil {
-		return fmt.Errorf("%s 里带了端口: %q（端口请写在 port 字段）", field, host)
+		return fmt.Errorf("%s 里带了端口（端口请写在 port 字段）", field)
 	}
 	for _, r := range host {
 		if r <= ' ' || r == '/' || r == '\\' {
-			return fmt.Errorf("%s 含非法字符: %q", field, host)
+			return fmt.Errorf("%s 含非法字符", field)
 		}
 	}
 	if strings.ContainsAny(host, "[]%@") {
-		return fmt.Errorf("%s 含非法字符（方括号、百分号或 @）: %q", field, host)
-	}
-	return nil
-}
-
-// PersistPrivateKey 把自动生成的 WireGuard 私钥写回配置文件。
-//
-// 已经有了就不覆盖：两个进程同时首启同一份配置时，后写的那个会让盘上的
-// 私钥与正在跑的那个进程内存里的不一致——之后所有对端配置都会失效。
-func PersistPrivateKey(path, key string) error {
-	return persistField(path, "wireguard", "private_key", key)
-}
-
-// PersistDeviceID 把设备标识写回配置文件（顶层字段）。
-func PersistDeviceID(path, id string) error {
-	return persistField(path, "", "device_id", id)
-}
-
-// persistField 就地替换配置里的一个字段，保留原有注释与文件权限。
-//
-// section 为空表示顶层字段，否则是段名（目前只有 wireguard）。两条入口只差
-// "在哪一段里找、找不到时往哪插"，机制共用一份——分成两个函数时漏改一处，
-// 就会出现"某个字段的写回不保注释"或"漏掉块写法校验"这类只在一条路径上
-// 出现的故障。
-//
-// 只在字段为空时写入：私钥与设备标识都是首次启动自举出来的，已有值必须保留
-// （两个进程同时首启同一份配置时，先写的那份才算数）。
-func persistField(path, section, field, value string) error {
-	if path == "" {
-		return fmt.Errorf("没有配置文件路径")
-	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(string(data), "\n")
-
-	start, end := 0, len(lines)
-	if section != "" {
-		if start, end, err = sectionRange(lines, section, path); err != nil {
-			return err
-		}
-	}
-
-	for i := start; i < end; i++ {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		// 顶层字段必须顶格，段里的字段必须缩进。不按缩进区分，就会把别的
-		// 段里的同名字段当成目标。
-		if (section == "") != (indentOf(line) == 0) {
-			continue
-		}
-		if !strings.HasPrefix(trimmed, field+":") {
-			continue
-		}
-		if existingValue(line) != "" {
-			return nil
-		}
-		// 保留行尾注释：样例文件里 private_key 那行就带着说明，写回时丢掉它
-		// 等于破坏用户手写的配置。
-		lines[i] = line[:indentOf(line)] + field + ": " + value + commentOf(line)
-		return writePreservingMode(path, fi, lines)
-	}
-
-	if section == "" {
-		at := topLevelInsertAt(lines)
-		return writePreservingMode(path, fi, insertLine(lines, at, field+": "+value))
-	}
-	if start < 0 {
-		// 完全没有这一段：追加一段。
-		return writePreservingMode(path, fi, append(lines, section+":", "  "+field+": "+value))
-	}
-	// 有这一段但没有该字段：插到段尾，跳过段末的空行。
-	at := end
-	for at > start+1 && strings.TrimSpace(lines[at-1]) == "" {
-		at--
-	}
-	return writePreservingMode(path, fi, insertLine(lines, at, "  "+field+": "+value))
-}
-
-// topLevelInsertAt 返回顶层字段插在哪一行：开头是注释或空行时插在它们之后，
-// 否则插在第一条顶格键之后。
-func topLevelInsertAt(lines []string) int {
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if indentOf(line) == 0 {
-			return i + 1
-		}
-	}
-	return len(lines)
-}
-
-// sectionRange 返回某一段的行区间 [start, end)：段头那行到下一个顶格键之前。
-//
-// 段不存在时返回 (-1, -1, nil)，由调用方决定怎么补。段头写成流式
-// （wireguard: {peer_address: ...}）时返回错误：往它后面插一行缩进两格的字段
-// 会让整份文件解析不过，那种写法必须拒绝写回（调用方按警告处理）。
-func sectionRange(lines []string, section, path string) (int, int, error) {
-	start := -1
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") || indentOf(line) != 0 {
-			continue
-		}
-		if start < 0 {
-			if !strings.HasPrefix(trimmed, section+":") {
-				continue
-			}
-			if !isBlockMapping(trimmed, section+":") {
-				return -1, -1, fmt.Errorf("%s 的 %s 段不是块写法（%q）：把那一行展开成\n%s:\n  字段: 值\n再启动，或手工填好要写回的字段", path, section, trimmed, section)
-			}
-			start = i
-			continue
-		}
-		return start, i, nil
-	}
-	if start < 0 {
-		return -1, -1, nil
-	}
-	return start, len(lines), nil
-}
-
-// indentOf 返回行首缩进宽度（空格与制表符各算一个字符）。
-func indentOf(line string) int { return len(line) - len(strings.TrimLeft(line, " \t")) }
-
-// insertLine 在 at 处插入一行。
-func insertLine(lines []string, at int, line string) []string {
-	out := make([]string, 0, len(lines)+1)
-	out = append(out, lines[:at]...)
-	out = append(out, line)
-	return append(out, lines[at:]...)
-}
-
-// isBlockMapping 判断一行 "key:" 是不是块映射的开头。
-//
-// "wireguard:" 与 "wireguard:   # 说明" 都是；"wireguard: {peer_address: ...}"
-// 这种流式写法不是——往它后面插一行缩进两格的字段，整份文件就解析不过了，
-// 所以那种写法必须拒绝写回（由调用方按警告处理），而不是写坏用户的配置。
-func isBlockMapping(line, prefix string) bool {
-	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-	return rest == "" || strings.HasPrefix(rest, "#")
-}
-
-// existingValue 取出某一行里字段的当前值（去掉行尾注释与引号）。
-func existingValue(line string) string {
-	i := strings.Index(line, ":")
-	if i < 0 {
-		return ""
-	}
-	rest := line[i+1:]
-	if j := strings.Index(rest, "#"); j >= 0 {
-		rest = rest[:j]
-	}
-	return strings.Trim(strings.TrimSpace(rest), "\"'")
-}
-
-// commentOf 取出行尾注释（连前面的分隔空格），没有注释就返回空串。
-//
-// 只用于我们自己改写的那一行：值里不可能出现 #（是 base64 或十六进制）。
-func commentOf(line string) string {
-	i := strings.Index(line, "#")
-	if i < 0 {
-		return ""
-	}
-	return " " + strings.TrimSpace(line[i:])
-}
-
-// writePreservingMode 写回文件并保持原有权限。
-func writePreservingMode(path string, fi os.FileInfo, lines []string) error {
-	content := strings.Join(lines, "\n")
-	// 兜底：这一层是手写的行编辑，改完必须仍然是能解析的 YAML。解析不过就
-	// 放弃写回——宁可这一项没写进去（下次启动再生成），也不能把用户的配置
-	// 文件写坏到下一次启动直接以“解析配置文件失败”退出。
-	var probe yaml.Node
-	if err := yaml.Unmarshal([]byte(content), &probe); err != nil {
-		return fmt.Errorf("写回 %s 被拒绝：改动后解析不过（%w）", path, err)
-	}
-	// 临时名带 pid：两个进程同时写回时不会互相截断成半截 YAML。
-	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
-	if err != nil {
-		return fmt.Errorf("写入 %s: %w", tmp, err)
-	}
-	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("写入 %s: %w", tmp, err)
-	}
-	// 落盘之后再改名：这份文件里已经有新生成的私钥与设备标识，rename 之后
-	// 才崩溃的话，用户拿到的是一个"看起来成功、内容没落盘"的配置。
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("写入 %s: %w", tmp, err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("写入 %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("替换 %s: %w", path, err)
+		return fmt.Errorf("%s 含非法字符（方括号、百分号或 @）", field)
 	}
 	return nil
 }

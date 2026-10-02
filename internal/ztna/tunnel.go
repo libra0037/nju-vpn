@@ -7,10 +7,11 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -43,13 +44,16 @@ const (
 	// 单帧包长上限是 65535，而按声明长度切包时切剩的半个包要等下一帧补齐：
 	// 对端只要每帧都"比声明的少一字节"，这个缓冲就会一直长下去（心跳判死前
 	// 有 45 秒窗口，速率受 TCP 发送窗口限制）。给个上限，超过即按协议错误断开。
-	maxStreamBytes = 4 * 0xFFFF
+	maxStreamBytes       = 4 * 0xFFFF
+	dataWriteTimeout     = 5 * time.Second
+	authRetryLogInterval = 10 * time.Second
 )
 
 // tunnelConn 是一条 L3 隧道连接：TLS 之上跑本协议的帧。
 type tunnelConn struct {
 	node string
 	conn net.Conn
+	raw  net.Conn
 	r    *bufio.Reader
 
 	ep    *l3.Endpoint
@@ -61,8 +65,9 @@ type tunnelConn struct {
 	connectionID string
 	signKey      []byte
 
-	vipMu sync.RWMutex
-	vip   net.IP
+	initialAddr net.IP // 仅在发布前保存握手结果；启动后地址的权威为 Endpoint。
+	unregister  func()
+	workers     sync.WaitGroup
 
 	writeMu sync.Mutex
 
@@ -70,8 +75,12 @@ type tunnelConn struct {
 	closeCh   chan struct{}
 	closeErr  atomic.Pointer[error]
 
-	authWake     chan struct{}
-	heartbeatGap atomic.Int32
+	authWake       chan struct{}
+	heartbeatGap   atomic.Int32
+	rejectMu       sync.Mutex
+	rejected       [8]uint64
+	rejectLogAt    time.Time
+	authRetryLogAt atomic.Int64
 
 	logf func(format string, args ...any)
 }
@@ -89,57 +98,86 @@ type tunnelOptions struct {
 	// HandshakeTimeout 覆盖握手阶段的默认上限；0 表示用 defaultHandshakeTimeout。
 	// 生产调用不设它，只有测试会传一个很短的值。
 	HandshakeTimeout time.Duration
-	// Pins 认节点证书的身份；nil 表示不校验（只有直接构造 tunnelOptions 的
-	// 测试会这样）。
-	Pins *nodePins
+	Pins             *nodeSPKIPins
 }
 
-// dialTunnel 建立一条隧道连接并完成握手。返回时两个后台协程已经在跑。
+// dialTunnel 只完成握手，返回尚未注册回调、尚未启动任务的连接。
 func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
+	// 重连直接拨号时，TLS 与协议握手仍共用原来的整体期限。
+	ctx, cancel := context.WithTimeout(ctx, opts.handshakeTimeout())
+	defer cancel()
+	conn, err := dialNodeTLS(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return handshakeTunnel(ctx, opts, conn)
+}
+
+func (opts tunnelOptions) handshakeTimeout() time.Duration {
+	if opts.HandshakeTimeout > 0 {
+		return opts.HandshakeTimeout
+	}
+	return defaultHandshakeTimeout
+}
+
+// dialNodeTLS 不发送 SID；选点只证明 TLS 可用且身份在配置白名单内。
+// 成功时交出可继续做协议握手的连接，失败时关闭底层连接。
+func dialNodeTLS(ctx context.Context, opts tunnelOptions) (*tls.Conn, error) {
+	if opts.Pins == nil || len(opts.Pins.allowed) == 0 {
+		return nil, ErrNodeUntrusted
+	}
+	ctx, cancel := context.WithTimeout(ctx, opts.handshakeTimeout())
+	defer cancel()
 	raw, err := dialWithContext(ctx, opts.Dial, "tcp", opts.Node)
 	if err != nil {
-		return nil, fmt.Errorf("连接隧道节点 %s: %w", opts.Node, err)
+		return nil, dial.Wrap("连接隧道节点", err)
 	}
 	tlsConfig := &tls.Config{
 		ServerName:         opts.Server,
 		InsecureSkipVerify: true, // 链与名称都不可用（自签、CN=sdp），身份由指纹认
+		MinVersion:         tls.VersionTLS12,
 	}
-	if opts.Pins != nil {
-		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("节点 %s 没有出示证书", opts.Node)
-			}
-			return opts.Pins.verify(opts.Node, rawCerts[0])
-		}
-	}
+	tlsConfig.VerifyConnection = opts.Pins.verify
 	tlsConn := tls.Client(raw, tlsConfig)
 
-	// 握手阶段整体带期限：TLS 与协议握手都算在内，成功后再清掉，否则会把
-	// 之后的数据面读写一起拖死。
-	timeout := opts.HandshakeTimeout
-	if timeout <= 0 {
-		timeout = defaultHandshakeTimeout
-	}
-	deadline := time.Now().Add(timeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
+	deadline, _ := ctx.Deadline()
 	if err := tlsConn.SetDeadline(deadline); err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("设置握手期限: %w", err)
+		return nil, dial.Wrap("设置节点 TLS 期限", err)
 	}
-	// ctx 取消要能立刻打断正在进行的读：Go 没有别的办法叫醒一次阻塞的 Read。
-	stopCancelWatch := watchCancel(ctx, tlsConn)
-	defer stopCancelWatch()
-
+	// 标准库 HandshakeContext 负责取消 TLS 握手，无需另设取消监听。
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("隧道节点 TLS 握手: %w", err)
+		return nil, dial.Wrap("隧道节点 TLS 握手", err)
 	}
+	if err := ctx.Err(); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		_ = raw.Close()
+		return nil, dial.Wrap("清除节点 TLS 期限", err)
+	}
+	return tlsConn, nil
+}
+
+// handshakeTunnel 接管已验证的 TLS 连接；失败时关闭，成功时交给 tunnelConn。
+func handshakeTunnel(ctx context.Context, opts tunnelOptions, tlsConn *tls.Conn) (*tunnelConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, opts.handshakeTimeout())
+	defer cancel()
+	raw := tlsConn.NetConn()
+	deadline, _ := ctx.Deadline()
+	if err := tlsConn.SetDeadline(deadline); err != nil {
+		_ = raw.Close()
+		return nil, dial.Wrap("设置协议握手期限", err)
+	}
+	stopCancelWatch := watchCancel(ctx, tlsConn)
+	defer stopCancelWatch()
 
 	t := &tunnelConn{
 		node:         opts.Node,
 		conn:         tlsConn,
+		raw:          raw,
 		ep:           opts.Endpoint,
 		flows:        newFlowTable(),
 		table:        opts.Table,
@@ -156,30 +194,45 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 	}
 
 	br := bufio.NewReader(tlsConn)
-	if _, err := tlsConn.Write(handshakeRequest(t.sid)); err != nil {
-		_ = tlsConn.Close()
+	request, err := handshakeRequest(t.sid)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if _, err := tlsConn.Write(request); err != nil {
+		_ = raw.Close()
 		return nil, fmt.Errorf("发送握手: %w", err)
 	}
 	res, err := readHandshake(br)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	// 握手已经结束：先停掉取消监听再清期限。反过来会留下一个窗口——监听器
 	// 把刚清掉的期限又设成“现在”，数据面从第一包起就全废。
 	stopCancelWatch()
-	_ = tlsConn.SetDeadline(time.Time{})
+	if err := ctx.Err(); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		raw.Close()
+		return nil, dial.Wrap("清除握手期限", err)
+	}
 
 	t.r = br
-	t.setVIP(res.VIP)
-	t.ep.SetLocalAddr(res.VIP)
-
-	t.ep.SetUplink(t.Send)
-	go t.readLoop()
-	go t.heartbeatLoop()
-	go t.authLoop()
-	t.logf("隧道已建立: 节点 %s，地址 %s", t.node, t.vip.String())
+	t.initialAddr = res.VIP
 	return t, nil
+}
+
+// 调用方在会话锁内接纳连接后启动，关闭与接纳因此不会交错。
+func (t *tunnelConn) start() {
+	t.ep.SetLocalAddr(t.initialAddr)
+	t.initialAddr = nil
+	t.unregister = t.ep.SetUplink(t.Send)
+	t.workers.Go(t.readLoop)
+	t.workers.Go(t.heartbeatLoop)
+	t.workers.Go(t.authLoop)
 }
 
 // watchCancel 让 ctx 的取消能打断一次阻塞中的读写。
@@ -188,15 +241,17 @@ func dialTunnel(ctx context.Context, opts tunnelOptions) (*tunnelConn, error) {
 // 的调用会立刻以超时错误返回。返回的函数停止监听，可安全重复调用。
 func watchCancel(ctx context.Context, conn net.Conn) func() {
 	done := make(chan struct{})
+	joined := make(chan struct{})
 	var once sync.Once
 	go func() {
+		defer close(joined)
 		select {
 		case <-ctx.Done():
 			_ = conn.SetDeadline(time.Now())
 		case <-done:
 		}
 	}()
-	return func() { once.Do(func() { close(done) }) }
+	return func() { once.Do(func() { close(done) }); <-joined }
 }
 
 // Done 在连接关闭时关闭，供重连逻辑等待。
@@ -211,48 +266,71 @@ func (t *tunnelConn) Err() error {
 }
 
 func (t *tunnelConn) VIP() net.IP {
-	t.vipMu.RLock()
-	defer t.vipMu.RUnlock()
-	return t.vip
-}
-
-func (t *tunnelConn) setVIP(ip net.IP) {
-	t.vipMu.Lock()
-	t.vip = append(net.IP(nil), ip...)
-	t.vipMu.Unlock()
+	return t.ep.LocalAddr()
 }
 
 func (t *tunnelConn) write(buf []byte) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	_, err := t.conn.Write(buf)
-	return err
+	select {
+	case <-t.closeCh:
+		return net.ErrClosed
+	default:
+	}
+	if err := t.conn.SetWriteDeadline(time.Now().Add(dataWriteTimeout)); err != nil {
+		err = dial.Wrap("设置隧道写期限", err)
+		t.close(err)
+		return err
+	}
+	n, err := t.conn.Write(buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		t.close(dial.Wrap("隧道写入", err))
+	}
+	return dial.Wrap("隧道写入", err)
 }
 
 // Send 是上行入口：承载层每来一个 IP 包都会调它。
 //
 // 它不做 I/O 之外的等待：命中资源表之后要么直接发出去，要么缓存首包
 // 并唤醒鉴权协程。资源表没命中的包直接丢掉——发给服务端也会被丢。
-func (t *tunnelConn) Send(pkt []byte) error {
+func (t *tunnelConn) Send(pkt []byte) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			t.recordRejection(resultErr)
+		}
+	}()
 	info, err := parsePacket(pkt)
+	if err != nil {
+		if info.fragmented() {
+			t.flows.rejectFragment(info.fragment)
+		}
+		return err
+	}
+	if len(pkt) > maxPacketBytes {
+		if info.fragmented() {
+			t.flows.rejectFragment(info.fragment)
+		}
+		return ErrPacketTooLarge
+	}
+	var appID string
+	if info.offset == 0 {
+		var ok bool
+		appID, _, ok = t.table.match(info.dstIP, protoName(info.proto), info.dstPort)
+		if !ok {
+			if info.fragmented() {
+				t.flows.rejectFragment(info.fragment)
+			}
+			return ErrResourceUnmatched
+		}
+	}
+	token, queued, err := t.flows.queuePacket(info, appID, pkt)
 	if err != nil {
 		return err
 	}
-	proto := protoName(info.proto)
-	appID, groupID, ok := t.table.match(info.dstIP, proto, info.dstPort)
-	if !ok {
-		return fmt.Errorf("目标不在资源表内: %s %s:%d", proto, info.dstIP, info.dstPort)
-	}
-
-	token, state := t.flows.sendState(info.key, appID, groupID)
-	switch state {
-	case flowFailed:
-		return fmt.Errorf("该流鉴权失败: %s", info.key)
-	case flowReady:
-		// 有令牌，直接发。
-	default:
-		// 还没拿到令牌（或流刚建）：先缓存首包，让 authLoop 去申请。
-		t.flows.cache(info.key, pkt)
+	if queued {
 		t.wakeAuth()
 		return nil
 	}
@@ -261,6 +339,40 @@ func (t *tunnelConn) Send(pkt []byte) error {
 		return err
 	}
 	return t.write(frame)
+}
+
+// 拒包详情不可用作限速键；有限类别只带累计数量，不输出包地址或服务端文案。
+func (t *tunnelConn) recordRejection(err error) {
+	reason, label := 0, "链路或会话不可用"
+	var protocolErr *ProtocolError
+	switch {
+	case errors.Is(err, ErrResourceUnmatched):
+		reason, label = 1, "资源表外"
+	case errors.Is(err, ErrFlowRejected):
+		reason, label = 2, "流鉴权失败"
+	case errors.Is(err, ErrPendingFull):
+		reason, label = 3, "待鉴权缓存已满"
+	case errors.Is(err, ErrFlowTableFull):
+		reason, label = 4, "流表已满"
+	case errors.Is(err, ErrFragmentMissing):
+		reason, label = 5, "分片关联不存在或过期"
+	case errors.Is(err, ErrFragmentOrder):
+		reason, label = 6, "分片乱序或重叠"
+	case errors.Is(err, ErrFragmentFull) || errors.Is(err, ErrPacketTooLarge) || errors.As(err, &protocolErr):
+		reason, label = 7, "报文格式或容量超限"
+	}
+	now := time.Now()
+	t.rejectMu.Lock()
+	t.rejected[reason]++
+	count := t.rejected[reason]
+	report := t.rejectLogAt.IsZero() || now.Sub(t.rejectLogAt) >= 10*time.Second
+	if report {
+		t.rejectLogAt = now
+	}
+	t.rejectMu.Unlock()
+	if report && t.logf != nil {
+		t.logf("上行拒绝：%s，累计 %d 个包", label, count)
+	}
 }
 
 func (t *tunnelConn) wakeAuth() {
@@ -273,9 +385,13 @@ func (t *tunnelConn) wakeAuth() {
 func (t *tunnelConn) readLoop() {
 	var stream []byte
 	for {
+		if err := t.conn.SetReadDeadline(time.Now().Add(heartbeatInterval * heartbeatMissLimit)); err != nil {
+			t.close(dial.Wrap("设置隧道读期限", err))
+			return
+		}
 		fr, err := readFrame(t.r)
 		if err != nil {
-			t.close(fmt.Errorf("隧道读取: %w", err))
+			t.close(dial.Wrap("隧道读取", err))
 			return
 		}
 		// 收到任何服务端帧都算对端还活着。本地写成功不算：对端静默消失
@@ -308,11 +424,10 @@ func (t *tunnelConn) readLoop() {
 
 // appendStream 把一帧的载荷接进下行累计缓冲，超过上限即报协议错误。
 func appendStream(stream, payload []byte) ([]byte, error) {
-	stream = append(stream, payload...)
-	if len(stream) > maxStreamBytes {
-		return nil, &ProtocolError{What: "下行累计缓冲超过上限", Got: fmt.Sprintf("%d 字节", len(stream))}
+	if len(payload) > maxStreamBytes-len(stream) {
+		return nil, &ProtocolError{What: "下行累计缓冲超过上限"}
 	}
-	return stream, nil
+	return append(stream, payload...), nil
 }
 
 // handleAuthResp 记录令牌并把该流缓存的包补发出去。
@@ -320,34 +435,61 @@ func appendStream(stream, payload []byte) ([]byte, error) {
 // 注意状态字节为 0 也可能是失败：会话失效时服务端正是这么回的。
 func (t *tunnelConn) handleAuthResp(status byte, payload []byte) {
 	var resp struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			ConnectToken  string `json:"connectToken"`
-			ConntrackHash uint64 `json:"conntrackHash"`
+		Code *int `json:"code"`
+		Data struct {
+			ConnectToken  string  `json:"connectToken"`
+			ConntrackHash *uint64 `json:"conntrackHash"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
-		t.logf("鉴权响应无法解析: %v", err)
+		t.close(&ProtocolError{What: "鉴权响应格式非法"})
 		return
 	}
-	if status != 0 || resp.Code != 0 {
-		t.logf("鉴权被拒: status=%d code=%d message=%s", status, resp.Code, resp.Message)
-		t.flows.completeAuth(resp.Data.ConntrackHash, "", fmt.Errorf("鉴权被拒（%d）", resp.Code))
+	if resp.Code == nil || resp.Data.ConntrackHash == nil || *resp.Data.ConntrackHash == 0 {
+		t.close(&ProtocolError{What: "鉴权响应缺少 code 或 conntrackHash"})
 		return
 	}
-	_, pending := t.flows.completeAuth(resp.Data.ConntrackHash, resp.Data.ConnectToken, nil)
+	if status == authRetryStatus && t.flows.retryAuth(*resp.Data.ConntrackHash) {
+		t.logAuthRetry()
+		return
+	}
+	if status != 0 || *resp.Code != 0 {
+		t.flows.completeAuth(*resp.Data.ConntrackHash, "", ErrFlowRejected)
+		return
+	}
+	if len(resp.Data.ConnectToken) == 0 || len(resp.Data.ConnectToken) > 255 {
+		t.close(&ProtocolError{What: "鉴权响应令牌长度非法"})
+		return
+	}
+	_, pending := t.flows.completeAuth(*resp.Data.ConntrackHash, resp.Data.ConnectToken, nil)
 	if len(pending) == 0 {
 		return
 	}
-	frame, err := encodeDataFrame(resp.Data.ConnectToken, pending...)
-	if err != nil {
-		t.logf("补发首包失败: %v", err)
+	for len(pending) > 0 {
+		n := min(authBatchSize, len(pending))
+		frame, err := encodeDataFrame(resp.Data.ConnectToken, pending[:n]...)
+		if err != nil {
+			t.close(err)
+			return
+		}
+		if err := t.write(frame); err != nil {
+			t.close(err)
+			return
+		}
+		pending = pending[n:]
+	}
+}
+
+func (t *tunnelConn) logAuthRetry() {
+	if t.logf == nil {
 		return
 	}
-	if err := t.write(frame); err != nil {
-		t.close(err)
+	now := time.Now().UnixNano()
+	last := t.authRetryLogAt.Load()
+	if now-last < int64(authRetryLogInterval) || !t.authRetryLogAt.CompareAndSwap(last, now) {
+		return
 	}
+	t.logf("逐流鉴权暂未就绪（状态 0x%02X），已安排 %s 后的一次重试", authRetryStatus, flowAuthRetryDelay)
 }
 
 func (t *tunnelConn) handleVIPUpdate(status byte, payload []byte) {
@@ -365,9 +507,8 @@ func (t *tunnelConn) handleVIPUpdate(status byte, payload []byte) {
 		}
 		// 两个值一起更新：承载层的映射读端点上的地址（上下行改写都用它），
 		// VIP 供状态与后续判断读。它们描述的是同一个事实，不能只改一半。
-		t.setVIP(v4)
 		t.ep.SetLocalAddr(v4)
-		t.logf("服务端下发地址: %s（数据面已跟着切）", v4)
+		t.logf("服务端已更新隧道地址")
 		return
 	}
 }
@@ -424,12 +565,11 @@ func (t *tunnelConn) dispatchAuth() bool {
 			t.close(err)
 			return false
 		}
-		t.flows.markAuthSent(f.key)
 	}
 	return true
 }
 
-func (t *tunnelConn) sendAuthRequest(f *flow) error {
+func (t *tunnelConn) sendAuthRequest(f authFlow) error {
 	body, err := t.buildAuthRequest(f)
 	if err != nil {
 		return err
@@ -486,7 +626,7 @@ type authRequestJSON struct {
 // buildAuthRequest 组装逐流鉴权请求。
 //
 // 签名字段单独拼在末尾：签名覆盖的是不含它的那段 JSON 字节。
-func (t *tunnelConn) buildAuthRequest(f *flow) ([]byte, error) {
+func (t *tunnelConn) buildAuthRequest(f authFlow) ([]byte, error) {
 	ipProto := int(protoTCP)
 	switch f.key.proto {
 	case protoUDP:
@@ -545,8 +685,16 @@ func (t *tunnelConn) close(err error) {
 			t.closeErr.Store(&err)
 		}
 		close(t.closeCh)
-		t.ep.ClearUplink()
+		if t.unregister != nil {
+			t.unregister()
+		}
+		if t.raw != nil {
+			_ = t.raw.Close()
+		}
 		_ = t.conn.Close()
+		if t.flows != nil {
+			t.flows.clear()
+		}
 		if err != nil {
 			t.logf("隧道断开: %v", err)
 		}
@@ -556,5 +704,6 @@ func (t *tunnelConn) close(err error) {
 // Close 供重连逻辑使用：关掉连接并注销上行回调。
 func (t *tunnelConn) Close() error {
 	t.close(nil)
+	t.workers.Wait()
 	return nil
 }

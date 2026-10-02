@@ -95,7 +95,12 @@ func TestLogFileNameDistinguishesInstance(t *testing.T) {
 // startFakeService 起一个只按脚本应答的"服务进程"，用来测命令行的分支。
 func startFakeService(t *testing.T, handle func(ipc.Request) ipc.Response) string {
 	t.Helper()
-	endpoint := filepath.Join(t.TempDir(), "njuvpn-test.sock")
+	return startFakeServiceFor(t, filepath.Join(t.TempDir(), "fixture.yaml"), handle)
+}
+
+func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc.Response) string {
+	t.Helper()
+	endpoint := ipc.EndpointFor(path)
 	ln, err := ipc.Listen(endpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +121,11 @@ func startFakeService(t *testing.T, handle func(ipc.Request) ipc.Response) strin
 					if err != nil {
 						return
 					}
-					if err := ipc.WriteResponse(conn, handle(req)); err != nil {
+					write := ipc.WriteResponse
+					if req.Command == ipc.CmdResources {
+						write = ipc.WriteResourcesResponse
+					}
+					if err := write(conn, handle(req)); err != nil {
 						return
 					}
 				}

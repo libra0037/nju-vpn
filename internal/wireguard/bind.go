@@ -23,21 +23,25 @@ const (
 // ParseListenHost 解析配置里的监听地址写法。
 func ParseListenHost(s string) (ListenHost, error) {
 	switch s {
-	case "", "loopback", "local", "127.0.0.1":
+	case "", "loopback":
 		return ListenLoopback, nil
-	case "all", "any", "0.0.0.0":
+	case "all":
 		return ListenAll, nil
 	default:
-		return ListenLoopback, fmt.Errorf("wireguard.listen_host 只能是 loopback 或 all，收到 %q", s)
+		return ListenLoopback, fmt.Errorf("wireguard.listen_host 只能是 loopback 或 all")
 	}
 }
 
 // newBind 按监听范围创建绑定。
 func newBind(host ListenHost) conn.Bind {
-	if host == ListenAll {
+	switch host {
+	case ListenAll:
 		return conn.NewDefaultBind()
+	case ListenLoopback:
+		return &loopbackBind{}
+	default:
+		panic("非法 WireGuard 监听范围")
 	}
-	return &loopbackBind{}
 }
 
 // loopbackBind 是只绑定回环地址的最小 conn.Bind 实现。

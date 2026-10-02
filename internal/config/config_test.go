@@ -11,7 +11,13 @@ import (
 // writeConfig 写一份配置文件，默认给 0600 权限。
 func writeConfig(t *testing.T, body string, mode os.FileMode) string {
 	t.Helper()
+	if !strings.Contains(body, "tls:") {
+		body += "\ntls:\n  pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\n"
+	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte(body), mode); err != nil {
 		t.Fatal(err)
 	}
@@ -215,15 +221,10 @@ func TestLoadForClientReportsUnreadableConfig(t *testing.T) {
 	}
 }
 
-func TestLoadForClientReadsEndpoint(t *testing.T) {
-	body := validConfig + "ipc:\n  endpoint: /tmp/custom.sock\n"
-	path := writeConfig(t, body, 0o600)
-	cfg, err := LoadForClient(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.IPC.Endpoint; got != "/tmp/custom.sock" {
-		t.Errorf("端点 = %q", got)
+func TestCustomEndpointRejected(t *testing.T) {
+	path := writeConfig(t, validConfig+"ipc:\n  endpoint: /tmp/custom.sock\n", 0600)
+	if _, err := LoadForClient(path); err == nil {
+		t.Fatal("旧 IPC 配置必须被拒绝")
 	}
 }
 
@@ -270,80 +271,5 @@ func TestDefaultPath(t *testing.T) {
 				t.Errorf("路径里不能有换行: %q", got)
 			}
 		})
-	}
-}
-
-// TestRedactProxyHidesPassword 验证代理地址里的口令不会经状态与日志漏出。
-//
-// 常态（带协议前缀）只该抹掉口令；没有协议前缀时 Go 会把 "alice:pw@host"
-// 解析成 scheme=alice + opaque 主体，Redacted() 对这种形式原样返回，
-// 所以必须整体换成占位符。
-func TestRedactProxyHidesPassword(t *testing.T) {
-	cases := []struct {
-		name  string
-		proxy string
-	}{
-		{"带协议前缀", "http://alice:s3cr3t@127.0.0.1:7897"},
-		{"带协议的 socks5", "socks5://alice:s3cr3t@127.0.0.1:1080"},
-		{"没有协议前缀", "alice:s3cr3t@127.0.0.1:7897"},
-		{"只有协议前缀", "http://"},
-		{"解析不了的端口", "http://alice:s3cr3t@127.0.0.1:79x7"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := RedactProxy(c.proxy)
-			if strings.Contains(got, "s3cr3t") {
-				t.Errorf("RedactProxy(%q) = %q，口令漏了出来", c.proxy, got)
-			}
-		})
-	}
-
-	if got := RedactProxy(""); got != "" {
-		t.Errorf("空地址应当原样返回空串，得到 %q", got)
-	}
-	if got := RedactProxy("http://alice:s3cr3t@127.0.0.1:7897"); !strings.Contains(got, "127.0.0.1:7897") {
-		t.Errorf("常态应当保留主机与端口，得到 %q", got)
-	}
-}
-
-// TestParseSHA256Fingerprints 验证指纹文本的三种写法都能解析，写错时报错。
-func TestParseSHA256Fingerprints(t *testing.T) {
-	const colon = "21:54:05:9D:C8:84:4C:72:D8:F9:32:95:2C:D2:2E:04:9A:37:15:46:C4:E6:D1:DE:EB:5E:D1:BB:47:D1:57:54"
-	plain := strings.ReplaceAll(strings.ToLower(colon), ":", "")
-	if got, err := ParseSHA256Fingerprints([]string{colon, plain}); err != nil || len(got) != 2 {
-		t.Fatalf("合法指纹应当解析成功，得到 %v（%d 条）", err, len(got))
-	}
-	if got, err := ParseSHA256Fingerprints([]string{colon, plain}); err == nil && got[0] != got[1] {
-		t.Errorf("带分隔符与不带分隔符应当解析成同一个值")
-	}
-
-	for _, bad := range []string{"", "zz", "21:54", strings.Repeat("AA", 31), strings.Repeat("AA", 33)} {
-		if _, err := ParseSHA256Fingerprints([]string{bad}); err == nil {
-			t.Errorf("%q 不是合法指纹，应当报错", bad)
-		} else if !strings.Contains(err.Error(), bad) && bad != "" {
-			t.Errorf("错误里应当带上写坏的原值 %q，得到 %v", bad, err)
-		}
-	}
-}
-
-// TestNodePinHashesFallsBackToBuiltin 验证没有配置指纹时用内置的实测值，
-// 配了就用配置的（此时 ztna 侧会按严格模式处理）。
-func TestNodePinHashesFallsBackToBuiltin(t *testing.T) {
-	empty := &Config{}
-	got, err := empty.NodePinHashes()
-	if err != nil {
-		t.Fatalf("内置指纹应当可用: %v", err)
-	}
-	if len(got) != len(defaultPinnedNodeSHA256) {
-		t.Fatalf("内置指纹条数 = %d，期望 %d", len(got), len(defaultPinnedNodeSHA256))
-	}
-
-	custom := &Config{TLS: TLS{PinnedNodeSHA256: []string{strings.Repeat("AB", 32)}}}
-	got, err = custom.NodePinHashes()
-	if err != nil {
-		t.Fatalf("配置的指纹应当可用: %v", err)
-	}
-	if len(got) != 1 || got[0][0] != 0xAB {
-		t.Errorf("配了指纹就不该再回退到内置值，得到 %v", got)
 	}
 }

@@ -20,36 +20,30 @@ func (e *ErrAuthRequired) Error() string { return "需要二次验证: " + e.Hin
 
 // ErrCodeRejected 表示服务端拒绝了本次登录（口令错误、验证码错误等）。
 type ErrCodeRejected struct {
-	Code    int
-	Message string
+	Code int
 }
 
 func (e *ErrCodeRejected) Error() string {
-	return fmt.Sprintf("服务端拒绝（%d）: %s", e.Code, e.Message)
+	return fmt.Sprintf("服务端拒绝（%d）", e.Code)
 }
 
 // ErrSessionGone 表示会话已经失效，需要重新登录。
 type ErrSessionGone struct {
-	Code    int
-	Message string
+	Code int
 }
 
 func (e *ErrSessionGone) Error() string {
-	return fmt.Sprintf("会话已失效（%d）: %s", e.Code, e.Message)
+	return fmt.Sprintf("会话已失效（%d）", e.Code)
 }
 
 // ProtocolError 表示服务端返回的内容不符合预期（长度不足、字段缺失等）。
 // 协议层任何时候都不 panic，取值失败一律返回它。
 type ProtocolError struct {
 	What string
-	Got  string
 }
 
 func (e *ProtocolError) Error() string {
-	if e.Got == "" {
-		return "协议错误: " + e.What
-	}
-	return fmt.Sprintf("协议错误: %s（收到 %q）", e.What, e.Got)
+	return "协议错误: " + e.What
 }
 
 // AsAuthRequired 判断错误链里是否有"需要二次验证"。

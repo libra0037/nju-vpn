@@ -37,6 +37,7 @@ func usage() {
   %s start [--trust]           建立隧道（必要时自动拉起服务进程）
   %s stop                      断开隧道，服务进程继续运行
   %s status [--check]          查看服务进程与隧道状态
+  %s resources                只打印当前会话的 VPN 资源列表
   %s trust                     把本机绑成授信终端（之后登录免二次验证）
   %s untrust [--all]           解除本机授信；--all 解除该账号下全部授信终端
   %s restart                   重启服务进程（改完配置后用它，不必手工杀进程）
@@ -48,7 +49,7 @@ func usage() {
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
   Windows  %%LOCALAPPDATA%%\njuvpn\config.yaml
-`, prog, prog, prog, prog, prog, prog, prog, prog, prog)
+`, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog)
 }
 
 func main() {
@@ -69,6 +70,8 @@ func main() {
 		err = cmdStop(args)
 	case "status":
 		err = cmdStatus(args)
+	case "resources":
+		err = cmdResources(args)
 	case "trust":
 		err = cmdTrust(args)
 	case "untrust":
@@ -88,6 +91,9 @@ func main() {
 	}
 
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintf(os.Stderr, "%s: %v\n", prog, err)
 		var ue *usageError
 		if errors.As(err, &ue) {
@@ -113,7 +119,10 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positional []string
 	for {
 		if err := fs.Parse(args); err != nil {
-			return nil, err
+			if errors.Is(err, flag.ErrHelp) {
+				return nil, err
+			}
+			return nil, &usageError{err.Error()}
 		}
 		args = fs.Args()
 		if len(args) == 0 {

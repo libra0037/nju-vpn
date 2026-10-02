@@ -9,10 +9,12 @@ package ztnatest
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -67,7 +69,7 @@ type Options struct {
 	Trusted    []string
 	TrustLimit int
 
-	// Apps 是资源表里发布的能力，留空则给一条覆盖 10.0.0.0/8 的全协议规则。
+	// Apps 是资源表里发布的能力，nil 给默认规则，空切片表示有效空列表。
 	Apps []App
 	// Nodes 是资源表里发布的隧道节点地址，留空则用本机监听地址。
 	Nodes []string
@@ -95,10 +97,16 @@ type Server struct {
 	sid         string
 	logoutCount int
 
-	smsSends     atomic.Int32
-	tunnelCount  atomic.Int32
-	authRequests atomic.Int32
-	heartbeats   atomic.Int32
+	smsSends      atomic.Int32
+	tunnelCount   atomic.Int32
+	authRequests  atomic.Int32
+	heartbeats    atomic.Int32
+	resourceCalls atomic.Int32
+	serveDone     chan struct{}
+	connections   map[*ownedConn]struct{}
+	handlers      sync.WaitGroup
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 // New 启动假服务端。
@@ -112,7 +120,7 @@ func New(opts Options) (*Server, error) {
 	if opts.TrustLimit == 0 {
 		opts.TrustLimit = 3
 	}
-	if len(opts.Apps) == 0 {
+	if opts.Apps == nil {
 		opts.Apps = []App{{ID: "app-l3", NodeGroupID: "ng1", AccessModel: "L3VPN", Protocol: "all", Host: "10.0.0.0/8", Port: "0"}}
 	}
 
@@ -130,12 +138,14 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		opts:    opts,
-		ln:      ln,
-		addr:    ln.Addr().String(),
-		rsa:     rsaKey,
-		trusted: append([]string(nil), opts.Trusted...),
-		sid:     "sid-cookie-value",
+		opts:        opts,
+		ln:          ln,
+		addr:        ln.Addr().String(),
+		rsa:         rsaKey,
+		trusted:     append([]string(nil), opts.Trusted...),
+		sid:         "sid-cookie-value",
+		serveDone:   make(chan struct{}),
+		connections: make(map[*ownedConn]struct{}),
 		tls: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
@@ -151,18 +161,56 @@ func (s *Server) Addr() string { return s.addr }
 
 // Dial 是一个拨号函数（与网络层 dial.DialFunc 同形）：不管目标写的是什么，
 // 都连到假服务端。目标与预期不符时报错，接线错误因此会立刻暴露。
-func (s *Server) Dial(network, addr string) (net.Conn, error) {
+func (s *Server) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" {
 		return nil, fmt.Errorf("假服务端只支持 tcp，收到 %q", network)
 	}
 	if addr != s.addr {
 		return nil, fmt.Errorf("拨号目标 %q 与假服务端 %q 不符", addr, s.addr)
 	}
-	return net.Dial("tcp", s.addr)
+	return (&net.Dialer{}).DialContext(ctx, "tcp", s.addr)
+}
+
+func (s *Server) SPKIPin() [sha256.Size]byte {
+	cert, err := x509.ParseCertificate(s.tls.Certificates[0].Certificate[0])
+	if err != nil {
+		panic(err)
+	}
+	return sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 }
 
 // Close 停止服务。
-func (s *Server) Close() error { return s.ln.Close() }
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.ln.Close()
+		<-s.serveDone
+		s.mu.Lock()
+		connections := make([]*ownedConn, 0, len(s.connections))
+		for c := range s.connections {
+			connections = append(connections, c)
+		}
+		s.mu.Unlock()
+		for _, c := range connections {
+			c.Close()
+		}
+		s.handlers.Wait()
+	})
+	return s.closeErr
+}
+
+func (s *Server) ResourceCalls() int { return int(s.resourceCalls.Load()) }
+
+type ownedConn struct {
+	net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (c *ownedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { close(c.done) })
+	return err
+}
 
 // Trusted 返回当前授信终端 id 列表。
 func (s *Server) Trusted() []string {
@@ -277,16 +325,25 @@ func selfSignedCert() (tls.Certificate, error) {
 
 // serve 接受连接：TLS 握手之后按第一个字节把控制面与隧道分开。
 func (s *Server) serve() {
+	defer close(s.serveDone)
 	for {
 		raw, err := s.ln.Accept()
 		if err != nil {
 			return
 		}
-		go s.handleConn(raw)
+		c := &ownedConn{Conn: raw, done: make(chan struct{})}
+		s.mu.Lock()
+		s.connections[c] = struct{}{}
+		s.mu.Unlock()
+		s.handlers.Go(func() {
+			defer c.Close()
+			defer func() { s.mu.Lock(); delete(s.connections, c); s.mu.Unlock() }()
+			s.handleConn(c)
+		})
 	}
 }
 
-func (s *Server) handleConn(raw net.Conn) {
+func (s *Server) handleConn(raw *ownedConn) {
 	tlsConn := tls.Server(raw, s.tls)
 	if err := tlsConn.Handshake(); err != nil {
 		tlsConn.Close()
@@ -303,7 +360,7 @@ func (s *Server) handleConn(raw net.Conn) {
 		return
 	}
 	conn := &bufferedConn{Conn: tlsConn, r: br}
-	http.Serve(&oneShotListener{conn: conn}, s.http)
+	http.Serve(&oneShotListener{conn: conn, done: raw.done}, s.http)
 }
 
 // bufferedConn 让 bufio 预读的字节不丢失。
@@ -318,10 +375,12 @@ func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 // 报告监听已关闭。http.Serve 会返回，但它已经派出去的那条连接照常处理完。
 type oneShotListener struct {
 	conn net.Conn
+	done <-chan struct{}
 }
 
 func (l *oneShotListener) Accept() (net.Conn, error) {
 	if l.conn == nil {
+		<-l.done
 		return nil, net.ErrClosed
 	}
 	c := l.conn
@@ -464,6 +523,7 @@ func (s *Server) routes() *http.ServeMux {
 		writeEnvelope(w, 0, "", map[string]any{"username": s.opts.Username, "isOnline": true})
 	})
 	mux.HandleFunc("/controller/v1/user/clientResource", func(w http.ResponseWriter, r *http.Request) {
+		s.resourceCalls.Add(1)
 		if !s.requireLogin(w) {
 			return
 		}

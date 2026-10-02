@@ -22,27 +22,8 @@ import (
 // 还占着那个端点）。
 var errStateUnknown = errors.New("服务进程没有回报状态")
 
-// clientConfig 是命令行客户端需要的配置。
-//
-// 显式指定的配置文件读不出来时直接失败：端点按配置文件路径派生，此时既算
-// 不出端点，回落默认值又会打到另一个实例上——stop 与 restart 会误伤别人的
-// 服务进程，比"命令用不了"糟得多。
-func clientConfig(configPath string) (*config.Config, error) {
-	cfg, err := config.LoadForClient(configPath)
-	if err == nil {
-		return cfg, nil
-	}
-	if configPath != "" {
-		return nil, fmt.Errorf("无法加载配置 %s: %w", configPath, err)
-	}
-	// 没显式指定路径时退一步：路径还是默认路径，只是内容读不出来或校验
-	// 不过。端点只依赖路径，仍然算得出来；服务进程若也是这个情形，它同样
-	// 起不来，命令会以"服务进程是否在运行"收场。
-	fmt.Fprintf(os.Stderr, "%s: 配置 %s 不可用: %v（按默认路径的端点继续）\n", prog, config.DefaultPath(), err)
-	fallback := &config.Config{}
-	fallback.SetSourcePath(config.DefaultPath())
-	return fallback, nil
-}
+// 登录命令需要凭据；状态、停止和资源查询只依赖实例路径。
+func clientConfig(path string) (*config.Config, error) { return config.LoadForClient(path) }
 
 // call 向服务进程发一条请求并返回响应。
 //
@@ -62,7 +43,13 @@ func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response
 	if err := ipc.WriteRequest(conn, req); err != nil {
 		return ipc.Response{}, fmt.Errorf("发送请求: %w", err)
 	}
-	resp, err := ipc.ReadResponse(bufio.NewReader(conn))
+	reader := bufio.NewReader(conn)
+	var resp ipc.Response
+	if req.Command == ipc.CmdResources {
+		resp, err = ipc.ReadResourcesResponse(reader)
+	} else {
+		resp, err = ipc.ReadResponse(reader)
+	}
 	if err != nil {
 		return ipc.Response{}, fmt.Errorf("读取响应: %w", err)
 	}
@@ -71,24 +58,21 @@ func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response
 
 // endpointOf 解析出 IPC 端点。
 //
-// 显式配置了 ipc.endpoint 就用它；否则按配置文件的路径派生。后者是多实例
-// 互不打架的关键：同一台机器上的每个实例各有一份配置文件，端点自然互不
-// 相同（见 ipc.EndpointFor）。规则只有一份，在 ipc 包里——服务进程算实例
-// 身份时用的是同一个函数。
+// 端点只由配置文件路径派生；服务与命令共用 ipc.EndpointFor，保证同一
+// 配置对应同一实例，不同配置互不占用端点。
 func endpointOf(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
-	return ipc.ResolveEndpoint(cfg.IPC.Endpoint, cfg.SourcePath())
+	return ipc.EndpointFor(cfg.SourcePath())
 }
 
-// endpointFor 是 clientConfig 加 endpointOf 的组合，供各命令使用。
+// endpointFor 供管理命令定位实例，不读取或修改配置内容。
 func endpointFor(configPath string) (string, error) {
-	cfg, err := clientConfig(configPath)
-	if err != nil {
-		return "", err
+	if configPath == "" {
+		configPath = config.DefaultPath()
 	}
-	return endpointOf(cfg), nil
+	return ipc.EndpointFor(configPath), nil
 }
 
 // serviceState 问服务进程当前处在什么状态。
@@ -122,6 +106,10 @@ func runCommand(name string, args []string, req ipc.Request, timeout time.Durati
 	}
 	resp, err := call(endpoint, req, timeout)
 	if err != nil {
+		if req.Command == ipc.CmdStop && errors.Is(err, ipc.ErrNotRunning) {
+			fmt.Println("服务进程未运行")
+			return nil
+		}
 		return err
 	}
 	return finish(endpoint, resp)
@@ -211,11 +199,21 @@ func readStdinLine() (string, error) {
 	if stdinReader == nil {
 		stdinReader = bufio.NewReader(os.Stdin)
 	}
-	line, err := stdinReader.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+	var line []byte
+	for {
+		part, err := stdinReader.ReadSlice('\n')
+		if len(line)+len(part) > 8192 {
+			return "", errors.New("输入行超过 8192 字节")
+		}
+		line = append(line, part...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil && (len(line) == 0 || !errors.Is(err, io.EOF)) {
+			return "", err
+		}
+		return strings.TrimRight(string(line), "\r\n"), nil
 	}
-	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // promptCode 从终端读验证码。

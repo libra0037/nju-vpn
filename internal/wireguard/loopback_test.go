@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -77,7 +76,7 @@ func (t *memoryTun) Write(bufs [][]byte, offset int) (int, error) {
 	return n, nil
 }
 
-func (t *memoryTun) MTU() (int, error)        { return 1420, nil }
+func (t *memoryTun) MTU() (int, error)        { return 1400, nil }
 func (t *memoryTun) Name() (string, error)    { return "memtun", nil }
 func (t *memoryTun) Events() <-chan tun.Event { return t.events }
 func (t *memoryTun) BatchSize() int           { return 1 }
@@ -123,9 +122,6 @@ func freeUDPPort(t *testing.T) int {
 // TestLoopbackCarriesPacketsBothWays 是最重要的一条测试：
 // 它证明承载层真的能搬运数据，而不只是"配置成功"。
 func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 的 ring bind 需要管理员权限，跳过回环测试")
-	}
 
 	const (
 		peerIP   = "10.66.66.2"   // 分配给对端的地址
@@ -169,7 +165,7 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 
 	port := freeUDPPort(t)
 	server, err := NewDevice(DeviceOptions{
-		MTU:        1420,
+		MTU:        1400,
 		PrivateKey: serverPriv,
 		ListenPort: port,
 	})
@@ -253,9 +249,6 @@ func TestLoopbackCarriesPacketsBothWays(t *testing.T) {
 
 // 只配了承载层单边 peer 时（对端不认识承载层公钥），不能建立隧道。
 func TestLoopbackRejectsUnknownClient(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 的 ring bind 需要管理员权限")
-	}
 
 	serverPriv, _ := GenerateKey()
 	serverPub, _ := serverPriv.PublicKey()
@@ -285,7 +278,7 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 
 	port := freeUDPPort(t)
 	server, err := NewDevice(DeviceOptions{
-		MTU:        1420,
+		MTU:        1400,
 		PrivateKey: serverPriv,
 		ListenPort: port,
 	})
@@ -325,9 +318,6 @@ func TestLoopbackRejectsUnknownClient(t *testing.T) {
 
 // 关闭设备后不应再有包被送进隧道。
 func TestDeviceCloseStopsForwarding(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 的 ring bind 需要管理员权限")
-	}
 
 	ep := l3.New()
 	delivered := make(chan struct{}, 1)
@@ -347,7 +337,7 @@ func TestDeviceCloseStopsForwarding(t *testing.T) {
 	peerPub, _ := peerPriv.PublicKey()
 
 	dev, err := NewDevice(DeviceOptions{
-		MTU: 1420, PrivateKey: priv, ListenPort: freeUDPPort(t),
+		MTU: 1400, PrivateKey: priv, ListenPort: freeUDPPort(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -409,9 +399,6 @@ func captureLogs(t *testing.T, fn func()) string {
 // （真机上隧道建好后的 57 秒里刷了 12 行）。现在这些包在 Read 里就被丢掉并
 // 计数，日志里只该留下一条说清原因的记录。
 func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 的 ring bind 需要管理员权限")
-	}
 
 	serverPriv, err := GenerateKey()
 	if err != nil {
@@ -437,7 +424,7 @@ func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
 
 	logs := captureLogs(t, func() {
 		dev, err := NewDevice(DeviceOptions{
-			MTU: 1420, PrivateKey: serverPriv, ListenPort: freeUDPPort(t),
+			MTU: 1400, PrivateKey: serverPriv, ListenPort: freeUDPPort(t),
 		})
 		if err != nil {
 			t.Fatalf("创建承载设备失败: %v", err)

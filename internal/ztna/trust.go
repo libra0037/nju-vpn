@@ -75,7 +75,7 @@ func (c *control) queryDevice(ctx context.Context, status string) (DeviceStatus,
 		Devices []DeviceRecord `json:"data"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return out, &ProtocolError{What: "授信终端列表解析失败", Got: truncateForError(data)}
+		return out, &ProtocolError{What: "授信终端列表解析失败"}
 	}
 	out.SelfID = d.SelfID
 	out.Trusted = d.DeviceTrusted

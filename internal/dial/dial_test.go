@@ -2,7 +2,9 @@ package dial
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -72,7 +74,7 @@ func fakeSocks5(t *testing.T) (addr string, got chan []byte) {
 			return
 		}
 		// 连接保持打开，调用方还要用它。
-		<-make(chan struct{})
+		_, _ = io.Copy(io.Discard, br)
 	}()
 	return ln.Addr().String(), got
 }
@@ -86,7 +88,7 @@ func TestSocks5SendsIPv4LiteralAsAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dialFn("tcp", "203.0.113.69:443"); err != nil {
+	if _, err := dialFn(context.Background(), "tcp", "203.0.113.69:443"); err != nil {
 		t.Fatalf("建连失败: %v", err)
 	}
 	req := <-got
@@ -108,7 +110,7 @@ func TestSocks5SendsDomainAsDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dialFn("tcp", "vpn.example.edu:443"); err != nil {
+	if _, err := dialFn(context.Background(), "tcp", "vpn.example.edu:443"); err != nil {
 		t.Fatalf("建连失败: %v", err)
 	}
 	req := <-got
@@ -188,11 +190,12 @@ func TestProxyDialerRejectsUnsafeAddressBeforeConnecting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = fn("tcp", "evil\r\nGET http://127.0.0.1:8080/admin HTTP/1.1")
+	_, err = fn(context.Background(), "tcp", "evil\r\nGET http://127.0.0.1:8080/admin HTTP/1.1")
 	if err == nil {
 		t.Fatal("畸形地址没有被拒绝")
 	}
-	if !strings.Contains(err.Error(), "不能用于 CONNECT") {
+	var safe *Error
+	if !errors.As(err, &safe) || !strings.Contains(safe.Cause.Error(), "不能用于 CONNECT") {
 		t.Fatalf("错误应当来自地址校验，而不是连代理失败: %v", err)
 	}
 }

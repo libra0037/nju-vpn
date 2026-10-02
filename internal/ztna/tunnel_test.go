@@ -80,6 +80,7 @@ func stallOptions(t *testing.T, timeout time.Duration) tunnelOptions {
 	t.Helper()
 	srv := newFake(t, ztnatest.Options{StallTunnelHandshake: true})
 	return tunnelOptions{
+		Pins:             newNodeSPKIPins([][32]byte{srv.SPKIPin()}),
 		Node:             srv.Addr(),
 		Server:           "vpn.test",
 		Dial:             srv.Dial,

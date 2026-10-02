@@ -19,6 +19,7 @@ func TestUplinkAndDownlink(t *testing.T) {
 	ep := New()
 	var mu sync.Mutex
 	var sent [][]byte
+	var got [][]byte
 	ep.SetUplink(func(b []byte) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -49,8 +50,8 @@ func TestUplinkAndDownlink(t *testing.T) {
 func TestClearUplinkStopsDelivery(t *testing.T) {
 	ep := New()
 	called := 0
-	ep.SetUplink(func([]byte) error { called++; return nil })
-	ep.ClearUplink()
+	unregister := ep.SetUplink(func([]byte) error { called++; return nil })
+	unregister()
 	if err := ep.Send([]byte("x")); !errors.Is(err, ErrNoUplink) {
 		t.Errorf("注销后 Send 应报 ErrNoUplink，得到 %v", err)
 	}
@@ -65,18 +66,15 @@ func TestConcurrentSwap(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 200; i++ {
-			ep.SetUplink(func([]byte) error { return nil })
+			unregister := ep.SetUplink(func([]byte) error { return nil })
 			ep.Send([]byte("x"))
-			ep.ClearUplink()
+			unregister()
 		}
 	}()
 	for i := 0; i < 200; i++ {
-		ep.SetDownlink(func([]byte) {})
+		unregister := ep.SetDownlink(func([]byte) {})
 		ep.Deliver([]byte("y"))
-		ep.ClearDownlink()
+		unregister()
 	}
 	<-done
 }
-
-// got 是下行方向的收集器，单独放是因为上面的闭包要在解析前声明。
-var got [][]byte

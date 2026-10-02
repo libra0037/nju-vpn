@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,9 +49,15 @@ const closeGrace = 30 * time.Second
 // 用户在提示符前直接关掉终端时，进程会一直停在 auth_pending，服务端那条
 // "同一账号只允许一条隧道会话"的名额也跟着被占住。到点就登出，宁可让用户
 // 重新 start 一次。
-//
-// 用变量而不是常量：测试要把它缩到百毫秒级才能覆盖这条路径。
-var authWaitTimeout = 10 * time.Minute
+const defaultAuthWaitTimeout = 10 * time.Minute
+const defaultCommandTimeout = 2 * time.Minute
+
+type Options struct {
+	Dial             dial.DialFunc
+	AuthWaitTimeout  time.Duration
+	CommandTimeout   time.Duration // 包括排队及执行；0 使用两分钟预算。
+	ReconnectBackoff time.Duration
+}
 
 type commandKind int
 
@@ -90,6 +96,7 @@ func (k commandKind) String() string {
 
 type command struct {
 	kind commandKind
+	ctx  context.Context // 用户命令拥有总等待预算；内部事件没有此字段。
 	// arg 是本次请求带上来的口令（start / trust / untrust）或验证码（auth）。
 	arg string
 	// trust 与 all 是授信终端操作的参数：trust 表示"绑成授信终端"，
@@ -213,12 +220,18 @@ type Service struct {
 	//
 	// dialer 是测试注入点：注入的是拨号实现，Server / DialAddr 这些生产接线
 	// 仍然由 clientFor 算出来，测试因此必须走真实的那条路径。
-	dialer    dial.DialFunc
-	client    *ztna.Client
-	session   *ztna.Session
-	pending   *pendingOp
-	runCancel context.CancelFunc
-	gen       uint64
+	dialer           dial.DialFunc
+	client           *ztna.Client
+	session          *ztna.Session
+	pending          *pendingOp
+	runCancel        context.CancelFunc
+	runDone          chan struct{}
+	authWaitTimeout  time.Duration
+	commandTimeout   time.Duration
+	reconnectBackoff time.Duration
+	sessionSnapshot  atomic.Pointer[ztna.Session]
+	events           chan *command
+	gen              uint64
 	// authTimer 只在 auth_pending 期间有效，到点由 actor 收尾。
 	authTimer *time.Timer
 	// authSeq 是"等待验证码"的轮次，每次起停自增。计时器触发时把当时的
@@ -229,20 +242,53 @@ type Service struct {
 // New 构造服务对象并启动命令循环。
 //
 // 承载设备在这里就建起来，理由见 bearer 的注释。
-func New(cfg *config.Config) (*Service, error) {
+func New(cfg *config.Config, options ...Options) (*Service, error) {
+	if cfg == nil {
+		return nil, errors.New("缺少服务配置")
+	}
+	if _, err := cfg.NodeSPKIPins(); err != nil {
+		return nil, err
+	}
+	if len(options) > 1 {
+		return nil, errors.New("只能提供一组服务参数")
+	}
+	copyCfg := *cfg
+	copyCfg.TLS.PinnedNodeSPKISHA256 = slices.Clone(cfg.TLS.PinnedNodeSPKISHA256)
+	cfg = &copyCfg
+	opts := Options{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if opts.AuthWaitTimeout == 0 {
+		opts.AuthWaitTimeout = defaultAuthWaitTimeout
+	}
+	if opts.AuthWaitTimeout < 0 {
+		return nil, errors.New("验证码等待时间须为正数")
+	}
+	if opts.CommandTimeout == 0 {
+		opts.CommandTimeout = defaultCommandTimeout
+	}
+	if opts.CommandTimeout < 0 || opts.ReconnectBackoff < 0 {
+		return nil, errors.New("命令预算与重连退避须为正数")
+	}
 	br, err := newBearer(cfg)
 	if err != nil {
 		return nil, err
 	}
 	s := &Service{
-		cfg:       cfg,
-		status:    newStatusStore(identityOf(cfg)),
-		br:        br,
-		peerIP:    br.peerAddr.String(),
-		cred:      credentials{username: cfg.Username, password: cfg.Password},
-		cmds:      make(chan *command),
-		closed:    make(chan struct{}),
-		actorDone: make(chan struct{}),
+		cfg:              cfg,
+		status:           newStatusStore(identityOf(cfg)),
+		br:               br,
+		peerIP:           br.peerAddr.String(),
+		cred:             credentials{username: cfg.Username, password: cfg.Password},
+		cmds:             make(chan *command, 32),
+		events:           make(chan *command, 16),
+		closed:           make(chan struct{}),
+		actorDone:        make(chan struct{}),
+		dialer:           opts.Dial,
+		authWaitTimeout:  opts.AuthWaitTimeout,
+		commandTimeout:   opts.CommandTimeout,
+		reconnectBackoff: opts.ReconnectBackoff,
 	}
 	go s.loop()
 	return s, nil
@@ -250,13 +296,13 @@ func New(cfg *config.Config) (*Service, error) {
 
 // identityOf 组装实例身份，只在启动时算一次。
 //
-// 端点规则与 CLI 的 endpointOf 共用 ipc.ResolveEndpoint：两处算错任何一处，
+// 端点规则与 CLI 共用 ipc.EndpointFor：两处算错任何一处，
 // 命令就会打到别的实例上，那边的账号会被静默操作。
 func identityOf(cfg *config.Config) Identity {
 	return Identity{
 		PID:        os.Getpid(),
 		ConfigPath: cfg.SourcePath(),
-		Endpoint:   ipc.ResolveEndpoint(cfg.IPC.Endpoint, cfg.SourcePath()),
+		Endpoint:   ipc.EndpointFor(cfg.SourcePath()),
 		Username:   cfg.Username,
 	}
 }
@@ -288,12 +334,6 @@ func (s *Service) Done() <-chan struct{} { return s.closed }
 
 // BearerSummary 描述承载层的监听状态，供启动日志用。
 func (s *Service) BearerSummary() string { return s.br.summary() }
-
-// SetDialer 替换出站拨号函数（测试用）。
-//
-// 必须在第一条命令之前设置：真正读它的只有 actor 协程，而第一条命令的发送
-// 建立了 happens-before 关系。
-func (s *Service) SetDialer(f dial.DialFunc) { s.dialer = f }
 
 // Start 建立隧道：登录、取资源表、建隧道，必要时把本机绑成授信终端。
 //
@@ -354,12 +394,29 @@ func (s *Service) Close() {
 
 // call 把命令交给 actor 并等回复。
 func (s *Service) call(cmd *command) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.commandTimeout)
+	defer cancel()
+	cmd.ctx = ctx
 	cmd.reply = make(chan error, 1)
 
-	select {
-	case s.cmds <- cmd:
-	case <-s.closed:
-		return ErrShuttingDown
+	if cmd.kind == cmdStop {
+		// Stop 已取消正在执行的操作，须在有界预算内等到入队；不能因队列
+		// 已满而只留下 stopPending，却没有真正执行摘除与登出。
+		select {
+		case s.cmds <- cmd:
+		case <-s.closed:
+			return ErrShuttingDown
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	} else {
+		select {
+		case s.cmds <- cmd:
+		case <-s.closed:
+			return ErrShuttingDown
+		default:
+			return fmt.Errorf("%w：命令队列已满", ErrBadState)
+		}
 	}
 
 	select {
@@ -367,6 +424,8 @@ func (s *Service) call(cmd *command) error {
 		return err
 	case <-s.closed:
 		return ErrShuttingDown
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -397,6 +456,8 @@ func (s *Service) loop() {
 			return
 		case cmd := <-s.cmds:
 			s.dispatch(cmd)
+		case event := <-s.events:
+			s.dispatch(event)
 		}
 	}
 }
@@ -406,7 +467,14 @@ func (s *Service) loop() {
 // 这里是最外层 panic 边界：任何一处未预料到的崩溃都会转成一次失败，而不是
 // 带走整个进程——服务端的会话还开着，进程直接死掉就没人登出了。
 func (s *Service) dispatch(cmd *command) {
-	ctx, cancel := context.WithCancel(context.Background())
+	parent := cmd.ctx
+	if parent == nil {
+		parent = context.Background()
+	} else if err := parent.Err(); err != nil {
+		cmd.reply <- err
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
 	s.setOpCancel(cancel)
 
 	replied := false
@@ -425,10 +493,9 @@ func (s *Service) dispatch(cmd *command) {
 		s.setOpCancel(nil)
 		cancel()
 
-		if r := recover(); r != nil {
-			err := fmt.Errorf("内部错误: %v", r)
+		if recover() != nil {
+			err := errors.New("命令处理发生内部错误")
 			log.Printf("%v", err)
-			log.Printf("%s", debug.Stack())
 			s.teardown("")
 			s.status.set(StateError, err.Error())
 			reply(err)
@@ -689,7 +756,7 @@ func (s *Service) awaitAuth(ctx context.Context, hint string) error {
 func (s *Service) startAuthTimer() {
 	s.stopAuthTimer()
 	seq := s.authSeq
-	s.authTimer = time.AfterFunc(authWaitTimeout, func() { s.reportAuthTimeout(seq) })
+	s.authTimer = time.AfterFunc(s.authWaitTimeout, func() { s.reportAuthTimeout(seq) })
 }
 
 // stopAuthTimer 取消等待验证码的上限。
@@ -728,7 +795,7 @@ func (s *Service) authTimeout(seq uint64) error {
 	}
 	s.teardown("")
 	detail := fmt.Sprintf("等待验证码超过 %s，已登出；重新建立隧道请执行 njuvpn start",
-		authWaitTimeout.Round(time.Minute))
+		s.authWaitTimeout.Round(time.Minute))
 	log.Print(detail)
 	s.status.set(StateError, detail)
 	return nil
@@ -767,9 +834,10 @@ func (s *Service) finishConnect(sess *ztna.Session) error {
 	s.runCancel = cancel
 	s.gen++
 	gen := s.gen
-	go s.runTunnel(runCtx, sess, gen)
-
-	log.Printf("隧道已建立：校园网地址 %s，peer 地址 %s", sess.ClientIP(), s.br.peerAddr)
+	done := make(chan struct{})
+	s.runDone = done
+	go func() { defer close(done); s.runTunnel(runCtx, sess, gen) }()
+	log.Printf("隧道已建立")
 	return nil
 }
 
@@ -781,6 +849,7 @@ func (s *Service) attach(sess *ztna.Session) {
 	}
 	prev := s.session
 	s.session = sess
+	s.sessionSnapshot.Store(sess)
 	s.ep.Store(sess.Endpoint())
 	if prev == nil || prev == sess {
 		return
@@ -795,43 +864,29 @@ func (s *Service) runTunnel(ctx context.Context, sess *ztna.Session, gen uint64)
 	defer func() {
 		// 隧道协程没有命令层的 recover 保护：真崩了要收敛成一次"隧道
 		// 断开"，而不是带走整个进程（进程一死就没人登出了）。
-		if r := recover(); r != nil {
-			panicErr := fmt.Errorf("隧道协程内部错误: %v", r)
+		if recover() != nil {
+			panicErr := errors.New("隧道运行任务发生内部错误")
 			log.Printf("%v", panicErr)
-			log.Printf("%s", debug.Stack())
-			s.reportTunnelDown(gen, panicErr)
+			s.report(ctx, &command{kind: cmdTunnelDown, gen: gen, err: panicErr})
 		}
 	}()
 	events := ztna.LinkEvents{
-		Dropped:  func(attempt int, err error) { s.reportTunnelRetry(gen, attempt, err) },
-		Restored: func() { s.reportTunnelRestored(gen) },
+		Dropped: func(attempt int, err error) {
+			s.report(ctx, &command{kind: cmdTunnelRetry, gen: gen, attempt: attempt, err: err})
+		},
+		Restored: func() { s.report(ctx, &command{kind: cmdTunnelRestored, gen: gen}) },
 	}
-	s.reportTunnelDown(gen, sess.Run(ctx, events))
-}
-
-// reportTunnelRetry 上报一次重连尝试。
-func (s *Service) reportTunnelRetry(gen uint64, attempt int, err error) {
-	s.report(&command{kind: cmdTunnelRetry, gen: gen, attempt: attempt, err: err})
-}
-
-// reportTunnelRestored 上报链路恢复。
-func (s *Service) reportTunnelRestored(gen uint64) {
-	s.report(&command{kind: cmdTunnelRestored, gen: gen})
-}
-
-// reportTunnelDown 把隧道协程的退出转成一条命令交给 actor。
-//
-// 必须经过 actor：直接改状态就会和正在执行的命令打架。
-func (s *Service) reportTunnelDown(gen uint64, err error) {
-	s.report(&command{kind: cmdTunnelDown, gen: gen, err: err})
+	err := sess.Run(ctx, events)
+	s.report(ctx, &command{kind: cmdTunnelDown, gen: gen, err: err})
 }
 
 // report 投递一条来自隧道协程的汇报。投不进去（进程正在退出）就丢掉。
-func (s *Service) report(cmd *command) {
+func (s *Service) report(ctx context.Context, cmd *command) {
 	cmd.reply = make(chan error, 1)
 	select {
-	case s.cmds <- cmd:
+	case s.events <- cmd:
 	case <-s.closed:
+	case <-ctx.Done():
 	}
 }
 
@@ -914,7 +969,8 @@ func (s *Service) teardown(detail string) {
 		s.runCancel()
 		s.runCancel = nil
 	}
-	s.br.detach()
+	s.sessionSnapshot.Store(nil)
+	s.br.dev.ClearSession()
 
 	var logoutErr error
 	if s.pending != nil {
@@ -930,6 +986,11 @@ func (s *Service) teardown(detail string) {
 	if logoutErr != nil {
 		log.Printf("释放会话时出错: %v", logoutErr)
 	}
+	if s.runDone != nil {
+		<-s.runDone
+		s.runDone = nil
+	}
+	s.br.detach()
 	s.ep.Store(nil)
 
 	if s.status.Get().State != StateIdle {
@@ -977,7 +1038,7 @@ func (s *Service) clientFor() (*ztna.Client, error) {
 			"应由服务进程首次启动时生成并写回配置文件")
 	}
 	// 指纹在加载时就校验过了，这里再解析一次拿到定长数组。
-	pins, err := s.cfg.NodePinHashes()
+	pins, err := s.cfg.NodeSPKIPins()
 	if err != nil {
 		return nil, err
 	}
@@ -991,21 +1052,15 @@ func (s *Service) clientFor() (*ztna.Client, error) {
 		DeviceID:           s.cfg.DeviceID,
 		Logf:               log.Printf,
 		InsecureSkipVerify: s.cfg.TLS.InsecureSkipVerify,
-		NodePins:           pins,
-		PinsPath:           pinsPath(s.cfg),
-		// 用户自己写了指纹就严格按他写的来；留空时用内置值，并对其他节点
-		// 按“首次记录、之后比对”处理（资源表里可能有好几台节点）。
-		StrictNodePins: len(s.cfg.TLS.PinnedNodeSHA256) > 0,
-	}), nil
+		NodeSPKIPins:       pins,
+		ReconnectBackoff:   s.reconnectBackoff,
+	})
 }
 
-// pinsPath 是“首次记录”下来的节点证书指纹的落盘位置。
-//
-// 放在配置文件旁边：它属于这份配置（同一台机器上不同配置可以连不同部署），
-// 而配置文件本身已经是 0600。没有来源路径时（手工构造的配置）不落盘。
-func pinsPath(cfg *config.Config) string {
-	if cfg == nil || cfg.SourcePath() == "" {
-		return ""
+func (s *Service) ResourcesJSON(limit int) ([]byte, error) {
+	sess := s.sessionSnapshot.Load()
+	if sess == nil {
+		return nil, ztna.ErrResourcesUnavailable
 	}
-	return cfg.SourcePath() + ".node-pins"
+	return sess.ResourcesJSON(limit)
 }

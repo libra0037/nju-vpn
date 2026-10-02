@@ -44,18 +44,24 @@ func newFake(t *testing.T, opts ztnatest.Options) *ztnatest.Server {
 
 func newTestClient(t *testing.T, srv *ztnatest.Server, password string) *Client {
 	t.Helper()
-	return New(Options{
-		Server:   "vpn.test",
-		DialAddr: srv.Addr(),
-		Dial:     srv.Dial,
-		Username: testUser,
-		Password: password,
-		DeviceID: "device-test-1",
-		Logf:     t.Logf,
+	client, err := New(Options{
+		NodeSPKIPins:     [][32]byte{srv.SPKIPin()},
+		ReconnectBackoff: time.Millisecond,
+		Server:           "vpn.test",
+		DialAddr:         srv.Addr(),
+		Dial:             srv.Dial,
+		Username:         testUser,
+		Password:         password,
+		DeviceID:         "device-test-1",
+		Logf:             t.Logf,
 		// 假服务端用自签证书，控制面的系统信任链校验在这里必然失败——
 		// 这条通道的校验由 internal/ztna/verify_test.go 单独覆盖。
 		InsecureSkipVerify: true,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }
 
 func TestConnectWithSMSTrustAndData(t *testing.T) {
@@ -69,7 +75,7 @@ func TestConnectWithSMSTrustAndData(t *testing.T) {
 	if !ok {
 		t.Fatalf("应停在等验证码这一步，得到 %v", err)
 	}
-	if !strings.Contains(authErr.Hint, "138****0000") {
+	if !strings.Contains(authErr.Hint, "***0000") {
 		t.Errorf("提示里应带上脱敏手机号，得到 %q", authErr.Hint)
 	}
 	// 半完成的会话必须原样留着：提前登出会把它作废，验证码就再也提交不上
@@ -233,12 +239,15 @@ func TestConnectUsesPasswordFromOptions(t *testing.T) {
 // OpenDevices 故意在失败时也返回一个对象：登录走到一半失败时那个会话占着
 // 服务端名额，调用方要拿它去登出。空会话因此是合法状态，方法必须自己挡住。
 func TestDeviceSessionWithoutLoginDoesNotPanic(t *testing.T) {
-	// 设备标识是登录的必要参数，留空就会在早期失败——不碰任何网络。
-	client := New(Options{Server: "vpn.test", Username: testUser, Password: testPass})
+	// 离线拨号失败发生在会话构造之后，仍须能关闭返回的半完成对象。
+	client, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", DeviceID: "test", Dial: func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("offline") }, Username: testUser, Password: testPass, NodeSPKIPins: [][32]byte{{1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	d, err := client.OpenDevices(ctx, "")
 	if err == nil {
-		t.Fatal("缺少设备标识时应当报错")
+		t.Fatal("离线拨号应当报错")
 	}
 	if d == nil {
 		t.Fatal("失败时也该返回可安全使用的对象（调用方要能关掉它）")
@@ -351,10 +360,10 @@ func TestReconnectRotatesNodes(t *testing.T) {
 	// 模拟"A 重启/维护，别的节点还好着"。
 	var mu sync.Mutex
 	reachable := map[string]bool{nodeA: true}
-	dial := func(network, addr string) (net.Conn, error) {
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if addr == srv.Addr() {
 			// 控制面走的是服务端自己的地址，不受节点开关影响。
-			return srv.Dial(network, addr)
+			return srv.Dial(ctx, network, addr)
 		}
 		mu.Lock()
 		up := reachable[addr]
@@ -362,7 +371,7 @@ func TestReconnectRotatesNodes(t *testing.T) {
 		if !up {
 			return nil, fmt.Errorf("节点 %s 不可达", addr)
 		}
-		return srv.Dial(network, srv.Addr())
+		return srv.Dial(ctx, network, srv.Addr())
 	}
 	setReachable := func(a, b bool) {
 		mu.Lock()

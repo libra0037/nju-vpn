@@ -13,6 +13,7 @@
 package service
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -78,16 +79,31 @@ func (s *statusStore) Get() Status {
 	return s.status
 }
 
-// set 迁移到 next 状态。
-//
-// 这里不做"迁移是否合法"的判定：那张表曾经存在，但把每一条真实路径都走
-// 过一遍之后发现它拦的迁移一次都没发生过（隧道协程的汇报都带代次，过期
-// 汇报在调用点就被丢掉了），留着只会给读者一个"能报警"的错觉。状态是否
-// 合理由各调用点自己的前置条件保证（例如 tunnelDown 只看当前代次）。
+// set 拒绝非法迁移；外层命令边界负责收尾并输出不含凭据的内部错误。
 func (s *statusStore) set(next State, detail string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !validTransition(s.status.State, next) {
+		panic(fmt.Sprintf("非法服务状态迁移：%s → %s", s.status.State, next))
+	}
 	s.applyLocked(next, detail)
+}
+
+func validTransition(from, to State) bool {
+	switch from {
+	case StateIdle:
+		return to == StateIdle || to == StateLoggingIn || to == StateError
+	case StateLoggingIn:
+		return to == StateLoggingIn || to == StateAuthPending || to == StateUp || to == StateIdle || to == StateError
+	case StateAuthPending:
+		return to == StateAuthPending || to == StateUp || to == StateIdle || to == StateError
+	case StateUp:
+		return to == StateUp || to == StateIdle || to == StateError
+	case StateError:
+		return to == StateError || to == StateIdle || to == StateLoggingIn
+	default:
+		return false
+	}
 }
 
 // setDetail 只更新说明文字，状态不变。
@@ -101,6 +117,9 @@ func (s *statusStore) setDetail(detail string) {
 func (s *statusStore) setRetrying(retrying bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if retrying && s.status.State != StateUp {
+		panic("仅运行中的隧道可以进入重连状态")
+	}
 	s.status.Retrying = retrying
 }
 

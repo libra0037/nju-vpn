@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -27,23 +29,36 @@ type Options struct {
 	// InsecureSkipVerify 关闭控制面的证书校验。默认（false）走系统信任链：
 	// 门户证书是公共 CA 签发的，口令与验证码因此不再暴露给中间人。
 	InsecureSkipVerify bool
-	// NodePins 是隧道节点证书的 SHA-256 指纹（叶子证书）。
-	NodePins [][sha256.Size]byte
-	// PinsPath 是“首次记录”下来的节点指纹的落盘位置；空表示只记在内存里。
-	PinsPath string
-	// StrictNodePins 为真时只认 NodePins 给的指纹，不再对陌生节点做首次记录。
-	// 用户在配置里明确写了指纹就按他写的来。
-	StrictNodePins bool
+	// NodeSPKIPins 是配置边界已解析的只读 SPKI SHA-256 白名单。
+	NodeSPKIPins     [][sha256.Size]byte
+	ReconnectBackoff time.Duration
 }
 
 // Client 是协议层门面：一次"连接"= 登录 + 取资源 + 建隧道。
 type Client struct {
 	opts Options
-	pins *nodePins
+	pins *nodeSPKIPins
 }
 
-func New(opts Options) *Client {
-	return &Client{opts: opts, pins: newNodePins(opts.NodePins, opts.PinsPath, opts.StrictNodePins, opts.Logf)}
+func New(opts Options) (*Client, error) {
+	if opts.Server == "" || opts.DialAddr == "" || opts.Dial == nil || opts.DeviceID == "" {
+		return nil, &ProtocolError{What: "缺少服务端地址、拨号实现或设备标识"}
+	}
+	if len(opts.NodeSPKIPins) == 0 {
+		return nil, ErrNodeUntrusted
+	}
+	if len(opts.NodeSPKIPins) > 16 {
+		return nil, &ProtocolError{What: "SPKI 白名单超过上限"}
+	}
+	if opts.ReconnectBackoff == 0 {
+		opts.ReconnectBackoff = time.Second
+	}
+	if opts.ReconnectBackoff < 0 {
+		return nil, &ProtocolError{What: "重连退避须为正数"}
+	}
+	pins := newNodeSPKIPins(opts.NodeSPKIPins)
+	opts.NodeSPKIPins = nil // 校验器拥有独立快照。
+	return &Client{opts: opts, pins: pins}, nil
 }
 
 func (c *Client) logf(format string, args ...any) {
@@ -94,8 +109,12 @@ type Session struct {
 	// devicesOnly 表示这次登录只用于授信终端操作，不建隧道。
 	devicesOnly bool
 
-	mu     sync.Mutex
-	active *tunnelConn
+	mu      sync.Mutex
+	active  *tunnelConn
+	closed  bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	runDone chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -131,7 +150,8 @@ func (c *Client) newSession(ctx context.Context, password string, devicesOnly bo
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New(), devicesOnly: devicesOnly}
+	ownedCtx, cancel := context.WithCancel(context.Background())
+	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New(), devicesOnly: devicesOnly, ctx: ownedCtx, cancel: cancel}
 
 	if err := s.beginLogin(ctx); err != nil {
 		_ = s.Close(context.Background())
@@ -193,7 +213,7 @@ func (s *Session) continueAuth(ctx context.Context) error {
 			s.withAuthID = s.step.AuthID != ""
 			return nil
 		default:
-			return &ProtocolError{What: "不支持的二次验证方式", Got: s.step.Service}
+			return &ProtocolError{What: "不支持的二次验证方式"}
 		}
 	}
 	return &ProtocolError{What: "认证链过长"}
@@ -202,7 +222,7 @@ func (s *Session) continueAuth(ctx context.Context) error {
 // Auth 提交验证码并继续。成功后资源与地址就绪。
 func (s *Session) Auth(ctx context.Context, code string) error {
 	if s.step.Service != "auth/sms" {
-		return &ProtocolError{What: "当前不需要验证码", Got: s.step.Service}
+		return &ProtocolError{What: "当前不需要验证码"}
 	}
 	step, err := s.ctrl.submitSMS(ctx, s.step.AuthID, s.withAuthID, code)
 	if err != nil {
@@ -226,7 +246,7 @@ func (s *Session) Auth(ctx context.Context, code string) error {
 // SMSHint 返回手机号脱敏后的提示；服务端答不上来时给一句兜底文案。
 func (s *Session) SMSHint(ctx context.Context) string { return s.smsHint(ctx) }
 
-// SMSPrompt 触发短信并返回给用户看的提示（手机号脱敏 + 服务端文案）。
+// SMSPrompt 触发短信并返回本地固定文案。
 func (s *Session) SMSPrompt(ctx context.Context) (string, error) {
 	return s.ctrl.sendSMS(ctx, s.step.AuthID, s.withAuthID)
 }
@@ -236,7 +256,7 @@ func (s *Session) smsHint(ctx context.Context) string {
 	if err != nil || len(phones) == 0 {
 		return "服务端要求短信验证码"
 	}
-	return fmt.Sprintf("验证码将发送至 %s", phones[0])
+	return fmt.Sprintf("验证码将发送至 %s", maskPhone(phones[0]))
 }
 
 // prepare 取资源表、选节点、建立第一条隧道连接并拿到校园网地址。
@@ -255,7 +275,13 @@ func (s *Session) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return context.Canceled
+	}
 	s.table = table
+	s.mu.Unlock()
 	s.client.logf("资源表: %d 条规则，%d 个隧道节点", len(table.entries), len(table.nodes))
 	if table.portFallbacks > 0 {
 		s.client.logf("资源表里有 %d 条规则的端口段看不懂，已按 1-65535 处理（可能会多发几次鉴权请求）",
@@ -265,21 +291,29 @@ func (s *Session) prepare(ctx context.Context) error {
 		s.client.logf("资源表里有 %d 个节点地址不合法，已丢弃（它们会进探活与 CONNECT 请求行）", table.badNodes)
 	}
 
-	node, err := probeNodes(ctx, s.client.opts.Dial, table.candidateNodes(table.major), 6*time.Second)
+	node, tlsConn, err := probeNodes(ctx, func(ctx context.Context, node string) (*tls.Conn, error) {
+		return dialNodeTLS(ctx, s.tunnelOptions(node))
+	}, table.candidateNodes(table.major), 6*time.Second)
 	if err != nil {
 		return err
 	}
 	s.node = node
 	s.signKey = randomSignKey()
-	s.client.logf("隧道节点: %s", node)
 
-	conn, err := dialTunnel(ctx, s.tunnelOptions(s.node))
+	conn, err := handshakeTunnel(ctx, s.tunnelOptions(s.node), tlsConn)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
+	if s.closed || ctx.Err() != nil {
+		s.mu.Unlock()
+		conn.Close()
+		return context.Canceled
+	}
 	s.active = conn
+	conn.start()
 	s.mu.Unlock()
+	s.client.logf("隧道连接已建立")
 	return nil
 }
 
@@ -356,7 +390,23 @@ const (
 // 重新登录（短信模式下还要再花一条验证码），而资源表里其他节点可能一直是
 // 好的。
 func (s *Session) Run(ctx context.Context, events LinkEvents) error {
-	backoff := time.Second
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return context.Canceled
+	}
+	if s.runDone != nil {
+		s.mu.Unlock()
+		return errors.New("会话运行任务已经启动")
+	}
+	s.runDone = make(chan struct{})
+	done := s.runDone
+	ownedCtx, cancel := context.WithCancel(s.ctx)
+	s.mu.Unlock()
+	stop := context.AfterFunc(ctx, cancel)
+	defer func() { stop(); cancel(); close(done) }()
+	ctx = ownedCtx
+	backoff := s.client.opts.ReconnectBackoff
 	attempt := 0
 	failures := 0
 	for {
@@ -368,8 +418,13 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 		}
 		select {
 		case <-ctx.Done():
+			conn.Close()
 			return ctx.Err()
 		case <-conn.Done():
+		}
+		conn.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
 		attempt++
@@ -391,8 +446,7 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 			next++
 			reconnected, lastErr = dialTunnel(ctx, s.tunnelOptions(node))
 			if reconnected != nil {
-				// 记住这次真正连上的节点，下次断线优先回到它。
-				s.node = node
+				// 发布前还会在会话锁内检查关闭与取消。
 				break
 			}
 			if ctx.Err() != nil {
@@ -411,9 +465,17 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 		}
 
 		s.mu.Lock()
+		if s.closed || ctx.Err() != nil {
+			s.mu.Unlock()
+			reconnected.Close()
+			return context.Canceled
+		}
 		s.active = reconnected
+		s.node = reconnected.node
+		reconnected.start()
 		s.mu.Unlock()
-		backoff = time.Second
+		s.client.logf("隧道连接已建立")
+		backoff = s.client.opts.ReconnectBackoff
 		attempt = 0
 		failures = 0
 		if events.Restored != nil {
@@ -449,20 +511,29 @@ func (c *Client) connectLoginOnly(ctx context.Context, password string) (*Sessio
 func (s *Session) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
+		s.closed = true
+		s.cancel()
 		conn := s.active
 		s.active = nil
+		done := s.runDone
 		s.mu.Unlock()
 
-		s.ep.ClearUplink()
-		s.ep.ClearDownlink()
 		if conn != nil {
 			_ = conn.Close()
 		}
+		if done != nil {
+			<-done
+		}
 		// 只在真的建立过登录会话时登出。
 		if s.ctrl != nil && s.ticket != "" {
-			if err := s.ctrl.logout(ctx); err != nil {
+			logoutCtx, cancel := context.WithTimeout(ctx, controlTimeout)
+			defer cancel()
+			if err := s.ctrl.logout(logoutCtx); err != nil {
 				s.closeErr = err
 			}
+		}
+		if s.ctrl != nil {
+			s.ctrl.hc.CloseIdleConnections()
 		}
 	})
 	return s.closeErr
@@ -482,14 +553,13 @@ func pickPasswordMethod(methods []authMethod, domain string) (authMethod, error)
 			fallback = &methods[i]
 		}
 	}
+	if domain != "" {
+		return authMethod{}, &ProtocolError{What: "配置的口令登录域不存在"}
+	}
 	if fallback != nil {
 		return *fallback, nil
 	}
-	names := make([]string, 0, len(methods))
-	for _, m := range methods {
-		names = append(names, m.LoginDomain+"/"+m.AuthType)
-	}
-	return authMethod{}, &ProtocolError{What: "服务端没有可用的口令登录方式", Got: fmt.Sprintf("%v", names)}
+	return authMethod{}, &ProtocolError{What: "服务端没有可用的口令登录方式"}
 }
 
 // randomSignKey 生成逐流鉴权用的签名密钥。
@@ -498,13 +568,33 @@ func pickPasswordMethod(methods []authMethod, domain string) (authMethod, error)
 // 校验起来，所有部署会共用同一把密钥。
 func randomSignKey() []byte {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		// 取不到随机数不该让登录失败：当前部署里它不影响任何行为。
-		// 退回确定性填充，并留一条线索，免得将来服务端真的校验时查不出原因。
-		log.Printf("生成逐流签名密钥失败，退回固定填充（当前部署不受影响）: %v", err)
-		for i := range b {
-			b[i] = byte(i*7 + 13)
+	_, _ = rand.Read(b) // Go 1.26 的 crypto/rand.Read 成功填满；熵源失败会终止进程。
+	return b
+}
+
+var ErrResourcesUnavailable = errors.New("当前没有已登录会话的资源快照")
+
+// ResourcesJSON 编码已发布的只读资源，预算包含 JSON 转义；不发控制面请求。
+func (s *Session) ResourcesJSON(limit int) ([]byte, error) {
+	s.mu.Lock()
+	if s.closed || s.active == nil || s.table == nil {
+		s.mu.Unlock()
+		return nil, ErrResourcesUnavailable
+	}
+	table := s.table
+	s.mu.Unlock()
+	return table.snapshotJSON(limit)
+}
+
+func maskPhone(raw string) string {
+	var digits []byte
+	for i := 0; i < len(raw); i++ {
+		if raw[i] >= '0' && raw[i] <= '9' {
+			digits = append(digits, raw[i])
 		}
 	}
-	return b
+	if len(digits) < 4 {
+		return "已登记手机号"
+	}
+	return "***" + string(digits[len(digits)-4:])
 }

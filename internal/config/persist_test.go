@@ -1,253 +1,130 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
-// TestPersistThroughSymlinkWritesTarget 回归：写回必须落在链接的目标上。
-//
-// 写回是“写临时文件 + rename”，rename 替换的是目录项本身：配置路径是
-// 符号链接时，链接会被换成一份新的普通文件，用户真正在编辑的那份永远
-// 收不到 device_id / private_key（曾用 njuvpn restart -config link.yaml
-// 复现过）。实例身份按真实路径算，所以两边还会分叉。
-func TestPersistThroughSymlinkWritesTarget(t *testing.T) {
-	dir := t.TempDir()
-	real := filepath.Join(dir, "real.yaml")
-	if err := os.WriteFile(real, []byte("server: vpn.example.edu\nusername: u\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(dir, "link.yaml")
-	if err := os.Symlink(real, link); err != nil {
-		t.Skipf("本平台建不了符号链接: %v", err)
-	}
-
-	cfg, err := Load(link)
-	if err != nil {
-		t.Fatalf("加载失败: %v", err)
-	}
-	realInfo, err := os.Stat(real)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gotInfo, err := os.Stat(cfg.SourcePath())
-	if err != nil {
-		t.Fatalf("SourcePath 指向的文件不存在: %v", err)
-	}
-	if !os.SameFile(realInfo, gotInfo) {
-		t.Fatalf("SourcePath 没有解析到链接目标: %q", cfg.SourcePath())
-	}
-
-	if err := PersistDeviceID(cfg.SourcePath(), "dev-1"); err != nil {
-		t.Fatalf("写回失败: %v", err)
-	}
-
-	fi, err := os.Lstat(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("链接被换成了普通文件，真实配置永远收不到写回内容")
-	}
-	// 通过链接读：链的两端必须在同一份内容上。
-	body, err := os.ReadFile(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(body), "device_id: dev-1") {
-		t.Fatalf("真实文件没有收到写回内容:\n%s", body)
+func TestInitializeIdentityPreservesYAMLAndAdoptsDisk(t *testing.T) {
+	for _, fields := range []string{
+		"device_id: null # 设备注释\nwireguard: {private_key: null, peer_address: 10.66.66.2}\n",
+		"\"device_id\": '' # 设备注释\n\"wireguard\":\n  \"private_key\": '' # 私钥注释\n",
+	} {
+		t.Run(fields, func(t *testing.T) {
+			path := writeConfig(t, "# 配置注释\nserver: vpn.example.edu\nusername: u\n"+fields, 0600)
+			first, err := InitializeIdentity(path, func() (string, string, error) { return "device-a", "key-a", nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := InitializeIdentity(path, func() (string, string, error) { t.Fatal("已有身份不能再生成"); return "", "", nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cfg := range []*Config{first, second, loaded} {
+				if cfg.DeviceID != "device-a" || cfg.WireGuard.PrivateKey != "key-a" {
+					t.Fatal("内存未采用实际落盘身份")
+				}
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, comment := range []string{"# 配置注释", "# 设备注释"} {
+				if !strings.Contains(string(content), comment) {
+					t.Fatal("注释丢失")
+				}
+			}
+			if runtime.GOOS != "windows" {
+				info, _ := os.Stat(path)
+				if info.Mode().Perm() != 0600 {
+					t.Fatal("身份文件权限过宽")
+				}
+			}
+		})
 	}
 }
 
-// TestPersistPrivateKeyKeepsExistingValue 验证已有私钥不会被覆盖。
-//
-// 两个进程同时首启同一份配置时，两边都会生成私钥并写回；后写的那个
-// 会让盘上的私钥与正在运行的进程内存里的不一致，客户端配置随之全部失效。
-func TestPersistPrivateKeyKeepsExistingValue(t *testing.T) {
-	path := writeConfig(t, "server: vpn.example.edu\nusername: u\nwireguard:\n  private_key: keepme\n", 0o600)
-
-	if err := PersistPrivateKey(path, "newkey"); err != nil {
-		t.Fatalf("写回失败: %v", err)
+func TestIdentityWriteDoesNotFollowPlantedTemp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("符号链接需要特权")
 	}
-	body, err := os.ReadFile(path)
+	path := writeConfig(t, validConfig, 0600)
+	victim := filepath.Join(filepath.Dir(path), "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, fmt.Sprintf("%s.tmp.%d", path, os.Getpid())); err != nil {
+		t.Fatal(err)
+	}
+	_, err := InitializeIdentity(path, func() (string, string, error) { return "id", "key", nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "keepme") {
-		t.Fatalf("已有的私钥被覆盖了:\n%s", body)
+	got, _ := os.ReadFile(victim)
+	if string(got) != "keep" {
+		t.Fatal("被预置链接引导写入")
 	}
 }
 
-// 回归：私钥要写回配置文件，而且不能把文件里的注释冲掉——
-// 那份文件是给人看的，用 YAML 序列化会全部丢注释。
-func TestPersistPrivateKeyReplacesExistingLine(t *testing.T) {
-	body := "# njuvpn 配置\n" +
-		"server: vpn.example.edu\n" +
-		"username: u\n" +
-		"password: p\n" +
-		"\n" +
-		"# --- WireGuard 承载 ---\n" +
-		"wireguard:\n" +
-		"  listen_port: 51820        # 对外暴露的 UDP 端口\n" +
-		"  private_key: \"\"           # 留空则首次启动自动生成\n" +
-		"  peer_address: 10.66.66.2\n"
-	path := writeConfig(t, body, 0o600)
-	const key = "cHJpdmF0ZSBrZXkgcGxhY2Vob2xkZXIgYnl0ZXMgIQ=="
+func TestIdentityFailureDoesNotPublish(t *testing.T) {
+	path := writeConfig(t, validConfig, 0600)
+	before, _ := os.ReadFile(path)
+	cfg, err := InitializeIdentity(path, func() (string, string, error) { return "id", "key", fmt.Errorf("entropy failed") })
+	if err == nil || cfg != nil {
+		t.Fatal("失败仍发布身份")
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("生成失败仍写回")
+	}
+}
 
-	if err := PersistPrivateKey(path, key); err != nil {
-		t.Fatalf("写回失败: %v", err)
-	}
-
-	raw := readFile(t, path)
-	if !strings.Contains(raw, "private_key: "+key) {
-		t.Errorf("私钥没有写进配置: %s", raw)
-	}
-	if strings.Count(raw, "private_key:") != 1 {
-		t.Errorf("private_key 出现了多次: %s", raw)
-	}
-	// 注释与同段里的其它字段必须原样保留。
-	wants := []string{
-		"# njuvpn 配置",
-		"# 对外暴露的 UDP 端口",
-		// 被改写的那一行自己的行尾注释也不能丢。
-		"# 留空则首次启动自动生成",
-		"listen_port: 51820",
-		"peer_address: 10.66.66.2",
-	}
-	for _, want := range wants {
-		if !strings.Contains(raw, want) {
-			t.Errorf("注释或字段丢失: %q，实际内容: %s", want, raw)
+func TestLoadRejectsAmbiguousOrOversizedYAML(t *testing.T) {
+	for _, extra := range []string{"\n---\nusername: replacement\n", "\na: &a [*a]\n", strings.Repeat("#", 256*1024+1)} {
+		if _, err := Load(writeConfig(t, validConfig+extra, 0600)); err == nil {
+			t.Fatal("无界或多文档配置被接受")
 		}
 	}
-	// 权限不能被放宽：文件里有账号口令。
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode().Perm() != 0o600 {
-		t.Errorf("权限变成了 %04o", fi.Mode().Perm())
-	}
 }
 
-// wireguard 段存在但没有 private_key 行时，插到段内。
-func TestPersistPrivateKeyInsertsIntoExistingSection(t *testing.T) {
-	body := "server: vpn.example.edu\n" +
-		"username: u\n" +
-		"password: p\n" +
-		"wireguard:\n" +
-		"  listen_port: 51820\n" +
-		"\n" +
-		"log:\n" +
-		"  level: info\n"
-	path := writeConfig(t, body, 0o600)
-	const key = "a2V5"
-
-	if err := PersistPrivateKey(path, key); err != nil {
+func TestConfiguredSPKIPinsOnly(t *testing.T) {
+	const pin = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	for _, pins := range [][]string{nil, {}, {"short"}, {strings.Repeat("00", 32)}, {pin, pin}, {strings.TrimSuffix(pin, "=")}, {pin + "\n"}} {
+		c := Config{TLS: TLS{PinnedNodeSPKISHA256: pins}}
+		if _, err := c.NodeSPKIPins(); err == nil {
+			t.Fatalf("非法白名单被接受: %d 项", len(pins))
+		}
+	}
+	c := Config{TLS: TLS{PinnedNodeSPKISHA256: []string{"a2czXjambEMdvKj+wcCn2YNF4AFf84W5AXdF4GzMGAY=", "cqCxa81gLyniGGB1PyKnjhxKN2wfBTs8NNy72SfRFpY="}}}
+	values, err := c.NodeSPKIPins()
+	if err != nil || len(values) != 2 {
 		t.Fatal(err)
 	}
-	raw := readFile(t, path)
-	if !strings.Contains(raw, "  private_key: "+key) {
-		t.Errorf("没有插入 private_key: %s", raw)
+	values[0][0] = 0
+	again, _ := c.NodeSPKIPins()
+	if again[0][0] != 0x6b {
+		t.Fatal("返回切片不是独立值")
 	}
-	// 必须插在 wireguard 段里，不能落到 log 段之后。
-	if strings.Index(raw, "private_key") > strings.Index(raw, "log:") {
-		t.Errorf("插错了位置: %s", raw)
+	for _, old := range []string{"tls:\n  pinned_node_sha256: []\n", "ipc:\n  endpoint: /tmp/custom.sock\n"} {
+		if _, err := Load(writeConfig(t, validConfig+old, 0600)); err == nil {
+			t.Fatal("旧字段被接受")
+		}
 	}
-}
-
-// 完全没有 wireguard 段时追加一段，并且结果仍可被解析。
-func TestPersistPrivateKeyAppendsSection(t *testing.T) {
-	body := "server: vpn.example.edu\nusername: u\npassword: p\n"
-	path := writeConfig(t, body, 0o600)
-	const key = "a2V5"
-
-	if err := PersistPrivateKey(path, key); err != nil {
-		t.Fatal(err)
+	missing := writeConfig(t, validConfig+"tls: {}\n", 0600)
+	if _, err := Load(missing); err == nil {
+		t.Fatal("缺失 pin 不得回退")
 	}
-	raw := readFile(t, path)
-	if !strings.Contains(raw, "wireguard:") || !strings.Contains(raw, "  private_key: "+key) {
-		t.Errorf("没有追加 wireguard 段: %s", raw)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("写回后配置无法解析: %v", err)
-	}
-	if cfg.WireGuard.PrivateKey != key {
-		t.Errorf("解析出的私钥 = %q", cfg.WireGuard.PrivateKey)
-	}
-}
-
-// 写回的私钥必须能被 Load 读回来，形成闭环。
-func TestPersistPrivateKeyRoundTrip(t *testing.T) {
-	path := writeConfig(t, validConfig, 0o600)
-	const key = "cm91bmQgdHJpcCBrZXkgYnl0ZXMh"
-
-	if err := PersistPrivateKey(path, key); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.WireGuard.PrivateKey != key {
-		t.Errorf("读回的私钥 = %q，期望 %q", cfg.WireGuard.PrivateKey, key)
-	}
-	if cfg.SourcePath() != path {
-		t.Errorf("SourcePath = %q，期望 %q", cfg.SourcePath(), path)
-	}
-}
-
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(raw)
-}
-
-// TestPersistPrivateKeyRefusesFlowSection 验证承载段写成流式时不写回。
-//
-// 往 "wireguard: {…}" 这样的一行后面插一行缩进两格的字段，会让整份文件解析
-// 不过：进程当下照跑，下一次启动却直接以“解析配置文件失败”退出，用户只能
-// 手工删改。写回方宁可失败（调用方按警告处理），也不能造出这种文件。
-func TestPersistPrivateKeyRefusesFlowSection(t *testing.T) {
-	original := "server: vpn.example.edu\nusername: u\nwireguard: {peer_address: 10.66.66.2, listen_port: 51820}\n"
-	path := writeConfig(t, original, 0o600)
-
-	err := PersistPrivateKey(path, "newkey")
-	if err == nil {
-		t.Fatal("流式写法的承载段应当拒绝写回")
-	}
-	if !strings.Contains(err.Error(), "块写法") {
-		t.Errorf("错误应当说清是写法问题，得到 %v", err)
-	}
-	if got := readFile(t, path); got != original {
-		t.Errorf("拒绝写回时文件必须原样不动，现在是:\n%s", got)
-	}
-	// 拒绝之后文件仍然可用：下一次启动还能解析。
-	if _, err := Load(path); err != nil {
-		t.Errorf("文件应当仍然可解析，得到 %v", err)
-	}
-}
-
-// TestPersistPrivateKeyRefusesToWriteBrokenYAML 验证兜底：改动后解析不过时
-// 直接不落盘，文件保持原样。
-func TestPersistPrivateKeyRefusesToWriteBrokenYAML(t *testing.T) {
-	original := "server: vpn.example.edu\n"
-	path := writeConfig(t, original, 0o600)
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 直接喂给写回层一份会解析失败的内容：模拟行编辑算法出错的后果。
-	if err := writePreservingMode(path, fi, []string{"server: vpn.example.edu", "  bad: ["}); err == nil {
-		t.Fatal("解析不过的内容应当被拒绝写回")
-	}
-	if got := readFile(t, path); got != original {
-		t.Errorf("被拒绝时文件必须原样不动，现在是:\n%s", got)
+	// 1400 是默认内层 MTU，无第二次封装扣减。
+	cfg, err := Load(writeConfig(t, "server: vpn.example.edu\nusername: u\n", 0600))
+	if err != nil || cfg.MTU != 1400 {
+		t.Fatal("默认 MTU 应为 1400", err)
 	}
 }

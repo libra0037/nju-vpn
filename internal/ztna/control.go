@@ -41,21 +41,13 @@ const (
 // 它只影响终端记录里显示的设备名，不参与鉴权：换成中性标识后登录、
 // 授信、隧道全部照常。仓库因此不需要出现任何厂商或产品字眼。
 const clientIdentity = "njuvpn"
+const maxControlBytes = 8 << 20
 
 // 服务端用来区分客户端与平台的两个固定参数。
-var sharedParams = url.Values{
-	"clientType": {"SDPClient"},
-	"platform":   {"Linux"},
-	"lang":       {"en-US"},
-}
-
 func withSharedParams(extra url.Values) url.Values {
-	out := url.Values{}
-	for k, v := range sharedParams {
-		out[k] = append([]string(nil), v...)
-	}
+	out := url.Values{"clientType": {"SDPClient"}, "platform": {"Linux"}, "lang": {"en-US"}}
 	for k, v := range extra {
-		out.Set(k, v[0])
+		out[k] = append([]string(nil), v...)
 	}
 	return out
 }
@@ -70,7 +62,7 @@ func withSharedParams(extra url.Values) url.Values {
 //   - 75500401"冷却期内重复请求短信、不算失败"被三家参考实现一致采用，沿用；
 //   - 75500001 / 75500005 / 75500006 在参考实现与实机记录里都没有定义或来源，
 //     所以一律按通用拒绝处理：猜成"会话失效"会让用户被登出、猜成"账号已在别处
-//     登录"会指错方向，而服务端自己的 message 已经带在错误里了。
+//     登录"会指错方向；未知码只输出数值，不传递任意服务端文案。
 const (
 	codeOK             = 0
 	codeSessionGone    = 75500002 // 会话失效
@@ -145,28 +137,15 @@ func newControl(opts controlOptions) (*control, error) {
 	return c, nil
 }
 
-// dialWithContext 让不感知 ctx 的拨号实现也能被取消。
 func dialWithContext(ctx context.Context, fn dial.DialFunc, network, addr string) (net.Conn, error) {
-	type result struct {
-		conn net.Conn
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		conn, err := fn(network, addr)
-		ch <- result{conn, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.conn, r.err
-	case <-ctx.Done():
-		go func() {
-			if r := <-ch; r.conn != nil {
-				_ = r.conn.Close()
-			}
-		}()
+	conn, err := fn(ctx, network, addr)
+	if ctx.Err() != nil {
+		if conn != nil {
+			conn.Close()
+		}
 		return nil, ctx.Err()
 	}
+	return conn, dial.Wrap("拨号", err)
 }
 
 func (c *control) cookies() []*http.Cookie {
@@ -206,12 +185,15 @@ func (c *control) do(ctx context.Context, method, path string, params url.Values
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, dial.Wrap("控制面请求", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, dial.Wrap("读取控制面响应", err)
+	}
+	if len(raw) > maxControlBytes {
+		return nil, &ProtocolError{What: "控制面响应超过 8 MiB"}
 	}
 	if c.debug != nil {
 		c.debug(fmt.Sprintf("%s %s -> HTTP %d, %d 字节", method, path, resp.StatusCode, len(raw)))
@@ -241,19 +223,24 @@ func envelopeDataAuth(raw []byte) (json.RawMessage, error) {
 
 // decodeEnvelope 是上面两个函数的公共实现。sessionCodes 为真时，唯一的
 // 会话失效码（75500002）翻成 ErrSessionGone；其余码一律当作"被拒绝"，
-// 服务端的 message 原样带出去。
+// 服务端的任意 message 不进入错误或日志。
 func decodeEnvelope(raw []byte, sessionCodes bool) (json.RawMessage, error) {
 	var e envelope
 	if err := json.Unmarshal(raw, &e); err != nil {
-		return nil, &ProtocolError{What: "控制面响应不是 JSON", Got: truncateForError(raw)}
+		return nil, &ProtocolError{What: "控制面响应不是 JSON"}
 	}
 	switch {
-	case e.Code == codeOK:
+	case e.Code == nil:
+		return nil, &ProtocolError{What: "控制面响应缺少整数 code"}
+	case *e.Code == codeOK:
+		if len(e.Data) == 0 || string(e.Data) == "null" {
+			return nil, &ProtocolError{What: "控制面响应缺少 data"}
+		}
 		return e.Data, nil
-	case sessionCodes && e.Code == codeSessionGone:
-		return nil, &ErrSessionGone{Code: e.Code, Message: e.Message}
+	case sessionCodes && *e.Code == codeSessionGone:
+		return nil, &ErrSessionGone{Code: *e.Code}
 	default:
-		return nil, &ErrCodeRejected{Code: e.Code, Message: e.Message}
+		return nil, &ErrCodeRejected{Code: *e.Code}
 	}
 }
 
@@ -269,7 +256,7 @@ func (c *control) manifest(ctx context.Context) error {
 	}
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
-		return &ProtocolError{What: "manifest 解析失败", Got: truncateForError(raw)}
+		return &ProtocolError{What: "manifest 解析失败"}
 	}
 	return nil
 }
@@ -318,7 +305,7 @@ func (c *control) authConfig(ctx context.Context, needTicket bool) (authConfig, 
 		AntiReplayRand string `json:"antiReplayRand"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return out, &ProtocolError{What: "authConfig 解析失败", Got: truncateForError(data)}
+		return out, &ProtocolError{What: "authConfig 解析失败"}
 	}
 	csrf := d.CSRF
 	if csrf == "" {
@@ -361,7 +348,11 @@ func (c *control) passwordLogin(ctx context.Context, username, password, domain,
 	if err != nil {
 		return out, err
 	}
-	env := base64.StdEncoding.EncodeToString([]byte(`{"deviceId":"` + c.deviceID + `"}`))
+	envJSON, err := json.Marshal(map[string]string{"deviceId": c.deviceID})
+	if err != nil {
+		return out, err
+	}
+	env := base64.StdEncoding.EncodeToString(envJSON)
 	raw, err := c.do(ctx, http.MethodPost, pathPasswordLogin, withSharedParams(nil), body,
 		map[string]string{"x-sdp-env": env})
 	if err != nil {
@@ -378,9 +369,12 @@ func (c *control) passwordLogin(ctx context.Context, username, password, domain,
 		GraphCheckCodeEnable int    `json:"graphCheckCodeEnable"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return out, &ProtocolError{What: "口令登录响应解析失败", Got: truncateForError(data)}
+		return out, &ProtocolError{What: "口令登录响应解析失败"}
 	}
 	out.Ticket = d.Ticket
+	if out.Ticket == "" || len(out.Ticket) > 4096 {
+		return out, &ProtocolError{What: "口令登录缺少有效 ticket"}
+	}
 	out.NextService = d.NextService
 	out.AntiReplayRand = d.AntiReplayRand
 	out.GraphCheckCode = d.GraphCheckCodeEnable == 1
@@ -429,7 +423,7 @@ func authStepFromData(data json.RawMessage) (authStep, error) {
 	}
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &d); err != nil {
-			return authStep{}, &ProtocolError{What: "认证链响应解析失败", Got: truncateForError(data)}
+			return authStep{}, &ProtocolError{What: "认证链响应解析失败"}
 		}
 	}
 	step := authStep{Service: d.NextService}
@@ -481,7 +475,7 @@ func (c *control) phoneNumber(ctx context.Context, authID string) ([]string, err
 		MaskIdentifierValue string          `json:"maskIdentifierValue"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return nil, &ProtocolError{What: "手机号响应解析失败", Got: truncateForError(data)}
+		return nil, &ProtocolError{What: "手机号响应解析失败"}
 	}
 	var out []string
 	if len(d.PhoneNumber) > 0 && d.PhoneNumber[0] == '[' {
@@ -511,23 +505,23 @@ func (c *control) sendSMS(ctx context.Context, authID string, withAuthID bool) (
 		return "", err
 	}
 	var e struct {
-		Code    int    `json:"code"`
+		Code    *int   `json:"code"`
 		Message string `json:"message"`
 		Data    struct {
 			Tips string `json:"tips"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &e); err != nil {
-		return "", &ProtocolError{What: "短信响应解析失败", Got: truncateForError(raw)}
+		return "", &ProtocolError{What: "短信响应解析失败"}
 	}
 	// 冷却期内重复请求返回的是上一次的响应，不算失败。
-	if e.Code != codeOK && e.Code != codeSMSAlreadySent {
-		return "", &ErrCodeRejected{Code: e.Code, Message: e.Message}
+	if e.Code == nil {
+		return "", &ProtocolError{What: "短信响应缺少整数 code"}
 	}
-	if e.Data.Tips != "" {
-		return e.Data.Tips, nil
+	if *e.Code != codeOK && *e.Code != codeSMSAlreadySent {
+		return "", &ErrCodeRejected{Code: *e.Code}
 	}
-	return e.Message, nil
+	return "验证码已发送，请检查短信", nil
 }
 
 func (c *control) submitSMS(ctx context.Context, authID string, withAuthID bool, code string) (authStep, error) {
@@ -582,7 +576,7 @@ func (c *control) onlineInfo(ctx context.Context) (onlineInfo, error) {
 		Username string `json:"username"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return out, &ProtocolError{What: "在线信息解析失败", Got: truncateForError(data)}
+		return out, &ProtocolError{What: "在线信息解析失败"}
 	}
 	out.Username = d.Username
 	return out, nil
