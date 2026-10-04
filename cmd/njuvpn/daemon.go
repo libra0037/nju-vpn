@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/config"
@@ -262,16 +260,16 @@ func shutdownService(endpoint string) error {
 }
 
 // waitServiceGone 等到服务进程真的退出（端点不再响应）。
-func waitServiceGone(endpoint string, timeout time.Duration) error {
+func waitServiceGone(endpoint string, timeout time.Duration, probe func(string) error) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := pingService(endpoint); err != nil {
+		if err := probe(endpoint); err != nil {
 			if errors.Is(err, ipc.ErrNotRunning) {
 				return nil
 			}
 			// shutdown 已获确认后，正在接入的连接可能被关闭。仍须再次确认
 			// 端点无人监听；重置连接本身不能证明旧进程已经退出。
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
+			if !ipc.IsDisconnect(err) {
 				return err
 			}
 		}

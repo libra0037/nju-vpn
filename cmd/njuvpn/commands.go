@@ -255,7 +255,7 @@ func cmdRestart(args []string) error {
 		if !errors.Is(err, ipc.ErrNotRunning) {
 			return err
 		}
-	} else if err := waitServiceGone(endpoint, serviceStopTimeout); err != nil {
+	} else if err := waitServiceGone(endpoint, serviceStopTimeout, pingService); err != nil {
 		return err
 	}
 	if err := ensureService(*configPath); err != nil {

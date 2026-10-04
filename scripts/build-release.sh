@@ -43,5 +43,5 @@ done
 ( cd "$OUT" && sha256sum njuvpn-* > SHA256SUMS )
 
 echo
-echo "产物在 $OUT："
+echo "产物在 ${OUT}："
 ls -lh "$OUT" | tail -n +2

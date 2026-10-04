@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -75,6 +77,14 @@ const MaxLineBytes = 64 * 1024
 var ErrLineTooLong = errors.New("报文行超过长度上限")
 var ErrNotRunning = errors.New("服务进程未运行")
 var ErrUntrustedPeer = errors.New("本地 IPC 对端身份不可信")
+
+// IsDisconnect 识别连接关闭，不表示监听端点已消失。退出轮询仍须等到
+// ErrNotRunning；认证失败、超时和协议错误不能用作退出证据。
+func IsDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		isPlatformDisconnect(err)
+}
 
 // Request 是一条解析后的请求。
 type Request struct {

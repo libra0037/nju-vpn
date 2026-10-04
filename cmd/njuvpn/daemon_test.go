@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -238,5 +240,43 @@ func TestWaitServiceReadyReportsStartupFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "启动后立即退出") {
 		t.Fatalf("错误应当指向启动失败，得到 %v", err)
+	}
+}
+
+func TestWaitServiceGoneRequiresAbsentEndpoint(t *testing.T) {
+	for _, disconnect := range []error{io.EOF, net.ErrClosed, syscall.ECONNRESET, syscall.EPIPE} {
+		t.Run(disconnect.Error(), func(t *testing.T) {
+			assertWaitServiceGoneAfterDisconnect(t, disconnect)
+		})
+	}
+	for _, failure := range []error{ipc.ErrUntrustedPeer, context.DeadlineExceeded, errStateUnknown} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			calls := 0
+			err := waitServiceGone("test-endpoint", time.Second, func(string) error {
+				calls++
+				return fmt.Errorf("探活: %w", failure)
+			})
+			if !errors.Is(err, failure) || calls != 1 {
+				t.Fatalf("认证、超时或错误响应不能证明退出：err=%v, calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func assertWaitServiceGoneAfterDisconnect(t *testing.T, disconnect error) {
+	t.Helper()
+	calls := 0
+	err := waitServiceGone("test-endpoint", time.Second, func(endpoint string) error {
+		if endpoint != "test-endpoint" {
+			t.Fatalf("探活了错误端点 %q", endpoint)
+		}
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("发送请求: %w", disconnect)
+		}
+		return ipc.ErrNotRunning
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("连接关闭后还须确认端点不存在：err=%v, calls=%d", err, calls)
 	}
 }

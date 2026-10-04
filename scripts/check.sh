@@ -16,7 +16,7 @@ case "${1:-}" in
   *) echo '用法：scripts/check.sh [--code-only]' >&2; exit 2 ;;
 esac
 if [[ $(go env GOVERSION) != "go$GO_VERSION" ]]; then
-  echo "要求 Go $GO_VERSION（与 go.mod 一致）" >&2
+  echo "要求 Go ${GO_VERSION}（与 go.mod 一致）" >&2
   exit 1
 fi
 
@@ -31,12 +31,13 @@ run() {
 
 # tool 打印工具的路径；找不到时打印空串。
 tool() {
-  if command -v "$1" >/dev/null 2>&1; then
-    command -v "$1"
+  local name="$1$(go env GOEXE)"
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
     return
   fi
   local candidate
-  candidate="$(go env GOPATH)/bin/$1$(go env GOEXE)"
+  candidate="$(go env GOPATH)/bin/$name"
   if [ -x "$candidate" ]; then
     echo "$candidate"
   fi
@@ -133,7 +134,7 @@ doc_check() {
   local rc=0 cmd
   for cmd in $(grep -oE 'njuvpn [a-z]+' README.md | awk '{print $2}' | sort -u); do
     if ! grep -qE "^  njuvpn $cmd( |$)" "$helps" && ! grep -qE "^  \${?[a-z]*}?njuvpn $cmd( |$)" "$helps"; then
-      echo "README 提到了子命令 $cmd，但 usage 里没有它"
+      echo "README 提到了子命令 ${cmd}，但 usage 里没有它"
       rc=1
     fi
   done
@@ -159,7 +160,7 @@ if ! $code_only; then run doc_check; fi
 
 sc=$(tool staticcheck)
 if [ -n "$sc" ]; then
-  if [[ $("$sc" -version) != "staticcheck $STATICCHECK_VERSION "* ]]; then
+  if [[ $("$sc" -version) != "staticcheck$(go env GOEXE) $STATICCHECK_VERSION "* ]]; then
     echo "staticcheck 版本须为 $STATICCHECK_VERSION"
     fail=1
   else
@@ -180,7 +181,7 @@ if [ -n "$dc" ]; then
     # 含测试分析必须无输出；生产入口另行列出只被测试使用的符号。
     for entry in "${PLATFORMS[@]}"; do
       target=${entry%:*}
-      echo "== deadcode（含测试入口）$target，tags=$BUILD_TAGS"
+      echo "== deadcode（含测试入口）${target}，tags=$BUILD_TAGS"
       if ! dc_out=$(env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" "$dc" -tags "$BUILD_TAGS" -test ./... 2>&1); then
         fail=1
       fi
