@@ -13,9 +13,6 @@ import (
 // ErrNoUplink 表示上行通道尚未建立。
 var ErrNoUplink = errors.New("隧道上行通道尚未建立")
 
-// MaxPacketBytes 是两层隧道交接的内层 IP 包上限。
-const MaxPacketBytes = 1400
-
 // 每次注册有独立身份；注销只能移除自己注册的回调。
 type uplinkBinding struct{ call func([]byte) error }
 type downlinkBinding struct{ call func([]byte) }

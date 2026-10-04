@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,7 @@ type tunnelConn struct {
 	r    *bufio.Reader
 
 	ep    *l3.Endpoint
+	mtu   int
 	flows *flowTable
 	table *resourceTable
 
@@ -78,7 +80,7 @@ type tunnelConn struct {
 	authWake       chan struct{}
 	heartbeatGap   atomic.Int32
 	rejectMu       sync.Mutex
-	rejected       [8]uint64
+	rejected       RejectionCounts
 	rejectLogAt    time.Time
 	authRetryLogAt atomic.Int64
 
@@ -99,6 +101,7 @@ type tunnelOptions struct {
 	// 生产调用不设它，只有测试会传一个很短的值。
 	HandshakeTimeout time.Duration
 	Pins             *nodeSPKIPins
+	MTU              int
 }
 
 // dialTunnel 只完成握手，返回尚未注册回调、尚未启动任务的连接。
@@ -148,7 +151,7 @@ func dialNodeTLS(ctx context.Context, opts tunnelOptions) (*tls.Conn, error) {
 	// 标准库 HandshakeContext 负责取消 TLS 握手，无需另设取消监听。
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
-		return nil, dial.Wrap("隧道节点 TLS 握手", err)
+		return nil, dial.Wrap("隧道节点 TLS 握手", errors.Join(ErrNodeTLS, err))
 	}
 	if err := ctx.Err(); err != nil {
 		_ = raw.Close()
@@ -176,6 +179,7 @@ func handshakeTunnel(ctx context.Context, opts tunnelOptions, tlsConn *tls.Conn)
 
 	t := &tunnelConn{
 		node:         opts.Node,
+		mtu:          opts.MTU,
 		conn:         tlsConn,
 		raw:          raw,
 		ep:           opts.Endpoint,
@@ -309,7 +313,7 @@ func (t *tunnelConn) Send(pkt []byte) (resultErr error) {
 		}
 		return err
 	}
-	if len(pkt) > maxPacketBytes {
+	if len(pkt) > t.mtu {
 		if info.fragmented() {
 			t.flows.rejectFragment(info.fragment)
 		}
@@ -318,7 +322,7 @@ func (t *tunnelConn) Send(pkt []byte) (resultErr error) {
 	var appID string
 	if info.offset == 0 {
 		var ok bool
-		appID, _, ok = t.table.match(info.dstIP, protoName(info.proto), info.dstPort)
+		appID, _, ok = t.table.match(netip.AddrFrom4(info.key.dst), info.proto, info.dstPort)
 		if !ok {
 			if info.fragmented() {
 				t.flows.rejectFragment(info.fragment)
@@ -343,35 +347,39 @@ func (t *tunnelConn) Send(pkt []byte) (resultErr error) {
 
 // 拒包详情不可用作限速键；有限类别只带累计数量，不输出包地址或服务端文案。
 func (t *tunnelConn) recordRejection(err error) {
-	reason, label := 0, "链路或会话不可用"
+	t.rejectMu.Lock()
+	count, label := &t.rejected.LinkUnavailable, "链路或会话不可用"
 	var protocolErr *ProtocolError
 	switch {
 	case errors.Is(err, ErrResourceUnmatched):
-		reason, label = 1, "资源表外"
+		count, label = &t.rejected.ResourceUnmatched, "资源表外"
 	case errors.Is(err, ErrFlowRejected):
-		reason, label = 2, "流鉴权失败"
+		count, label = &t.rejected.FlowRejected, "流鉴权失败"
 	case errors.Is(err, ErrPendingFull):
-		reason, label = 3, "待鉴权缓存已满"
+		count, label = &t.rejected.PendingFull, "待鉴权缓存已满"
 	case errors.Is(err, ErrFlowTableFull):
-		reason, label = 4, "流表已满"
+		count, label = &t.rejected.FlowTableFull, "流表已满"
 	case errors.Is(err, ErrFragmentMissing):
-		reason, label = 5, "分片关联不存在或过期"
+		count, label = &t.rejected.FragmentMissing, "分片关联不存在或过期"
 	case errors.Is(err, ErrFragmentOrder):
-		reason, label = 6, "分片乱序或重叠"
-	case errors.Is(err, ErrFragmentFull) || errors.Is(err, ErrPacketTooLarge) || errors.As(err, &protocolErr):
-		reason, label = 7, "报文格式或容量超限"
+		count, label = &t.rejected.FragmentOrder, "分片乱序或重叠"
+	case errors.Is(err, ErrFragmentFull):
+		count, label = &t.rejected.FragmentFull, "分片关联已满"
+	case errors.Is(err, ErrPacketTooLarge):
+		count, label = &t.rejected.MTUExceeded, "报文超过配置 MTU"
+	case errors.As(err, &protocolErr):
+		count, label = &t.rejected.InvalidPacket, "报文格式非法"
 	}
 	now := time.Now()
-	t.rejectMu.Lock()
-	t.rejected[reason]++
-	count := t.rejected[reason]
+	*count += 1
+	n := *count
 	report := t.rejectLogAt.IsZero() || now.Sub(t.rejectLogAt) >= 10*time.Second
 	if report {
 		t.rejectLogAt = now
 	}
 	t.rejectMu.Unlock()
 	if report && t.logf != nil {
-		t.logf("上行拒绝：%s，累计 %d 个包", label, count)
+		t.logf("上行拒绝：%s，累计 %d 个包", label, n)
 	}
 }
 

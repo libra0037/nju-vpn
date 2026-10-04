@@ -62,16 +62,14 @@ func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{
-		Server:   "vpn.test",
-		ServerIP: host,
-		Port:     port,
-		Username: testUser,
-		Password: testPass,
-		DeviceID: "device-test-1",
-		MTU:      1400,
-		// 假服务端用自签证书：控制面的系统信任链校验在这里必然失败，
-		// 这条通道的校验由 internal/ztna 的用例单独覆盖。
-		TLS: config.TLS{InsecureSkipVerify: true, PinnedNodeSPKISHA256: []string{pinText(srv)}},
+		Server:               "vpn.test",
+		ServerIP:             host,
+		Port:                 port,
+		Username:             testUser,
+		Password:             testPass,
+		DeviceID:             "device-test-1",
+		MTU:                  1400,
+		PinnedNodeSPKISHA256: []string{pinText(srv)},
 		WireGuard: config.WireGuard{
 			ListenPort:  0,
 			PrivateKey:  key.String(),
@@ -85,7 +83,7 @@ func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 
 func newTestService(t *testing.T, srv *ztnatest.Server, cfg *config.Config, options ...Options) *Service {
 	t.Helper()
-	opts := Options{Dial: srv.Dial, ReconnectBackoff: time.Millisecond}
+	opts := Options{Dial: srv.Dial, ControlRootCAs: srv.RootCAs(), ReconnectBackoff: time.Millisecond}
 	if len(options) > 0 {
 		opts.AuthWaitTimeout = options[0].AuthWaitTimeout
 		opts.CommandTimeout = options[0].CommandTimeout
@@ -593,7 +591,7 @@ func TestListenHostTablesAgree(t *testing.T) {
 func loadWithListenHost(t *testing.T, value string) error {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	content := "server: vpn.example\nusername: u\nmtu: 1400\ntls:\n  pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\nwireguard:\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
+	content := "server: vpn.example\nusername: u\nmtu: 1400\npinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\nwireguard:\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -36,11 +36,11 @@ func TestResourcesReadsCurrentSessionWithoutSideEffects(t *testing.T) {
 				if r.Code != 200 {
 					t.Fatal(r)
 				}
-				var list []ztna.Resource
-				if err := json.Unmarshal([]byte(r.Message), &list); err != nil || list == nil {
+				var list ztna.L3Resources
+				if err := json.Unmarshal([]byte(r.Message), &list); err != nil || list.IP == nil || list.NodeGroup == nil {
 					t.Fatal("无效快照", r)
 				}
-				if empty && len(list) != 0 || !empty && len(list) != 1 {
+				if empty && len(list.IP) != 0 || !empty && len(list.IP) != 1 {
 					t.Fatal("快照丢失", list)
 				}
 			}

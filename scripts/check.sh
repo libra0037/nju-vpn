@@ -36,7 +36,7 @@ tool() {
     return
   fi
   local candidate
-  candidate="$(go env GOPATH)/bin/$1"
+  candidate="$(go env GOPATH)/bin/$1$(go env GOEXE)"
   if [ -x "$candidate" ]; then
     echo "$candidate"
   fi
@@ -80,19 +80,29 @@ terminology_check() {
 }
 if ! $code_only; then run terminology_check; fi
 
-# gofmt -l 有输出就算失败（它列出的是没格式化的文件）。
-fmt_out=$(gofmt -l . 2>&1)
-if [ -n "$fmt_out" ]; then
-  echo "== gofmt -l ."
-  echo "$fmt_out"
+# 从模块目录检查 Git 已跟踪及未忽略的 Go 文件；dist/ 中的只读参考仓库
+# 不属于本项目源文件。新文件也进入检查，不能依赖是否已经暂存。
+go_sources=()
+while IFS= read -r -d '' go_source; do
+  go_sources+=("$go_source")
+done < <(git ls-files --cached --others --exclude-standard -z -- '*.go')
+if [ "${#go_sources[@]}" -eq 0 ]; then
+  echo '格式检查：未找到仓库自有 Go 文件'
   fail=1
+else
+  fmt_out=$(gofmt -l "${go_sources[@]}" 2>&1)
+  if [ -n "$fmt_out" ]; then
+    echo '== gofmt -l（仓库自有 Go 文件）'
+    echo "$fmt_out"
+    fail=1
+  fi
 fi
 
 run go run scripts/check-enums.go
 run go vet -tags "$BUILD_TAGS" ./...
 run go build -tags "$BUILD_TAGS" ./...
 # 发布脚本给的六个组合都要能编译：Windows 与 macOS 的分支在 Linux 上编译不到，
-# 交叉编译是它们唯一的守门人（曾经漏掉 windows/amd64 的一次改坏就是这么发现的）。
+# 交叉编译与原生 CI 共同覆盖各平台分支。
 for entry in "${PLATFORMS[@]}"; do
   target=${entry%:*}
   run env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -tags "$BUILD_TAGS" ./...
@@ -149,7 +159,7 @@ if ! $code_only; then run doc_check; fi
 
 sc=$(tool staticcheck)
 if [ -n "$sc" ]; then
-  if [[ $($sc -version) != "staticcheck $STATICCHECK_VERSION "* ]]; then
+  if [[ $("$sc" -version) != "staticcheck $STATICCHECK_VERSION "* ]]; then
     echo "staticcheck 版本须为 $STATICCHECK_VERSION"
     fail=1
   else

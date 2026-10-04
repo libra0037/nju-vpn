@@ -17,17 +17,14 @@ device_id: ""
 # 出站代理，留空表示直连。支持 http:// 与 socks5:// 两种写法。
 proxy: ""
 
-tls:
-  # 关闭控制面（登录、验证码、资源表）的证书校验，默认不关闭。
-  insecure_skip_verify: false
-  # 自签节点唯一的信任来源：DER SubjectPublicKeyInfo 的 SHA-256，
-  # 使用带填充的标准 Base64。必须有 1–16 项且不重复；程序只读、不自动补录。
-  # 以下两项是本部署已观测到的活跃指纹，证书有效期均为一年。
-  # 同公钥续签无需修改；换公钥须通过可信来源确认并更新，再 njuvpn restart。
-  # insecure_skip_verify 不影响节点的 SPKI 校验。
-  pinned_node_spki_sha256:
-    - "a2czXjambEMdvKj+wcCn2YNF4AFf84W5AXdF4GzMGAY="
-    - "cqCxa81gLyniGGB1PyKnjhxKN2wfBTs8NNy72SfRFpY="
+# 自签节点唯一的信任来源：DER SubjectPublicKeyInfo 的 SHA-256，
+# 使用带填充的标准 Base64。必须有 1–16 项且不重复；程序只读、不自动补录。
+# 以下两项是本部署已观测到的活跃指纹，证书有效期均为一年。
+# 同公钥续签无需修改；换公钥须通过可信来源确认并更新，再 njuvpn restart。
+# 控制面始终校验证书链与名称。
+pinned_node_spki_sha256:
+  - "a2czXjambEMdvKj+wcCn2YNF4AFf84W5AXdF4GzMGAY="
+  - "cqCxa81gLyniGGB1PyKnjhxKN2wfBTs8NNy72SfRFpY="
 
 wireguard:
   # 对外暴露的 UDP 端口。留空或填 0 都按默认值 51820 处理。
@@ -41,6 +38,7 @@ wireguard:
   # 分配给 WireGuard 对端的地址。
   peer_address: 10.66.66.2
 
+# 两段隧道共用的内层 MTU。
 mtu: 1400
 
 log:

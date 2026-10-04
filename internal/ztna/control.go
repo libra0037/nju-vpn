@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -90,8 +92,8 @@ type controlOptions struct {
 	Dial     dial.DialFunc
 	DeviceID string
 	Debug    func(string)
-	// InsecureSkipVerify 关闭证书校验；默认 false，也就是走系统信任链。
-	InsecureSkipVerify bool
+	// RootCAs 为测试提供受控信任；nil 使用系统信任链，名称校验始终开启。
+	RootCAs *x509.CertPool
 }
 
 // controlTimeout 是控制面单次请求的整体上限（连接、TLS 与响应都算在内）。
@@ -128,7 +130,7 @@ func newControl(opts controlOptions) (*control, error) {
 			// 默认走系统信任链：门户证书由公共 CA 签发，链与名称都能校验，
 			// 口令与验证码因此不会交给路上的中间人（ServerName 由 URL 的主机名
 			// 推导，即使实际连的是 server_ip 也按门户域名校验）。
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkipVerify},
+			TLSClientConfig: &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12},
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return dialWithContext(ctx, opts.Dial, network, opts.DialAddr)
 			},
@@ -185,6 +187,10 @@ func (c *control) do(ctx context.Context, method, path string, params url.Values
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
+		var certErr *tls.CertificateVerificationError
+		if errors.As(err, &certErr) {
+			err = errors.Join(ErrControlTLS, err)
+		}
 		return nil, dial.Wrap("控制面请求", err)
 	}
 	defer resp.Body.Close()

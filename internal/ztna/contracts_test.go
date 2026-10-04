@@ -9,6 +9,7 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -30,28 +31,24 @@ func TestCryptoInputsHaveCPUAndLengthBudgets(t *testing.T) {
 		t.Fatal("构造时不得拨号")
 		return nil, nil
 	}
-	if _, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", Dial: fn, DeviceID: "device", NodeSPKIPins: [][32]byte{{1}}}); err != nil {
+	if _, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", Dial: fn, DeviceID: "device", NodeSPKIPins: [][32]byte{{1}}, MTU: 1400}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestEncodedResourceBudgetIncludesEscaping(t *testing.T) {
-	for _, list := range [][]Resource{
-		nil, {}, {{ID: "<>\\\n\x1b", NodeGroupID: "g", AddressList: nil}},
-		{{ID: "a", AddressList: []ResourceAddress{{Host: "<>\\", IP: []string{"a", "b"}}}}},
-	} {
-		table := &resourceTable{resources: list}
-		want, _ := json.Marshal(list)
-		if list == nil {
-			want = []byte("[]")
-		}
-		got, err := table.snapshotJSON(len(want))
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatal("计数与完整 JSON 不符", string(want), string(got), err)
-		}
-		if got, err := table.snapshotJSON(len(want) - 1); !errors.Is(err, ErrResourceSnapshotTooLarge) || got != nil {
-			t.Fatal("超限仍有部分响应", got, err)
-		}
+	resources := L3Resources{
+		IP:        []IPv4Resource{{ID: "<>\\\n\x1b", NodeGroupID: "g", Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: ResourceProtocolTCP, Port: [2]uint16{443, 443}}},
+		NodeGroup: map[string][]ResourceNode{"g": {{Address: "node.test:441", Type: "wan"}}},
+	}
+	table := &resourceTable{L3Resources: resources}
+	const want = `{"ip":[{"id":"\u003c\u003e\\\n\u001b","nodeGroupId":"g","protocol":6,"host":"192.0.2.1/32","port":[443,443]}],"dns":{"firstDNS":"","secondDNS":""},"nodegroup":{"g":[{"address":"node.test:441","type":"wan"}]}}`
+	got, err := table.snapshotJSON(len(want))
+	if err != nil || !bytes.Equal(got, []byte(want)) {
+		t.Fatal("恰好达到预算的完整 JSON 被拒绝", string(got), err)
+	}
+	if got, err := table.snapshotJSON(len(want) - 1); !errors.Is(err, ErrResourceSnapshotTooLarge) || got != nil {
+		t.Fatal("超限仍有部分响应", got, err)
 	}
 }
 func TestHandshakeSIDChecksEncodedLength(t *testing.T) {
@@ -128,16 +125,16 @@ func TestMalformedTailClearsExistingAssociation(t *testing.T) {
 func BenchmarkResourceMatch(b *testing.B) {
 	for _, n := range []int{256, 16384} {
 		b.Run(stringSize(n), func(b *testing.B) {
-			entries := make([]resourceEntry, n)
-			for i := range entries {
-				entries[i] = resourceEntry{ipMin: uint32(i), ipMax: uint32(i), proto: "all", portMax: 65535, appID: "a"}
+			rules := make([]IPv4Resource, n)
+			for i := range rules {
+				rules[i] = IPv4Resource{Host: netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), 32), Protocol: ResourceProtocolAll, Port: [2]uint16{1, 65535}, ID: "a"}
 			}
-			table := &resourceTable{entries: entries}
-			dst := net.IPv4(255, 255, 255, 254)
+			table := &resourceTable{L3Resources: L3Resources{IP: rules}}
+			dst := netip.MustParseAddr("255.255.255.254")
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				table.match(dst, "tcp", 443)
+				table.match(dst, protoTCP, 443)
 			}
 		})
 	}

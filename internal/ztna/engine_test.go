@@ -54,9 +54,8 @@ func newTestClient(t *testing.T, srv *ztnatest.Server, password string) *Client 
 		Password:         password,
 		DeviceID:         "device-test-1",
 		Logf:             t.Logf,
-		// 假服务端用自签证书，控制面的系统信任链校验在这里必然失败——
-		// 这条通道的校验由 internal/ztna/verify_test.go 单独覆盖。
-		InsecureSkipVerify: true,
+		ControlRootCAs:   srv.RootCAs(),
+		MTU:              1400,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +239,7 @@ func TestConnectUsesPasswordFromOptions(t *testing.T) {
 // 服务端名额，调用方要拿它去登出。空会话因此是合法状态，方法必须自己挡住。
 func TestDeviceSessionWithoutLoginDoesNotPanic(t *testing.T) {
 	// 离线拨号失败发生在会话构造之后，仍须能关闭返回的半完成对象。
-	client, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", DeviceID: "test", Dial: func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("offline") }, Username: testUser, Password: testPass, NodeSPKIPins: [][32]byte{{1}}})
+	client, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", DeviceID: "test", Dial: func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("offline") }, Username: testUser, Password: testPass, NodeSPKIPins: [][32]byte{{1}}, MTU: 1400})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,14 +334,33 @@ func TestOpenDevicesUntrustAll(t *testing.T) {
 }
 
 func TestConnectRejectsAlreadyOnline(t *testing.T) {
-	srv := newFake(t, ztnatest.Options{})
+	const rejectCode = 75500123 // 仅验证通用拒绝，不赋予真实服务端码含义。
+	srv := newFake(t, ztnatest.Options{AlreadyOnlineCode: rejectCode})
 	client := newTestClient(t, srv, testPass)
 	ctx := context.Background()
-	if _, err := client.Connect(ctx, ConnectOptions{}); err != nil {
+	first, err := client.Connect(ctx, ConnectOptions{})
+	if first != nil {
+		t.Cleanup(func() { first.Close(ctx) })
+	}
+	if err != nil {
 		t.Fatalf("第一次登录应成功: %v", err)
 	}
-	if _, err := client.Connect(ctx, ConnectOptions{}); err != nil {
-		t.Logf("第二次登录的错误（假服务端不限制在线数）: %v", err)
+	second, err := client.Connect(ctx, ConnectOptions{})
+	if second != nil {
+		t.Cleanup(func() { second.Close(ctx) })
+	}
+	rejected, ok := AsRejected(err)
+	if !ok || rejected.Code != rejectCode {
+		t.Fatalf("第二次登录须返回明确拒绝，得到 %v", err)
+	}
+	if second == nil || !second.closed || second.active != nil {
+		t.Fatal("被拒登录的局部会话未关闭")
+	}
+	if srv.LogoutCount() != 0 || srv.Tunnels() != 1 || first.ClientIP() == nil {
+		t.Fatal("拒绝第二次登录不应登出或拆除第一条会话")
+	}
+	if err := first.Close(ctx); err != nil || srv.LogoutCount() != 1 {
+		t.Fatal("成功会话必须完成一次登出", err)
 	}
 }
 

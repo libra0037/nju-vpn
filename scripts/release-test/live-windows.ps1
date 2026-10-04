@@ -338,7 +338,7 @@ try {
     $lines = @(& $binary resources -config $ConfigPath 2>&1)
     $code = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($code -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 1) { throw '资源列表失败、为空或打印不完整' }
+    if ($code -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 4) { throw 'IPv4 资源列表失败、为空或 DNS 打印不完整' }
     Record 'resources-complete'
     Invoke-Cli 'start'
     $again = Read-Helper 'resources'

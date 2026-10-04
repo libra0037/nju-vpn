@@ -32,8 +32,7 @@ func TestControlPlaneTreatsRedirectAsFailure(t *testing.T) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},
-		// 生产走系统信任链；这里对着自签的测试服务端，显式关掉。
-		InsecureSkipVerify: true,
+		RootCAs: origin.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs,
 	})
 	if err != nil {
 		t.Fatal(err)

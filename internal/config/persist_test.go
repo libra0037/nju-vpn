@@ -98,12 +98,12 @@ func TestLoadRejectsAmbiguousOrOversizedYAML(t *testing.T) {
 func TestConfiguredSPKIPinsOnly(t *testing.T) {
 	const pin = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	for _, pins := range [][]string{nil, {}, {"short"}, {strings.Repeat("00", 32)}, {pin, pin}, {strings.TrimSuffix(pin, "=")}, {pin + "\n"}} {
-		c := Config{TLS: TLS{PinnedNodeSPKISHA256: pins}}
+		c := Config{PinnedNodeSPKISHA256: pins}
 		if _, err := c.NodeSPKIPins(); err == nil {
 			t.Fatalf("非法白名单被接受: %d 项", len(pins))
 		}
 	}
-	c := Config{TLS: TLS{PinnedNodeSPKISHA256: []string{"a2czXjambEMdvKj+wcCn2YNF4AFf84W5AXdF4GzMGAY=", "cqCxa81gLyniGGB1PyKnjhxKN2wfBTs8NNy72SfRFpY="}}}
+	c := Config{PinnedNodeSPKISHA256: []string{"a2czXjambEMdvKj+wcCn2YNF4AFf84W5AXdF4GzMGAY=", "cqCxa81gLyniGGB1PyKnjhxKN2wfBTs8NNy72SfRFpY="}}
 	values, err := c.NodeSPKIPins()
 	if err != nil || len(values) != 2 {
 		t.Fatal(err)
@@ -113,12 +113,12 @@ func TestConfiguredSPKIPinsOnly(t *testing.T) {
 	if again[0][0] != 0x6b {
 		t.Fatal("返回切片不是独立值")
 	}
-	for _, old := range []string{"tls:\n  pinned_node_sha256: []\n", "ipc:\n  endpoint: /tmp/custom.sock\n"} {
+	for _, old := range []string{"tls: {}\n", "tls:\n  pinned_node_spki_sha256: []\n", "insecure_skip_verify: true\n", "tls:\n  pinned_node_sha256: []\n", "ipc:\n  endpoint: /tmp/custom.sock\n"} {
 		if _, err := Load(writeConfig(t, validConfig+old, 0600)); err == nil {
 			t.Fatal("旧字段被接受")
 		}
 	}
-	missing := writeConfig(t, validConfig+"tls: {}\n", 0600)
+	missing := writeConfig(t, validConfig+"pinned_node_spki_sha256: []\n", 0600)
 	if _, err := Load(missing); err == nil {
 		t.Fatal("缺失 pin 不得回退")
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/libra0037/nju-vpn/internal/l3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,24 +40,11 @@ type Config struct {
 	DeviceID  string    `yaml:"device_id"`
 	Proxy     string    `yaml:"proxy"`
 	WireGuard WireGuard `yaml:"wireguard"`
-	TLS       TLS       `yaml:"tls"`
-	MTU       int       `yaml:"mtu"`
-	Log       Log       `yaml:"log"`
-}
-
-// TLS 是两条 TLS 通道的校验策略。
-//
-// 控制面（登录、验证码、资源表）走系统信任链：实测门户证书是公共 CA 签发的
-// （DigiCert，CN=*.nju.edu.cn），校验能直接通过，口令与验证码因此不再暴露给
-// 路上的中间人。数据面节点是自签证书（CN=sdp，与节点地址无关），链与名称都
-// 不可能校验，只能按指纹认身份。
-type TLS struct {
-	// InsecureSkipVerify 关闭控制面的证书校验。默认关闭校验=false，也就是
-	// 正常校验；只有网关换成系统不认的证书（自签、内网 CA）时才需要打开。
-	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
-	// PinnedNodeSPKISHA256 是自签节点唯一的信任来源；程序只读，不自动补录。
+	// PinnedNodeSPKISHA256 是自签节点唯一的信任来源，程序只读、不自动补录。
 	// 每项为 DER SubjectPublicKeyInfo 的 SHA-256 摘要，使用标准 Base64。
 	PinnedNodeSPKISHA256 []string `yaml:"pinned_node_spki_sha256"`
+	MTU                  int      `yaml:"mtu"`
+	Log                  Log      `yaml:"log"`
 }
 
 type WireGuard struct {
@@ -76,28 +63,27 @@ type Log struct {
 // 两层隧道交接同一个内层 IP 包，不能在这里再扣 WireGuard 外层开销。
 const (
 	MinMTU         = 576
-	MaxMTU         = l3.MaxPacketBytes
 	maxNodePins    = 16
 	maxConfigBytes = 256 * 1024
 )
 
 // NodeSPKIPins 在配置边界验证指纹并交出独立的不可变值副本。
 func (c *Config) NodeSPKIPins() ([][sha256.Size]byte, error) {
-	list := c.TLS.PinnedNodeSPKISHA256
+	list := c.PinnedNodeSPKISHA256
 	if len(list) == 0 || len(list) > maxNodePins {
-		return nil, fmt.Errorf("tls.pinned_node_spki_sha256 必须包含 1-%d 项", maxNodePins)
+		return nil, fmt.Errorf("pinned_node_spki_sha256 必须包含 1-%d 项", maxNodePins)
 	}
 	out := make([][sha256.Size]byte, 0, len(list))
 	seen := make(map[[sha256.Size]byte]bool, len(list))
 	for i, raw := range list {
 		decoded, err := base64.StdEncoding.Strict().DecodeString(raw)
 		if err != nil || len(decoded) != sha256.Size || base64.StdEncoding.EncodeToString(decoded) != raw {
-			return nil, fmt.Errorf("tls.pinned_node_spki_sha256 第 %d 项须为 32 字节摘要的标准 Base64", i+1)
+			return nil, fmt.Errorf("pinned_node_spki_sha256 第 %d 项须为 32 字节摘要的标准 Base64", i+1)
 		}
 		var sum [sha256.Size]byte
 		copy(sum[:], decoded)
 		if seen[sum] {
-			return nil, fmt.Errorf("tls.pinned_node_spki_sha256 第 %d 项重复", i+1)
+			return nil, fmt.Errorf("pinned_node_spki_sha256 第 %d 项重复", i+1)
 		}
 		seen[sum] = true
 		out = append(out, sum)
@@ -249,7 +235,8 @@ func (c *Config) applyDefaults() {
 		c.Port = 443
 	}
 	if c.MTU == 0 {
-		c.MTU = MaxMTU
+		// 1400 是已实测可用的默认值，不是服务端的已知上限。
+		c.MTU = 1400
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
@@ -282,8 +269,9 @@ func (c *Config) validate() error {
 	}
 	// password 允许留空：此时由 `njuvpn start` 在终端现问，经本地套接字
 	// 交给服务进程，只留在内存里（不落盘、不进 argv、不进日志）。
-	if c.MTU < MinMTU || c.MTU > MaxMTU {
-		return fmt.Errorf("mtu 超出范围（应在 %d-%d 之间）", MinMTU, MaxMTU)
+	// IPv4 总长度与校园数据帧的包长均为 16 位；1400 只是默认值。
+	if c.MTU < MinMTU || c.MTU > math.MaxUint16 {
+		return fmt.Errorf("mtu 超出范围（应在 %d-%d 之间）", MinMTU, math.MaxUint16)
 	}
 	// 0 在 applyDefaults 里已经被换成默认端口，这里不会见到。
 	if p := c.WireGuard.ListenPort; p < 1 || p > 65535 {

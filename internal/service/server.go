@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -168,7 +170,7 @@ func (s *Server) handle(conn net.Conn) {
 				if errors.Is(err, ipc.ErrLineTooLong) {
 					msg = fmt.Sprintf("请求超过 %d 字节的长度上限", ipc.MaxLineBytes)
 				}
-				_ = s.writeResponse(conn, "", ipc.Response{Code: ipc.CodeBadRequest, Message: msg})
+				_ = s.writeResponse(conn, ipc.Response{Code: ipc.CodeBadRequest, Message: msg})
 			}
 			return
 		}
@@ -186,20 +188,17 @@ func (s *Server) reply(conn net.Conn, req ipc.Request) error {
 		case s.resourceReply <- struct{}{}:
 			defer func() { <-s.resourceReply }()
 		default:
-			return s.writeResponse(conn, req.Command, ipc.Response{
+			return s.writeResponse(conn, ipc.Response{
 				Code: ipc.CodeRejected, Message: "资源查询正在进行，请稍后重试",
 			})
 		}
 	}
-	return s.writeResponse(conn, req.Command, s.dispatch(req))
+	return s.writeResponse(conn, s.dispatch(req))
 }
 
-func (s *Server) writeResponse(conn net.Conn, command string, resp ipc.Response) error {
+func (s *Server) writeResponse(conn net.Conn, resp ipc.Response) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		return err
-	}
-	if command == ipc.CmdResources {
-		return ipc.WriteResourcesResponse(conn, resp)
 	}
 	return ipc.WriteResponse(conn, resp)
 }
@@ -224,23 +223,42 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		return ipc.Response{Code: ipc.CodeOK, Message: string(s.svc.Status().State)}
 
 	case ipc.CmdStatus:
+		check, jsonOutput := false, false
+		for _, arg := range req.Args {
+			switch {
+			case arg == "check" && !check:
+				check = true
+			case arg == "json" && !jsonOutput:
+				jsonOutput = true
+			default:
+				return ipc.Response{Code: ipc.CodeBadRequest, Message: "status 只接受 check 与 json 各一次"}
+			}
+		}
 		st := s.svc.Status()
+		message := statusLine(st)
+		if jsonOutput {
+			body, err := json.Marshal(st)
+			if err != nil {
+				return ipc.Response{Code: ipc.CodeServerError, Message: "状态快照编码失败"}
+			}
+			message = string(body)
+		}
 		// status check 给巡检脚本用：链路不在 up 时以非 0 退出，而不是把
 		// "进程活着"当成"链路正常"。正在退避重连时也算不正常：状态还是
 		// up（隧道对象还在），但链路是断的。
-		if ipc.Arg(req.Args, 0) == "check" && (st.State != StateUp || st.Retrying) {
-			return ipc.Response{Code: ipc.CodeRejected, Message: statusLine(st)}
+		if check && (st.State != StateUp || st.Retrying) {
+			return ipc.Response{Code: ipc.CodeRejected, Message: message}
 		}
-		return ipc.Response{Code: ipc.CodeOK, Message: statusLine(st)}
+		return ipc.Response{Code: ipc.CodeOK, Message: message}
 
 	case ipc.CmdResources:
 		if len(req.Args) != 0 {
 			return ipc.Response{Code: ipc.CodeBadRequest, Message: "resources 不接受参数"}
 		}
-		body, err := s.svc.ResourcesJSON(ipc.MaxResourcesResponseBytes - len("200 \n"))
+		body, err := s.svc.ResourcesJSON(ipc.MaxLineBytes - len("200 \n"))
 		if err != nil {
 			if errors.Is(err, ztna.ErrResourceSnapshotTooLarge) {
-				return ipc.Response{Code: ipc.CodeServerError, Message: fmt.Sprintf("资源列表超过 %d 字节的 IPC 响应上限", ipc.MaxResourcesResponseBytes)}
+				return ipc.Response{Code: ipc.CodeServerError, Message: fmt.Sprintf("资源列表超过 %d 字节的 IPC 响应上限", ipc.MaxLineBytes)}
 			}
 			return ipc.Response{Code: ipc.CodeRejected, Message: ztna.ErrResourcesUnavailable.Error()}
 		}
@@ -388,6 +406,36 @@ func statusLine(st Status) string {
 	}
 	if st.Detail != "" {
 		msg += " | " + st.Detail
+	}
+	if st.Failure != "" {
+		msg += " | 原因 " + st.Failure
+	}
+	peer := "未配置"
+	if st.WireGuard.Configured {
+		peer = "等待握手"
+		if st.WireGuard.Ready {
+			peer = "已握手"
+		}
+	}
+	msg += " | WireGuard " + peer
+	var drops []string
+	for reason, count := range st.WireGuard.Drops {
+		drops = append(drops, fmt.Sprintf("%s=%d", reason, count))
+	}
+	if len(drops) > 0 {
+		sort.Strings(drops)
+		msg += " | 承载丢包 " + strings.Join(drops, ", ")
+	}
+	if st.Tunnel != nil {
+		link := "断开"
+		if st.Tunnel.Connected {
+			link = "已连接"
+		}
+		msg += fmt.Sprintf(" | 校园隧道%s，MTU %d", link, st.Tunnel.MTU)
+		r := st.Tunnel.Rejected
+		msg += fmt.Sprintf(" | 上行拒包：资源 %d，鉴权 %d，分片 %d，MTU %d，容量 %d，格式 %d，链路 %d",
+			r.ResourceUnmatched, r.FlowRejected, r.FragmentMissing+r.FragmentOrder,
+			r.MTUExceeded, r.PendingFull+r.FlowTableFull+r.FragmentFull, r.InvalidPacket, r.LinkUnavailable)
 	}
 	if st.ClientIP != "" {
 		msg += " | 校园网地址 " + st.ClientIP

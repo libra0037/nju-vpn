@@ -199,8 +199,8 @@ func TestPrepareLeavesSourceAndPinsUnchanged(t *testing.T) {
 	cfg := &config.Config{
 		Server: "test.invalid", Username: "release-test", Password: "secret-never-printed",
 		DeviceID: "test-device", MTU: 1400, Proxy: "socks5://test.invalid:1000",
-		WireGuard: config.WireGuard{ListenPort: 51821, ListenHost: "loopback", PeerAddress: "10.66.66.2", PrivateKey: serverKey.String()},
-		TLS:       config.TLS{PinnedNodeSPKISHA256: []string{base64.StdEncoding.EncodeToString(make([]byte, 32))}},
+		WireGuard:            config.WireGuard{ListenPort: 51821, ListenHost: "loopback", PeerAddress: "10.66.66.2", PrivateKey: serverKey.String()},
+		PinnedNodeSPKISHA256: []string{base64.StdEncoding.EncodeToString(make([]byte, 32))},
 	}
 	body, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -232,7 +232,7 @@ func TestPrepareLeavesSourceAndPinsUnchanged(t *testing.T) {
 	}
 	if prepared.DeviceID != loaded.DeviceID || prepared.Password != loaded.Password || prepared.Proxy != loaded.Proxy ||
 		prepared.WireGuard.PrivateKey != loaded.WireGuard.PrivateKey ||
-		strings.Join(prepared.TLS.PinnedNodeSPKISHA256, ",") != strings.Join(loaded.TLS.PinnedNodeSPKISHA256, ",") {
+		strings.Join(prepared.PinnedNodeSPKISHA256, ",") != strings.Join(loaded.PinnedNodeSPKISHA256, ",") {
 		t.Fatal("独立配置丢失原身份或 TLS 策略")
 	}
 	if after, err := os.ReadFile(source); err != nil || string(after) != string(body) {

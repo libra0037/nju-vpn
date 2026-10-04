@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -243,43 +244,39 @@ func TestParsePacketRejectsBadInput(t *testing.T) {
 	}
 }
 
-func TestParseIPRangeAndPortRange(t *testing.T) {
-	lo, hi, ok := parseIPRange("10.0.0.0/24")
-	if !ok || lo != binary.BigEndian.Uint32(net.ParseIP("10.0.0.0").To4()) || hi != binary.BigEndian.Uint32(net.ParseIP("10.0.0.255").To4()) {
-		t.Errorf("CIDR 解析结果 = %d-%d（%v）", lo, hi, ok)
-	}
-	lo, hi, ok = parseIPRange("10.0.0.1-10.0.0.5")
-	if !ok || hi-lo != 4 {
-		t.Errorf("区间解析结果 = %d-%d（%v）", lo, hi, ok)
-	}
-	lo, hi, ok = parseIPRange("10.0.0.7")
-	if !ok || lo != hi {
-		t.Errorf("单地址解析结果 = %d-%d（%v）", lo, hi, ok)
-	}
-	if _, _, ok := parseIPRange("example.com"); ok {
-		t.Error("域名不该被当成可匹配的资源")
-	}
-
-	if a, b, ok := parsePortRange(""); a != 1 || b != 65535 || !ok {
-		t.Errorf("空端口 = %d-%d（%v），期望全放行", a, b, ok)
-	}
-	if a, b, ok := parsePortRange("0"); a != 1 || b != 65535 || !ok {
-		t.Errorf("端口 0 = %d-%d（%v），期望全放行", a, b, ok)
-	}
-	if a, b, ok := parsePortRange("443"); a != 443 || b != 443 || !ok {
-		t.Errorf("单端口 = %d-%d（%v）", a, b, ok)
-	}
-	if a, b, ok := parsePortRange("8000-8100"); a != 8000 || b != 8100 || !ok {
-		t.Errorf("端口段 = %d-%d（%v）", a, b, ok)
-	}
-	// 看不懂的写法要明确报出来（调用方按整段处理并计数），而不是悄悄放行。
-	for _, spec := range []string{"abc", "443-80", "-1", "70000", "80,"} {
-		a, b, ok := parsePortRange(spec)
-		if ok {
-			t.Errorf("%q 不该被解析成 %d-%d", spec, a, b)
+func TestParseIPv4ResourceHostAndPortRange(t *testing.T) {
+	for _, tc := range []struct{ host, want string }{
+		{"10.0.0.7", "10.0.0.7/32"},
+		{"10.0.0.7/24", "10.0.0.0/24"},
+		{"255.255.255.255/0", "0.0.0.0/0"},
+		{"255.255.255.255/32", "255.255.255.255/32"},
+	} {
+		got, ok := parseIPv4ResourceHost(tc.host)
+		if !ok || got.String() != tc.want {
+			t.Errorf("%q = %v（%v），期望 %s", tc.host, got, ok, tc.want)
 		}
-		if a != 1 || b != 65535 {
-			t.Errorf("%q 的兜底 = %d-%d，期望 1-65535", spec, a, b)
+	}
+	for _, host := range []string{"", "example.com", "*.example.com", "10.0.0.1-10.0.0.5", "10.0.0.0/33", "256.0.0.1", "010.0.0.1", "10.0.0.1 ", "::1", "::/0", "::ffff:10.0.0.1", "::ffff:10.0.0.0/120"} {
+		if _, ok := parseIPv4ResourceHost(host); ok {
+			t.Errorf("%q 不应进入 IPv4 资源表", host)
+		}
+	}
+	for _, tc := range []struct {
+		spec   string
+		lo, hi uint16
+	}{
+		{"", 1, 65535}, {"0", 1, 65535}, {"443", 443, 443},
+		{"8000-8100", 8000, 8100}, {"65535", 65535, 65535},
+	} {
+		lo, hi, ok := parsePortRange(tc.spec)
+		if !ok || lo != tc.lo || hi != tc.hi {
+			t.Errorf("%q = %d-%d（%v），期望 %d-%d", tc.spec, lo, hi, ok, tc.lo, tc.hi)
+		}
+	}
+	for _, spec := range []string{"abc", "443-80", "-1", "65536", "80,443", "80-", "1-2-3", "0-65535", "+80"} {
+		lo, hi, ok := parsePortRange(spec)
+		if ok || lo != 0 || hi != 0 {
+			t.Errorf("%q 不应产生可用端口段：%d-%d（%v）", spec, lo, hi, ok)
 		}
 	}
 }
@@ -288,44 +285,44 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 	raw := []byte(`{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[
 		{"id":"app-a","nodeGroupId":"groupWan","accessModel":"L3VPN","addressList":[
 			{"protocol":"tcp","port":"443","host":"10.1.0.0/16"},
-			{"protocol":"all","port":"0","host":"172.16.0.1-172.16.0.9"}]},
+			{"protocol":"all","port":"0","host":"172.16.0.0/29"}]},
 		{"id":"app-b","nodeGroupId":"groupWan","accessModel":"Web","addressList":[
 			{"protocol":"all","port":"0","host":"10.2.0.0/16"}]}
 		]}],"config":{"nodeGroupConf":{"majorNodeGroup":{"id":"groupWan"},"nodeGroupList":[
 		{"id":"groupWan","addressInfo":[{"address":"node-a:441","type":"wan"}]},
 		{"id":"groupLan","addressInfo":[{"address":"node-b:441","type":"lan"}]}]}}}},
-		"sdpPolicy":{"data":{"clientOption":{"dnsOption":{"firstDNS":"10.0.0.53"}}}}}}`)
+		"sdpPolicy":{"data":{"clientOption":{"dnsOptionV2":{"firstDNS":"10.0.0.53"}}}}}}`)
 
 	table, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(table.entries) != 2 {
-		t.Fatalf("资源条数 = %d，期望 2（Web 资源不参与 L3 匹配）", len(table.entries))
+	if len(table.IP) != 2 {
+		t.Fatalf("资源条数 = %d，期望 2（Web 资源不参与 L3 匹配）", len(table.IP))
 	}
 
 	cases := []struct {
 		name  string
 		dst   string
-		proto string
+		proto uint8
 		port  uint16
 		ok    bool
 	}{
-		{"命中 TCP 资源", "10.1.2.3", "tcp", 443, true},
-		{"端口不在范围内", "10.1.2.3", "tcp", 80, false},
-		{"协议不匹配", "10.1.2.3", "udp", 443, false},
-		{"命中 all 区间", "172.16.0.5", "udp", 53, true},
+		{"命中 TCP 资源", "10.1.2.3", protoTCP, 443, true},
+		{"端口不在范围内", "10.1.2.3", protoTCP, 80, false},
+		{"协议不匹配", "10.1.2.3", protoUDP, 443, false},
+		{"命中 all 区间", "172.16.0.5", protoUDP, 53, true},
 		// ICMP 没有端口，协议层传上来的是 0：规则里的端口段是 1-65535，
 		// 拿 0 去比会把整个网段的 ICMP 判成表外（实测踩过：ping 校园网全丢）。
-		{"ICMP 命中 all 区间", "172.16.0.5", "icmp", 0, true},
-		{"ICMP 不该命中只有 TCP 的规则", "10.1.2.3", "icmp", 0, false},
+		{"ICMP 命中 all 区间", "172.16.0.5", protoICMP, 0, true},
+		{"ICMP 不该命中只有 TCP 的规则", "10.1.2.3", protoICMP, 0, false},
 		// TCP/UDP 里目的端口 0 是畸形包：按协议区分之后它不再绕过端口判断。
-		{"TCP 目的端口 0 不命中 443 规则", "10.1.2.3", "tcp", 0, false},
-		{"区间之外", "172.16.0.10", "udp", 53, false},
-		{"表外地址", "8.8.8.8", "tcp", 53, false},
+		{"TCP 目的端口 0 不命中 443 规则", "10.1.2.3", protoTCP, 0, false},
+		{"区间之外", "172.16.0.10", protoUDP, 53, false},
+		{"表外地址", "8.8.8.8", protoTCP, 53, false},
 	}
 	for _, c := range cases {
-		dst := net.ParseIP(c.dst)
+		dst := netip.MustParseAddr(c.dst)
 		appID, _, ok := table.match(dst, c.proto, c.port)
 		if ok != c.ok {
 			t.Errorf("%s: 匹配 = %v，期望 %v", c.name, ok, c.ok)
@@ -344,13 +341,8 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 	}
 }
 
-// TestResourceTableCountsUnparsedPortSpecs 验证看不懂的端口段会被计数（会话据此
-// 提示一次），而不是悄悄按整段放行。
-//
-// 兜底仍然是整段：这条过滤只决定"要不要为这个目标发鉴权请求"，越权判定在
-// 服务端。按"跳过这条规则"处理会把服务端放行的资源在客户端就挡掉，那才是
-// 真的断网。
-func TestResourceTableCountsUnparsedPortSpecs(t *testing.T) {
+// 非法端口格式必须跳过规则，不能扩大客户端鉴权范围。
+func TestResourceTableRejectsAndCountsInvalidPorts(t *testing.T) {
 	raw := []byte(`{"data":{"appList":{"data":{"appInfo":[{"apps":[
 		{"id":"app-a","accessModel":"L3VPN","addressList":[
 			{"protocol":"tcp","port":"80,443","host":"10.3.0.0/16"}]}
@@ -360,11 +352,11 @@ func TestResourceTableCountsUnparsedPortSpecs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if table.portFallbacks != 1 {
-		t.Errorf("看不懂的端口段计数 = %d，期望 1", table.portFallbacks)
+	if table.badPorts != 1 {
+		t.Errorf("看不懂的端口段计数 = %d，期望 1", table.badPorts)
 	}
-	if _, _, ok := table.match(net.ParseIP("10.3.4.5"), "tcp", 12345); !ok {
-		t.Error("兜底应当是整段放行（越权判定在服务端）")
+	if _, _, ok := table.match(netip.MustParseAddr("10.3.4.5"), protoTCP, 12345); ok {
+		t.Error("非法端口规则扩大了访问范围")
 	}
 }
 
@@ -375,8 +367,8 @@ func TestParseResourceTableSubstitutesHostPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(table.nodes) != 1 || table.nodes[0].addr != "vpn.test:441" {
-		t.Errorf("节点地址 = %v，期望 vpn.test:441", table.nodes)
+	if len(table.NodeGroup["g"]) != 1 || table.NodeGroup["g"][0].Address != "vpn.test:441" {
+		t.Errorf("节点地址 = %v，期望 vpn.test:441", table.NodeGroup)
 	}
 }
 

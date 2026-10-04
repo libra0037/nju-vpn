@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -54,6 +55,7 @@ const defaultCommandTimeout = 2 * time.Minute
 
 type Options struct {
 	Dial             dial.DialFunc
+	ControlRootCAs   *x509.CertPool // 离线测试的受控信任；生产使用系统信任链。
 	AuthWaitTimeout  time.Duration
 	CommandTimeout   time.Duration // 包括排队及执行；0 使用两分钟预算。
 	ReconnectBackoff time.Duration
@@ -221,6 +223,7 @@ type Service struct {
 	// dialer 是测试注入点：注入的是拨号实现，Server / DialAddr 这些生产接线
 	// 仍然由 clientFor 算出来，测试因此必须走真实的那条路径。
 	dialer           dial.DialFunc
+	controlRootCAs   *x509.CertPool
 	client           *ztna.Client
 	session          *ztna.Session
 	pending          *pendingOp
@@ -253,11 +256,14 @@ func New(cfg *config.Config, options ...Options) (*Service, error) {
 		return nil, errors.New("只能提供一组服务参数")
 	}
 	copyCfg := *cfg
-	copyCfg.TLS.PinnedNodeSPKISHA256 = slices.Clone(cfg.TLS.PinnedNodeSPKISHA256)
+	copyCfg.PinnedNodeSPKISHA256 = slices.Clone(cfg.PinnedNodeSPKISHA256)
 	cfg = &copyCfg
 	opts := Options{}
 	if len(options) > 0 {
 		opts = options[0]
+	}
+	if opts.ControlRootCAs != nil {
+		opts.ControlRootCAs = opts.ControlRootCAs.Clone()
 	}
 	if opts.AuthWaitTimeout == 0 {
 		opts.AuthWaitTimeout = defaultAuthWaitTimeout
@@ -286,6 +292,7 @@ func New(cfg *config.Config, options ...Options) (*Service, error) {
 		closed:           make(chan struct{}),
 		actorDone:        make(chan struct{}),
 		dialer:           opts.Dial,
+		controlRootCAs:   opts.ControlRootCAs,
 		authWaitTimeout:  opts.AuthWaitTimeout,
 		commandTimeout:   opts.CommandTimeout,
 		reconnectBackoff: opts.ReconnectBackoff,
@@ -314,6 +321,13 @@ func identityOf(cfg *config.Config) Identity {
 // 的旧值，又要在每次状态迁移时记得清。
 func (s *Service) Status() Status {
 	st := s.status.Get()
+	if s.br != nil {
+		st.WireGuard = s.br.dev.Diagnostics()
+	}
+	if sess := s.sessionSnapshot.Load(); sess != nil {
+		d := sess.Diagnostics()
+		st.Tunnel = &d
+	}
 	if ep := s.ep.Load(); ep != nil {
 		st.PeerIP = s.peerIP
 		if ip := ep.LocalAddr(); ip != nil {
@@ -497,7 +511,7 @@ func (s *Service) dispatch(cmd *command) {
 			err := errors.New("命令处理发生内部错误")
 			log.Printf("%v", err)
 			s.teardown("")
-			s.status.set(StateError, err.Error())
+			s.status.setError(err.Error(), err)
 			reply(err)
 		}
 	}()
@@ -797,7 +811,7 @@ func (s *Service) authTimeout(seq uint64) error {
 	detail := fmt.Sprintf("等待验证码超过 %s，已登出；重新建立隧道请执行 njuvpn start",
 		s.authWaitTimeout.Round(time.Minute))
 	log.Print(detail)
-	s.status.set(StateError, detail)
+	s.status.setError(detail, context.DeadlineExceeded)
 	return nil
 }
 
@@ -905,7 +919,7 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 	if err != nil {
 		detail += ": " + err.Error()
 	}
-	s.status.set(StateError, detail)
+	s.status.setError(detail, err)
 	// 重连窗口已经用尽：进程还活着，但不会自己去重新登录（重新登录可能要
 	// 人输验证码）。把恢复命令写进日志，别让用户对着 error 猜。
 	log.Printf("隧道已停止，等待人工恢复：njuvpn start（会重新登录一次）")
@@ -927,8 +941,7 @@ func (s *Service) tunnelRetry(gen uint64, attempt int, err error) error {
 	if s.status.Get().State != StateUp {
 		return nil
 	}
-	s.status.setRetrying(true)
-	s.status.setDetail(fmt.Sprintf("隧道断开，正在重连（第 %d 次）: %v", attempt, err))
+	s.status.setLinkFailure(fmt.Sprintf("隧道断开，正在重连（第 %d 次）: %v", attempt, err), err)
 	return nil
 }
 
@@ -948,7 +961,7 @@ func (s *Service) tunnelRestored(gen uint64) error {
 // fail 收敛到 error 状态。只能在 actor 协程内调用。
 func (s *Service) fail(err error) error {
 	s.teardown("")
-	s.status.set(StateError, err.Error())
+	s.status.setError(err.Error(), err)
 	return err
 }
 
@@ -1043,17 +1056,18 @@ func (s *Service) clientFor() (*ztna.Client, error) {
 		return nil, err
 	}
 	return ztna.New(ztna.Options{
-		Server:             s.cfg.Server,
-		DialAddr:           s.cfg.ConnectAddr(),
-		Dial:               dialFn,
-		Username:           s.cred.username,
-		Password:           s.cred.password,
-		LoginDomain:        s.cfg.LoginDomain,
-		DeviceID:           s.cfg.DeviceID,
-		Logf:               log.Printf,
-		InsecureSkipVerify: s.cfg.TLS.InsecureSkipVerify,
-		NodeSPKIPins:       pins,
-		ReconnectBackoff:   s.reconnectBackoff,
+		Server:           s.cfg.Server,
+		DialAddr:         s.cfg.ConnectAddr(),
+		Dial:             dialFn,
+		Username:         s.cred.username,
+		Password:         s.cred.password,
+		LoginDomain:      s.cfg.LoginDomain,
+		DeviceID:         s.cfg.DeviceID,
+		Logf:             log.Printf,
+		ControlRootCAs:   s.controlRootCAs,
+		MTU:              s.cfg.MTU,
+		NodeSPKIPins:     pins,
+		ReconnectBackoff: s.reconnectBackoff,
 	})
 }
 

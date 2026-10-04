@@ -121,11 +121,7 @@ func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc
 					if err != nil {
 						return
 					}
-					write := ipc.WriteResponse
-					if req.Command == ipc.CmdResources {
-						write = ipc.WriteResourcesResponse
-					}
-					if err := write(conn, handle(req)); err != nil {
+					if err := ipc.WriteResponse(conn, handle(req)); err != nil {
 						return
 					}
 				}

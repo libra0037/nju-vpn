@@ -46,8 +46,8 @@ go build -o njuvpn ./cmd/njuvpn
 
 ```bash
 njuvpn start [--trust]  建立隧道（加 --trust 时在这次登录成功后把本机绑成授信终端）
-njuvpn status           查看状态（加 -check 时隧道不在 up 就以非 0 退出，便于脚本巡检）
-njuvpn resources        打印当前登录会话的校内资源列表（不启动服务进程、登录或重新拉取资源表）
+njuvpn status           查看状态与诊断（-check 检查校园链路；-json 输出 JSON）
+njuvpn resources        打印当前登录会话的 IPv4 L3 资源及校园 DNS（不启动服务进程、登录或重新拉取资源表）
 njuvpn stop             断开隧道（本来就没在跑也按成功处理）
 njuvpn restart          重启服务进程（改完配置后用它）
 njuvpn trust            把本机绑成授信终端（之后登录免二次验证）
@@ -94,7 +94,7 @@ njuvpn version          查看版本
      ip: 10.66.66.2
      private-key: <对端私钥>
      public-key: <承载层公钥>
-     allowed-ips: ["172.16.0.0/12"]
+     allowed-ips: ["0.0.0.0/0"]
      udp: true
      mtu: 1400
    ```
@@ -130,13 +130,19 @@ njuvpn version          查看版本
    sudo wg show                # 看握手与流量
    ```
 
-   校外资源**不能**通过校园网隧道访问（协议上的禁止，非本程序的有意设计），必须走直连，因此两份配置的 `allowed-ips` / `AllowedIPs` 不建议直接写 `0.0.0.0/0` ，建议按自己的实际需求收窄到 `njuvpn resources` 之内。
+   能访问的范围由 IPv4 资源规则的 IP／CIDR、协议、端口及服务端逐流鉴权决定，不按公网或私网地址区分。仅支持 `accessModel=L3VPN` 且 `host` 为 IPv4 或 IPv4 CIDR 的资源；域名条目及其附带 IP 不生成规则。上面的 `172.16.0.0/12` 只是部分网段示例，请按 `njuvpn resources` 和实际需求填写。
 
-4. 配置路由。Clash 需手动设置代理规则，`wg-quick` 会自动设置系统路由表。仅让校内资源走校园网 VPN，避免影响到校外资源的访问。
+   mihomo 的 `allowed-ips` 定义节点可承载的目的地址；示例允许 IPv4，由代理规则决定哪些连接使用该节点。`wg-quick` 则按 `AllowedIPs` 自动安装系统路由，因此应收窄到需要访问的资源网段。CIDR 路由不能表达协议和端口，最终仍由程序匹配和服务端鉴权。
+
+   对端 MTU 与程序配置的 `mtu` 保持一致；1400 是已实测的默认值，不是已知的校园隧道上限。超过 UDP 报文长度或当前平台 WireGuard 缓冲上限的配置会被明确拒绝。
+
+4. 配置分流。Clash 需手动设置代理规则，`wg-quick` 会自动设置系统路由表。只将需要且已授权的资源送入校园隧道，其余流量按自己的原有策略处理；DNS 查询分流由对端负责。
 
 ### 多实例与开机自启
 
 同一台机器上跑多个实例：每实例一份配置文件，各自派生自己的 IPC 端点与日志名，再各配一个不同的 `wireguard.listen_port` 即可。`njuvpn status` 会报出实例身份（PID、账号、配置路径与端点），用来确认命令打在了哪个实例上。
+
+`status` 同时显示校园链路、WireGuard 对端握手状态和分类拒包计数；`-json` 提供完整字段。`up`／`-check` 只判断校园会话及链路，握手完成也不代表业务目标可达。隧道上行拒包计数在每次重连后清零，承载丢包计数保留至进程退出；查询不登录、不重取资源。
 
 不内置开机自启：Windows 用任务计划程序建一个「登录时启动」的任务（程序填 `njuvpn.exe`，参数填 `run -config <配置路径>`）；Linux 写一个 systemd user unit。
 

@@ -85,7 +85,7 @@ try {
     $lines = @(& $binary resources -config $testConfig 2>&1)
     $resourceCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($resourceCode -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 1) { throw '资源打印不完整' }
+    if ($resourceCode -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 4) { throw 'IPv4 资源及 DNS 打印不完整' }
     Record 'resources-complete'
     $stage = 'direct-traffic'
     $ErrorActionPreference = 'Continue'

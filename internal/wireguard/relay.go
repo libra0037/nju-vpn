@@ -57,6 +57,9 @@ type queuedPacket struct {
 	data  []byte
 }
 
+// 每次装载对端创建新闩锁；旧握手探测只能更新自己持有的对象。
+type peerGate struct{ seen atomic.Bool }
+
 // Relay 实现 tun.Device，把 WireGuard 和校园网隧道对接起来。
 type Relay struct {
 	mtu    int
@@ -66,20 +69,19 @@ type Relay struct {
 	// session 为 nil 表示当前没有校园网会话：对端发来的包直接丢弃。
 	session atomic.Pointer[relaySession]
 
-	// hold 与 peerSeen 一起决定下行方向要不要把包交给 WireGuard。
+	// peerGate 非 nil 表示已装载对端，seen 决定能否放行下行。
 	//
 	// 配好了 peer、对端还没露面时，设备不知道它在哪儿：包交上去也发不
 	// 出去，只会换来 wireguard-go 每 5 秒一行 ERROR "no known endpoint for
 	// peer"（真机上隧道建好后的 57 秒里刷了 12 行）。而这段窗口可以很长——
 	// 校园网网关自己就会往分配到的地址发包。
 	//
-	// hold 跟着 peer 一起开关（见 Device.SetPeer / ClearPeer），peerSeen 是
+	// 闩锁跟着 peer 一起开关（见 Device.SetPeer / ClearPeer），seen 是
 	// "对端确实接进来了"的证据：收到它解出来的第一个数据包时置位。之所以
 	// 不问设备要 "peer 的地址"：Read 跑在 wireguard-go 的 TUN 读取协程里，
 	// 在那里调 IpcGet 会和它的状态机抢 ipcMutex，实测能把设备锁死（Close
 	// 永远等不到读取协程退出）。
-	hold     atomic.Bool
-	peerSeen atomic.Bool
+	peerGate atomic.Pointer[peerGate]
 
 	// holdWake 在每次装/摘 peer 时响一下，给 watchPeerHandshake 一个即时信号。
 	// 没有它，探测循环只能靠轮询发现"会话刚接上"，而那段空转要么费电要么
@@ -149,8 +151,11 @@ func (r *Relay) InstallSession(ep *l3.Endpoint, mapper *Mapper) {
 // 握手，下行方向才会再次放行。关掉时（ClearPeer 之后设备里根本没有 peer）
 // 包照旧交给 WireGuard，它会因为找不到目的 peer 而静默丢弃。
 func (r *Relay) HoldDownlink(hold bool) {
-	r.peerSeen.Store(false)
-	r.hold.Store(hold)
+	var gate *peerGate
+	if hold {
+		gate = &peerGate{}
+	}
+	r.peerGate.Store(gate)
 	select {
 	case r.holdWake <- struct{}{}:
 	default:
@@ -204,8 +209,12 @@ func (r *Relay) deliverFrom(sess *relaySession, pkt []byte) {
 	}
 
 	total, err := ipv4TotalLength(pkt)
-	if err != nil || total != len(pkt) || total > r.mtu {
+	if err != nil || total != len(pkt) {
 		r.countDrop(dropDownlinkInvalid)
+		return
+	}
+	if total > r.mtu {
+		r.countDrop(dropMTUExceeded)
 		return
 	}
 	out := make([]byte, len(pkt))
@@ -274,11 +283,14 @@ const (
 	// dropStaleQueue：会话切换（重连、换账号）时队列里还留着属于旧会话的
 	// 下行包。它们的地址是按旧会话改写好的，交出去就是一批孤儿包。
 	dropStaleQueue
+	// dropMTUExceeded：任一方向的完整 IPv4 包超过配置 MTU。
+	dropMTUExceeded
 
 	dropReasonCount
 )
 
 var dropReasonText = [dropReasonCount]string{
+	dropMTUExceeded:       "报文超过配置 MTU",
 	dropDownlinkInvalid:   "下行数据切不出 IPv4 包",
 	dropDownlinkAddr:      "下行包的目的地址不是本次分配到的地址（检查对端 allowed_ips 与 peer_address）",
 	dropDownlinkFull:      "下行队列已满",
@@ -363,7 +375,7 @@ func (r *Relay) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 				continue
 			}
 			pkt := item.data
-			if r.hold.Load() && !r.peerSeen.Load() {
+			if gate := r.peerGate.Load(); gate != nil && !gate.seen.Load() {
 				// 配了 peer、对端还没露面：设备不知道它在哪儿，交上去也发不
 				// 出去，只会换来一行 "no known endpoint for peer"。
 				r.countDrop(dropPeerNotReady)
@@ -405,7 +417,9 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 
 	// 走到这里说明对端的数据包已经解出来交给我们了：它握手成功、
 	// 而且设备记住了它的地址，下行方向可以放行。
-	r.peerSeen.Store(true)
+	if gate := r.peerGate.Load(); gate != nil {
+		gate.seen.Store(true)
+	}
 
 	n := 0
 	for _, buf := range bufs {
@@ -417,9 +431,13 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 		if len(pkt) == 0 {
 			continue
 		}
-		if _, err := parseIPv4(pkt); err != nil || len(pkt) > r.mtu {
+		if _, err := parseIPv4(pkt); err != nil {
 			// WireGuard 解出来的应该是 IPv4 包，其它一律丢弃。
 			r.countDrop(dropUplinkNotIPv4)
+			continue
+		}
+		if len(pkt) > r.mtu {
+			r.countDrop(dropMTUExceeded)
 			continue
 		}
 		if sess.mapper != nil {

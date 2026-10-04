@@ -46,10 +46,10 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 	if err := server.SetPeer(clientPub, net.ParseIP("10.66.66.2")); err != nil {
 		t.Fatalf("配置 peer 失败: %v", err)
 	}
-	if !server.relay.hold.Load() {
+	if server.relay.peerGate.Load() == nil {
 		t.Fatal("装了 peer 之后下行闩锁应当是闭合的")
 	}
-	if server.relay.peerSeen.Load() {
+	if server.relay.peerGate.Load().seen.Load() {
 		t.Fatal("对端还没露面，闩锁不该松开")
 	}
 
@@ -71,7 +71,7 @@ func TestDownlinkGateOpensOnHandshake(t *testing.T) {
 	// 闩锁应当在一两秒内松开（探测间隔 200ms）。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if server.relay.peerSeen.Load() {
+		if server.relay.peerGate.Load().seen.Load() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

@@ -42,6 +42,12 @@ type ProtocolError struct {
 	What string
 }
 
+// TLS 阶段类别供本地诊断使用，底层原因仍通过错误链保留。
+var (
+	ErrControlTLS = errors.New("控制面 TLS 验证失败")
+	ErrNodeTLS    = errors.New("隧道节点 TLS 握手失败")
+)
+
 func (e *ProtocolError) Error() string {
 	return "协议错误: " + e.What
 }

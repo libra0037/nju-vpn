@@ -2,16 +2,14 @@ package ztna
 
 import (
 	"encoding/binary"
-	"github.com/libra0037/nju-vpn/internal/l3"
 	"net"
 )
 
 const (
-	protoICMP      = 1
-	protoTCP       = 6
-	protoUDP       = 17
-	ipv4MinHeader  = 20
-	maxPacketBytes = l3.MaxPacketBytes
+	protoICMP     = 1
+	protoTCP      = 6
+	protoUDP      = 17
+	ipv4MinHeader = 20
 )
 
 type flowKey struct {

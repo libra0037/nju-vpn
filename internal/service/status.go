@@ -13,9 +13,15 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/libra0037/nju-vpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/wireguard"
+	"github.com/libra0037/nju-vpn/internal/ztna"
 )
 
 // State 是服务进程对外可见的状态。
@@ -31,8 +37,11 @@ const (
 
 // Status 是一次状态查询的完整结果。
 type Status struct {
-	State  State  `json:"state"`
-	Detail string `json:"detail,omitempty"`
+	State     State                   `json:"state"`
+	Detail    string                  `json:"detail,omitempty"`
+	Failure   string                  `json:"failure,omitempty"` // 有限错误类别，不依赖错误文本。
+	WireGuard wireguard.Diagnostics   `json:"wireguard"`
+	Tunnel    *ztna.TunnelDiagnostics `json:"tunnel,omitempty"`
 	// Retrying 表示链路已经断开、正在退避重连。
 	//
 	// 这时状态仍是 up（登录会话、隧道对象与承载层都还在，重连成功后不必
@@ -47,6 +56,37 @@ type Status struct {
 	Since time.Time `json:"since"`
 	// Identity 是实例身份，用来区分同机上的多个实例。
 	Identity Identity `json:"identity"`
+}
+
+func failureKind(err error) string {
+	var rejected *ztna.ErrCodeRejected
+	var gone *ztna.ErrSessionGone
+	var protocol *ztna.ProtocolError
+	var network *dial.Error
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ztna.ErrControlTLS):
+		return "control_tls"
+	case errors.Is(err, ztna.ErrNodeUntrusted):
+		return "node_untrusted"
+	case errors.Is(err, ztna.ErrNodeTLS):
+		return "node_tls"
+	case errors.As(err, &rejected):
+		return "auth_rejected"
+	case errors.As(err, &gone):
+		return "session_expired"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.As(err, &protocol):
+		return "protocol"
+	case errors.As(err, &network):
+		return "network"
+	default:
+		return "internal"
+	}
 }
 
 // Identity 描述"在跟哪个实例说话"。
@@ -89,6 +129,27 @@ func (s *statusStore) set(next State, detail string) {
 	s.applyLocked(next, detail)
 }
 
+func (s *statusStore) setError(detail string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validTransition(s.status.State, StateError) {
+		panic("当前服务状态不能进入错误状态")
+	}
+	s.applyLocked(StateError, detail)
+	s.status.Failure = failureKind(err)
+}
+
+func (s *statusStore) setLinkFailure(detail string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status.State != StateUp {
+		panic("仅运行中的隧道可以进入重连状态")
+	}
+	s.status.Retrying = true
+	s.status.Detail = detail
+	s.status.Failure = failureKind(err)
+}
+
 func validTransition(from, to State) bool {
 	switch from {
 	case StateIdle:
@@ -121,6 +182,9 @@ func (s *statusStore) setRetrying(retrying bool) {
 		panic("仅运行中的隧道可以进入重连状态")
 	}
 	s.status.Retrying = retrying
+	if !retrying {
+		s.status.Failure = ""
+	}
 }
 
 // applyLocked 写入新状态。调用方需持有写锁。
@@ -130,6 +194,7 @@ func (s *statusStore) applyLocked(next State, detail string) {
 	}
 	s.status.State = next
 	s.status.Detail = detail
+	s.status.Failure = ""
 	// 离开运行态时不再显示“正在重连”。地址不在这里清：它由 Service.Status
 	// 现取，会话摘掉后自然为空（见那里的注释）。
 	if next == StateIdle || next == StateError {

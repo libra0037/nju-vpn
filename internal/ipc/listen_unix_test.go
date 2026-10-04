@@ -10,8 +10,20 @@ import (
 	"testing"
 )
 
+// macOS 的临时目录较长，t.TempDir 还带完整测试名，可能超过 Unix socket
+// 地址长度。只缩短测试的独占私有目录，不更改生产端点或权限检查。
+func socketTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "njuvpn-ipc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 func TestDialRejectsUnsafePathBeforeConnecting(t *testing.T) {
-	dir := t.TempDir()
+	dir := socketTestDir(t)
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +67,7 @@ func TestDialRejectsUnsafePathBeforeConnecting(t *testing.T) {
 	}
 }
 func TestConnectedPeerCredentialsAreReadFromOS(t *testing.T) {
-	dir := t.TempDir()
+	dir := socketTestDir(t)
 	os.Chmod(dir, 0700)
 	endpoint := filepath.Join(dir, "peer.sock")
 	ln, err := Listen(endpoint)
@@ -84,7 +96,7 @@ func TestConnectedPeerCredentialsAreReadFromOS(t *testing.T) {
 	}
 }
 func TestSecondListenerDoesNotReplaceLiveEndpoint(t *testing.T) {
-	dir := t.TempDir()
+	dir := socketTestDir(t)
 	os.Chmod(dir, 0700)
 	endpoint := filepath.Join(dir, "live.sock")
 	a, err := Listen(endpoint)
@@ -104,7 +116,7 @@ func TestSecondListenerDoesNotReplaceLiveEndpoint(t *testing.T) {
 }
 
 func TestEndpointLeasePreventsConcurrentStaleCleanup(t *testing.T) {
-	dir := t.TempDir()
+	dir := socketTestDir(t)
 	os.Chmod(dir, 0700)
 	endpoint := filepath.Join(dir, "stale.sock")
 	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: endpoint, Net: "unix"})

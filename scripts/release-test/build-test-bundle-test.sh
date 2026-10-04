@@ -23,5 +23,5 @@ if [[ -e "$test_dir/out/BUILD.txt" ]]; then
   echo '列包失败后仍继续构建' >&2
   exit 1
 fi
-rg --quiet --fixed-strings 'test-package-list-failure' "$test_dir/output"
+grep -qF 'test-package-list-failure' "$test_dir/output"
 echo 'PASS package-list failure stops before building or archiving'

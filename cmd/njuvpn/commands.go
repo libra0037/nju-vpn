@@ -210,6 +210,7 @@ func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
 	check := fs.Bool("check", false, "链路不在 up 状态时以非 0 退出（给巡检脚本用）")
+	jsonOutput := fs.Bool("json", false, "打印只读状态与分类诊断 JSON")
 	if err := parseNoPositional(fs, args); err != nil {
 		return err
 	}
@@ -219,7 +220,10 @@ func cmdStatus(args []string) error {
 	}
 	req := ipc.Request{Command: ipc.CmdStatus}
 	if *check {
-		req.Args = []string{"check"}
+		req.Args = append(req.Args, "check")
+	}
+	if *jsonOutput {
+		req.Args = append(req.Args, "json")
 	}
 	resp, err := call(endpoint, req, 30*time.Second)
 	if err != nil {
