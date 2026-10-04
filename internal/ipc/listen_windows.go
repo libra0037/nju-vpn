@@ -40,7 +40,7 @@ func Listen(endpoint string) (net.Listener, error) {
 		return nil, ErrEmptyEndpoint
 	}
 	if !strings.HasPrefix(endpoint, pipePrefix) {
-		return nil, fmt.Errorf("Windows 下的 IPC 端点必须是命名管道（以 %s 开头），收到 %q", pipePrefix, endpoint)
+		return nil, fmt.Errorf("命名管道端点必须以 %s 开头，收到 %q", pipePrefix, endpoint)
 	}
 
 	sddl, err := currentUserSDDL()
