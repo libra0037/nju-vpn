@@ -88,7 +88,7 @@ func run() error {
 			}
 			public = pub.String()
 		}
-		identity, _ := json.Marshal([]any{cfg.DeviceID, cfg.WireGuard.PrivateKey, cfg.TLS, cfg.WireGuard.PeerPublicKey, cfg.MTU})
+		identity, _ := json.Marshal([]any{cfg.DeviceID, cfg.WireGuard.PrivateKey, cfg.PinnedNodeSPKISHA256, cfg.WireGuard.PeerPublicKey, cfg.MTU})
 		hash := sha256.Sum256(identity)
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"public_key": public, "peer_public_key": cfg.WireGuard.PeerPublicKey,
@@ -112,12 +112,7 @@ func run() error {
 		return err
 	}
 	reader := bufio.NewReader(conn)
-	var response ipc.Response
-	if command == "resources" {
-		response, err = ipc.ReadResourcesResponse(reader)
-	} else {
-		response, err = ipc.ReadResponse(reader)
-	}
+	response, err := ipc.ReadResponse(reader)
 	if err != nil {
 		return err
 	}
@@ -125,17 +120,17 @@ func run() error {
 		return fmt.Errorf("IPC 操作失败，状态码 %d", response.Code)
 	}
 	if command == "resources" {
-		var resources []ztna.Resource
-		if err := json.Unmarshal([]byte(response.Message), &resources); err != nil || resources == nil {
-			return errors.New("资源快照不是完整 JSON 数组")
+		var resources ztna.L3Resources
+		if err := json.Unmarshal([]byte(response.Message), &resources); err != nil || resources.IP == nil || resources.NodeGroup == nil {
+			return errors.New("资源快照不是完整的 IPv4 L3 资源对象")
 		}
-		rows := 0
-		for _, resource := range resources {
-			rows += max(1, len(resource.AddressList))
+		apps := make(map[string]bool)
+		for _, resource := range resources.IP {
+			apps[resource.ID] = true
 		}
 		hash := sha256.Sum256([]byte(response.Message))
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"apps": len(resources), "rows": rows, "json_bytes": len(response.Message),
+			"apps": len(apps), "rows": len(resources.IP), "json_bytes": len(response.Message),
 			"sha256": hex.EncodeToString(hash[:]),
 		})
 	}

@@ -44,12 +44,7 @@ func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response
 		return ipc.Response{}, fmt.Errorf("发送请求: %w", err)
 	}
 	reader := bufio.NewReader(conn)
-	var resp ipc.Response
-	if req.Command == ipc.CmdResources {
-		resp, err = ipc.ReadResourcesResponse(reader)
-	} else {
-		resp, err = ipc.ReadResponse(reader)
-	}
+	resp, err := ipc.ReadResponse(reader)
 	if err != nil {
 		return ipc.Response{}, fmt.Errorf("读取响应: %w", err)
 	}

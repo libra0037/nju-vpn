@@ -20,6 +20,7 @@ func main() {
 		{"internal/service/service.go", "commandKind", "dispatch", "cmd.kind"},
 		{"internal/service/status.go", "State", "validTransition", "from"},
 		{"internal/ztna/conntrack.go", "flowState", "queuePacket", "f.state"},
+		{"internal/ztna/resource.go", "ResourceProtocol", "String", "p"},
 		{"internal/wireguard/bind.go", "ListenHost", "newBind", "host"},
 	}
 	failed := false

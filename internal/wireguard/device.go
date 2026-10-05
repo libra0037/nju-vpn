@@ -64,8 +64,11 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		return nil, fmt.Errorf("监听端口超出范围: %d", opts.ListenPort)
 	}
 	// 与校园网隧道交接同一裸 IP 包，不能减去另一层外部封装的长度。
-	if opts.MTU <= 0 || opts.MTU > l3.MaxPacketBytes {
-		return nil, fmt.Errorf("WireGuard MTU 须在 1-%d 之间", l3.MaxPacketBytes)
+	// UDP/IPv4 总长是 16 位，内层还须给 IP、UDP 与 WireGuard 封装留空间。
+	// 依赖另有平台缓冲上限，超过时会静默截低；这里拒绝，保证两段 MTU 一致。
+	maxMTU := min(device.MaxContentSize, 65535-20-8-device.MessageTransportSize)
+	if opts.MTU <= 0 || opts.MTU > maxMTU {
+		return nil, fmt.Errorf("WireGuard MTU 须在 1-%d 之间（UDP 报文与当前平台缓冲约束）", maxMTU)
 	}
 	if opts.ListenHost != ListenLoopback && opts.ListenHost != ListenAll {
 		return nil, fmt.Errorf("非法 WireGuard 监听范围")
@@ -97,7 +100,7 @@ func NewDevice(opts DeviceOptions) (*Device, error) {
 		closed:     make(chan struct{}),
 		watchDone:  make(chan struct{}),
 	}
-	go d.watchPeerHandshake()
+	go d.watchPeerHandshake(d.config)
 	return d, nil
 }
 
@@ -238,6 +241,18 @@ func (d *Device) ListenPortOrDefault() int {
 // ListenHost 返回设备绑定的范围。
 func (d *Device) ListenHost() ListenHost { return d.listenHost }
 
+// Diagnostics 使用下行闩锁与原子计数的已有状态，不读 UAPI、不影响握手。
+func (d *Device) Diagnostics() Diagnostics {
+	gate := d.relay.peerGate.Load()
+	diag := Diagnostics{Configured: gate != nil, Ready: gate != nil && gate.seen.Load(), Drops: make(map[string]uint64)}
+	for reason, name := range dropReasonName {
+		if count := d.relay.drops[reason].n.Load(); count != 0 {
+			diag.Drops[name] = count
+		}
+	}
+	return diag
+}
+
 // Close 停止设备。可安全重复调用。
 func (d *Device) Close() error {
 	d.closeOnce.Do(func() {
@@ -269,7 +284,7 @@ const handshakeSettleMax = 5 * time.Second
 //
 // 这里读 UAPI 是安全的：早期版本在 Relay.Read（TUN 读取协程）里读，会和
 // wireguard-go 的状态机抢锁把设备锁死，所以探测必须跑在自己的协程里。
-func (d *Device) watchPeerHandshake() {
+func (d *Device) watchPeerHandshake(readConfig func() (deviceConfig, error)) {
 	defer close(d.watchDone)
 	interval := handshakeSettleInterval
 	timer := time.NewTimer(interval)
@@ -285,11 +300,12 @@ func (d *Device) watchPeerHandshake() {
 			continue
 		case <-timer.C:
 		}
-		hold, seen := d.relay.hold.Load(), d.relay.peerSeen.Load()
+		gate := d.relay.peerGate.Load()
+		hold, seen := gate != nil, gate != nil && gate.seen.Load()
 		if hold && !seen {
-			cfg, err := d.config()
+			cfg, err := readConfig()
 			if err == nil && cfg.lastHandshakeSec > 0 {
-				d.relay.peerSeen.Store(true)
+				gate.seen.Store(true)
 				seen = true
 			}
 		}

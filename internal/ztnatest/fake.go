@@ -73,6 +73,9 @@ type Options struct {
 	Apps []App
 	// Nodes 是资源表里发布的隧道节点地址，留空则用本机监听地址。
 	Nodes []string
+	// AlreadyOnlineCode 为已登录时的第二次口令登录指定拒绝码。
+	// 0 不限制；测试用占位码不表示真实部署的错误码契约。
+	AlreadyOnlineCode int
 }
 
 // Server 是假服务端。
@@ -177,6 +180,18 @@ func (s *Server) SPKIPin() [sha256.Size]byte {
 		panic(err)
 	}
 	return sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+}
+
+// RootCAs 显式信任本次假服务端证书；TLS 仍验证签名、有效期与名称。
+// 每次返回独立的测试信任池，不修改系统信任或生产配置。
+func (s *Server) RootCAs() *x509.CertPool {
+	cert, err := x509.ParseCertificate(s.tls.Certificates[0].Certificate[0])
+	if err != nil {
+		panic(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return pool
 }
 
 // Close 停止服务。
@@ -450,6 +465,11 @@ func (s *Server) routes() *http.ServeMux {
 			return
 		}
 		s.mu.Lock()
+		if s.loggedIn && s.opts.AlreadyOnlineCode != 0 {
+			s.mu.Unlock()
+			writeEnvelope(w, s.opts.AlreadyOnlineCode, "已有在线会话", nil)
+			return
+		}
 		s.loggedIn = true
 		s.mu.Unlock()
 		next := "auth/authCheck"
@@ -672,7 +692,7 @@ func (s *Server) resourceTable() map[string]any {
 		"sdpPolicy": map[string]any{
 			"data": map[string]any{
 				"clientOption": map[string]any{
-					"dnsOption": map[string]any{"firstDNS": "10.0.0.53"},
+					"dnsOptionV2": map[string]any{"firstDNS": "10.0.0.53"},
 				},
 			},
 		},

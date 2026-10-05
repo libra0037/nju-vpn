@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,10 +26,10 @@ func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls atomic.Int32
-	const app = `{"id":"app","accessModel":"","nodeGroupId":"g","addressList":[{"host":"192.0.2.1","protocol":"tcp","port":"443","ip":null}]}`
-	body := "[" + strings.TrimSuffix(strings.Repeat(app+",", 600), ",") + "]"
-	if len(body)+len("200 \n") <= ipc.MaxLineBytes {
-		t.Fatal("样例没有超过普通响应预算")
+	const rule = `{"id":"app","nodeGroupId":"g","protocol":6,"host":"192.0.2.1/32","port":[443,443]}`
+	body := `{"ip":[` + strings.TrimSuffix(strings.Repeat(rule+",", 512), ",") + `],"dns":{"firstDNS":"192.0.2.53","secondDNS":"192.0.2.54"},"nodegroup":{}}`
+	if len(body)+len("200 \n") > ipc.MaxLineBytes {
+		t.Fatal("归一化样例超过统一响应预算")
 	}
 	startFakeServiceFor(t, path, func(req ipc.Request) ipc.Response {
 		if req.Command != ipc.CmdResources || len(req.Args) != 0 {
@@ -54,7 +57,7 @@ func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 1 || bytes.Count(out, []byte("\n")) != 601 || !bytes.Contains(out, []byte("app")) {
+	if calls.Load() != 1 || bytes.Count(out, []byte("\n")) != 516 || !bytes.Contains(out, []byte("192.0.2.1/32")) || !bytes.Contains(out, []byte("192.0.2.53")) {
 		t.Fatal("没有只读查询并完整打印", calls.Load(), bytes.Count(out, []byte("\n")))
 	}
 	data, _ := os.ReadFile(path)
@@ -69,43 +72,57 @@ func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
 		t.Fatal("创建了配置")
 	}
 }
-func TestResourceOutputIsDeterministicAndEscapesTerminalText(t *testing.T) {
-	list := []ztna.Resource{
-		{ID: "z", AccessModel: "L3VPN", AddressList: []ztna.ResourceAddress{{Host: "domain", Protocol: "odd", Port: "1", IP: []string{"10.2.1.1", "10.1.1.1"}}}},
-		{ID: "a\x1b[2J\n", NodeGroupID: "g", AddressList: []ztna.ResourceAddress{}},
+func TestResourceOutputUsesPublishedOrderWithoutMutation(t *testing.T) {
+	resources := ztna.L3Resources{
+		IP: []ztna.IPv4Resource{
+			{ID: "unused\x1b[2J\n", Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: ztna.ResourceProtocolUDP, Port: [2]uint16{53, 53}},
+			{Host: netip.MustParsePrefix("198.51.100.0/24"), Protocol: ztna.ResourceProtocolAll, Port: [2]uint16{8000, 8100}},
+		},
+		DNS:       ztna.ResourceDNS{FirstDNS: "192.0.2.53", SecondDNS: "192.0.2.54"},
+		NodeGroup: map[string][]ztna.ResourceNode{},
 	}
-	raw, _ := json.Marshal(list)
-	var a, b bytes.Buffer
-	if err := printResources(&a, list); err != nil {
+	before, err := json.Marshal(resources)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var again []ztna.Resource
-	json.Unmarshal(raw, &again)
-	again[0], again[1] = again[1], again[0]
-	if err := printResources(&b, again); err != nil {
+	var out bytes.Buffer
+	if err := printResources(&out, resources); err != nil {
 		t.Fatal(err)
 	}
-	if a.String() != b.String() || strings.ContainsRune(a.String(), '\x1b') || !strings.Contains(a.String(), `\x1b`) || bytes.Count(a.Bytes(), []byte("\n")) != 3 {
-		t.Fatal("排序不稳定或未转义", a.String(), b.String())
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != 6 || lines[0] != "IPv4 资源表" ||
+		!slices.Equal(strings.Fields(lines[1]), []string{"udp", "192.0.2.1/32", "53"}) ||
+		!slices.Equal(strings.Fields(lines[2]), []string{"all", "198.51.100.0/24", "8000-8100"}) ||
+		lines[4] != "DNS 服务器" || lines[5] != "首选  192.0.2.53  备选  192.0.2.54" || strings.ContainsRune(out.String(), '\x1b') {
+		t.Fatal("打印顺序、格式或字段错误", out.String())
+	}
+	after, _ := json.Marshal(resources)
+	if !bytes.Equal(before, after) {
+		t.Fatal("打印修改了发布状态")
 	}
 	var empty bytes.Buffer
-	printResources(&empty, []ztna.Resource{})
-	if !strings.Contains(empty.String(), "为空") {
-		t.Fatal("有效空列表未打印")
+	if err := printResources(&empty, ztna.L3Resources{}); err != nil || !strings.Contains(empty.String(), "IPv4 资源表为空") || !strings.Contains(empty.String(), "DNS 服务器") {
+		t.Fatal("空规则列表未保留 DNS 展示", empty.String(), err)
 	}
 }
 
-func TestResourceOrderingDoesNotDependOnSeparatorCharacters(t *testing.T) {
-	addresses := []ztna.ResourceAddress{{Host: "x\x00y", Protocol: "z"}, {Host: "x", Protocol: "y\x00z"}}
-	first := []ztna.Resource{{ID: "a", AddressList: addresses}}
-	second := []ztna.Resource{{ID: "a", AddressList: []ztna.ResourceAddress{addresses[1], addresses[0]}}}
-	var a, b bytes.Buffer
-	printResources(&a, first)
-	printResources(&b, second)
-	if a.String() != b.String() {
-		t.Fatal("字段内的分隔字符影响稳定排序")
+func TestResourceOutputRejectsInvalidIPCFieldsBeforePrinting(t *testing.T) {
+	for i, resource := range []ztna.L3Resources{
+		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("::/0"), Protocol: ztna.ResourceProtocolAll, Port: [2]uint16{1, 65535}}}},
+		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("192.0.2.1/24"), Protocol: ztna.ResourceProtocolTCP, Port: [2]uint16{443, 443}}}},
+		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: 0, Port: [2]uint16{443, 443}}}},
+		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: ztna.ResourceProtocolTCP, Port: [2]uint16{443, 80}}}},
+		{DNS: ztna.ResourceDNS{FirstDNS: "192.0.2.53\n\x1b[2J"}},
+	} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			var out bytes.Buffer
+			if err := printResources(&out, resource); err == nil || out.Len() != 0 {
+				t.Fatal("非法响应仍有输出", out.String(), err)
+			}
+		})
 	}
 }
+
 func TestRestartRejectsFailureBeforeAnyStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unreadable.yaml")
 	var calls atomic.Int32

@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,17 +26,14 @@ import (
 //
 // 默认编译当前包；发布前测试包通过 NJUVPN_TEST_BINARY 指定同一源码构建的
 // 候选程序，让没有 Go 的机器也能验证真实的进程启动与 IPC。
-func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
+func testCLIBinary(t *testing.T) string {
+	t.Helper()
 	bin := os.Getenv("NJUVPN_TEST_BINARY")
 	if bin == "" {
 		if _, err := exec.LookPath("go"); err != nil {
 			t.Skip("未指定候选程序且没有 go 命令")
 		}
-		bin = filepath.Join(dir, "njuvpn")
+		bin = filepath.Join(t.TempDir(), "njuvpn")
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
 		}
@@ -48,6 +47,15 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return bin
+}
+
+func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	bin := testCLIBinary(t)
 	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -62,8 +70,7 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 		"password: \"\"",
 		"port: 443",
 		"mtu: 1400",
-		"tls:",
-		"  pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]",
+		"pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]",
 		"wireguard:",
 		fmt.Sprintf("  listen_port: %d", port),
 		"  peer_address: 10.66.66.2",
@@ -96,8 +103,9 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	}
 
 	out, err := run("status", "-config", configPath)
-	if err != nil {
-		t.Fatalf("status 失败: %v\n%s", err, out)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 4 {
+		t.Fatalf("空闲状态退出码应为 4: %v\n%s", err, out)
 	}
 	if !strings.Contains(out, string("idle")) {
 		t.Errorf("刚拉起的服务进程应处于 idle，得到 %q", out)
@@ -122,8 +130,8 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	if out, err := run("restart", "-config", configPath); err != nil {
 		t.Fatalf("第二次 restart 失败: %v\n%s", err, out)
 	}
-	if out, err := run("status", "-config", configPath); err != nil {
-		t.Fatalf("第二次 status 失败: %v\n%s", err, out)
+	if out, err := run("status", "-config", configPath); !errors.As(err, &exitErr) || exitErr.ExitCode() != 4 {
+		t.Fatalf("第二次空闲状态退出码应为 4: %v\n%s", err, out)
 	}
 	restarted, err := config.Load(configPath)
 	if err != nil {
@@ -239,5 +247,43 @@ func TestWaitServiceReadyReportsStartupFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "启动后立即退出") {
 		t.Fatalf("错误应当指向启动失败，得到 %v", err)
+	}
+}
+
+func TestWaitServiceGoneRequiresAbsentEndpoint(t *testing.T) {
+	for _, disconnect := range []error{io.EOF, net.ErrClosed, syscall.ECONNRESET, syscall.EPIPE} {
+		t.Run(disconnect.Error(), func(t *testing.T) {
+			assertWaitServiceGoneAfterDisconnect(t, disconnect)
+		})
+	}
+	for _, failure := range []error{ipc.ErrUntrustedPeer, context.DeadlineExceeded, errStateUnknown} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			calls := 0
+			err := waitServiceGone("test-endpoint", time.Second, func(string) error {
+				calls++
+				return fmt.Errorf("探活: %w", failure)
+			})
+			if !errors.Is(err, failure) || calls != 1 {
+				t.Fatalf("认证、超时或错误响应不能证明退出：err=%v, calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func assertWaitServiceGoneAfterDisconnect(t *testing.T, disconnect error) {
+	t.Helper()
+	calls := 0
+	err := waitServiceGone("test-endpoint", time.Second, func(endpoint string) error {
+		if endpoint != "test-endpoint" {
+			t.Fatalf("探活了错误端点 %q", endpoint)
+		}
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("发送请求: %w", disconnect)
+		}
+		return ipc.ErrNotRunning
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("连接关闭后还须确认端点不存在：err=%v, calls=%d", err, calls)
 	}
 }

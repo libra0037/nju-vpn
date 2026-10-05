@@ -16,7 +16,7 @@ case "${1:-}" in
   *) echo '用法：scripts/check.sh [--code-only]' >&2; exit 2 ;;
 esac
 if [[ $(go env GOVERSION) != "go$GO_VERSION" ]]; then
-  echo "要求 Go $GO_VERSION（与 go.mod 一致）" >&2
+  echo "要求 Go ${GO_VERSION}（与 go.mod 一致）" >&2
   exit 1
 fi
 
@@ -31,12 +31,13 @@ run() {
 
 # tool 打印工具的路径；找不到时打印空串。
 tool() {
-  if command -v "$1" >/dev/null 2>&1; then
-    command -v "$1"
+  local name="$1$(go env GOEXE)"
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
     return
   fi
   local candidate
-  candidate="$(go env GOPATH)/bin/$1"
+  candidate="$(go env GOPATH)/bin/$name"
   if [ -x "$candidate" ]; then
     echo "$candidate"
   fi
@@ -44,7 +45,7 @@ tool() {
 
 # flag_set 从文件（或 - 表示的标准输入）里提取选项，归一化后排序去重。
 # 归一化是因为 Go 的 flag 包把 -x 与 --x 当同一个：只比字面量会把
-# README 的 -check 与 usage 的 --check 误判成两个不同的选项。
+# README 的 -json 与 usage 的 --json 误判成两个不同的选项。
 flag_set() {
   grep -oE -- '(^|[^[:alnum:]-])--?[a-z][a-z0-9-]*' "$@" |
     grep -oE -- '--?[a-z][a-z0-9-]*' | sed -E 's/^--/-/' | sort -u
@@ -80,19 +81,29 @@ terminology_check() {
 }
 if ! $code_only; then run terminology_check; fi
 
-# gofmt -l 有输出就算失败（它列出的是没格式化的文件）。
-fmt_out=$(gofmt -l . 2>&1)
-if [ -n "$fmt_out" ]; then
-  echo "== gofmt -l ."
-  echo "$fmt_out"
+# 从模块目录检查 Git 已跟踪及未忽略的 Go 文件；dist/ 中的只读参考仓库
+# 不属于本项目源文件。新文件也进入检查，不能依赖是否已经暂存。
+go_sources=()
+while IFS= read -r -d '' go_source; do
+  go_sources+=("$go_source")
+done < <(git ls-files --cached --others --exclude-standard -z -- '*.go')
+if [ "${#go_sources[@]}" -eq 0 ]; then
+  echo '格式检查：未找到仓库自有 Go 文件'
   fail=1
+else
+  fmt_out=$(gofmt -l "${go_sources[@]}" 2>&1)
+  if [ -n "$fmt_out" ]; then
+    echo '== gofmt -l（仓库自有 Go 文件）'
+    echo "$fmt_out"
+    fail=1
+  fi
 fi
 
 run go run scripts/check-enums.go
 run go vet -tags "$BUILD_TAGS" ./...
 run go build -tags "$BUILD_TAGS" ./...
 # 发布脚本给的六个组合都要能编译：Windows 与 macOS 的分支在 Linux 上编译不到，
-# 交叉编译是它们唯一的守门人（曾经漏掉 windows/amd64 的一次改坏就是这么发现的）。
+# 交叉编译与原生 CI 共同覆盖各平台分支。
 for entry in "${PLATFORMS[@]}"; do
   target=${entry%:*}
   run env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -tags "$BUILD_TAGS" ./...
@@ -123,7 +134,7 @@ doc_check() {
   local rc=0 cmd
   for cmd in $(grep -oE 'njuvpn [a-z]+' README.md | awk '{print $2}' | sort -u); do
     if ! grep -qE "^  njuvpn $cmd( |$)" "$helps" && ! grep -qE "^  \${?[a-z]*}?njuvpn $cmd( |$)" "$helps"; then
-      echo "README 提到了子命令 $cmd，但 usage 里没有它"
+      echo "README 提到了子命令 ${cmd}，但 usage 里没有它"
       rc=1
     fi
   done
@@ -149,7 +160,7 @@ if ! $code_only; then run doc_check; fi
 
 sc=$(tool staticcheck)
 if [ -n "$sc" ]; then
-  if [[ $($sc -version) != "staticcheck $STATICCHECK_VERSION "* ]]; then
+  if [[ $("$sc" -version) != "staticcheck$(go env GOEXE) $STATICCHECK_VERSION "* ]]; then
     echo "staticcheck 版本须为 $STATICCHECK_VERSION"
     fail=1
   else
@@ -170,7 +181,7 @@ if [ -n "$dc" ]; then
     # 含测试分析必须无输出；生产入口另行列出只被测试使用的符号。
     for entry in "${PLATFORMS[@]}"; do
       target=${entry%:*}
-      echo "== deadcode（含测试入口）$target，tags=$BUILD_TAGS"
+      echo "== deadcode（含测试入口）${target}，tags=$BUILD_TAGS"
       if ! dc_out=$(env CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" "$dc" -tags "$BUILD_TAGS" -test ./... 2>&1); then
         fail=1
       fi

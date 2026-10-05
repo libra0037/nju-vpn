@@ -15,7 +15,7 @@ case "$*" in
 esac
 SH
 chmod +x "$test_dir/bin/go"
-if PATH="$test_dir/bin:$PATH" NJUVPN_TEST_GO_VERSION="$GO_VERSION" bash scripts/build-test-bundle.sh v0.1.1 "$test_dir/out" > "$test_dir/output" 2>&1; then
+if PATH="$test_dir/bin:$PATH" NJUVPN_TEST_GO_VERSION="$GO_VERSION" bash scripts/build-test-bundle.sh test-version "$test_dir/out" > "$test_dir/output" 2>&1; then
   echo '列包失败却返回成功' >&2
   exit 1
 fi
@@ -23,5 +23,5 @@ if [[ -e "$test_dir/out/BUILD.txt" ]]; then
   echo '列包失败后仍继续构建' >&2
   exit 1
 fi
-rg --quiet --fixed-strings 'test-package-list-failure' "$test_dir/output"
+grep -qF 'test-package-list-failure' "$test_dir/output"
 echo 'PASS package-list failure stops before building or archiving'

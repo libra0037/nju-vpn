@@ -19,6 +19,12 @@ const pipePrefix = `\\.\pipe\`
 // ErrEmptyEndpoint 表示调用方没有解析出 IPC 端点。
 var ErrEmptyEndpoint = errors.New("IPC 端点为空")
 
+func isPlatformDisconnect(err error) bool {
+	return errors.Is(err, windows.ERROR_BROKEN_PIPE) ||
+		errors.Is(err, windows.ERROR_NO_DATA) ||
+		errors.Is(err, windows.ERROR_PIPE_NOT_CONNECTED)
+}
+
 // endpointPath 把实例标识拼成命名管道名。
 //
 // 管道名是全局命名空间、所有用户共用，所以必须带实例标识：否则同一台机器上
@@ -34,7 +40,7 @@ func Listen(endpoint string) (net.Listener, error) {
 		return nil, ErrEmptyEndpoint
 	}
 	if !strings.HasPrefix(endpoint, pipePrefix) {
-		return nil, fmt.Errorf("Windows 下的 IPC 端点必须是命名管道（以 %s 开头），收到 %q", pipePrefix, endpoint)
+		return nil, fmt.Errorf("命名管道端点必须以 %s 开头，收到 %q", pipePrefix, endpoint)
 	}
 
 	sddl, err := currentUserSDDL()

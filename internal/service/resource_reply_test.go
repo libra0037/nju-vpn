@@ -14,14 +14,16 @@ import (
 	"github.com/libra0037/nju-vpn/internal/ztnatest"
 )
 
-func TestLargeResourcesReplyIsCompleteAndReadOnly(t *testing.T) {
+func TestNormalizedResourcesReplyIsCompleteBoundedAndReadOnly(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		count int
-		host  string
+		name     string
+		count    int
+		host     string
+		overflow bool
 	}{
-		{"60KiB-input", 512, "192.0.2.1"},
-		{"large-domains", 128, strings.Repeat("x", 1024)},
+		{"60KiB-input", 512, "192.0.2.1", false},
+		{"large-domains", 128, strings.Repeat("x", 1024), false},
+		{"over-budget", 1024, "192.0.2.1", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			apps := make([]ztnatest.App, tc.count)
@@ -48,17 +50,33 @@ func TestLargeResourcesReplyIsCompleteAndReadOnly(t *testing.T) {
 				if err := ipc.WriteRequest(client, ipc.Request{Command: ipc.CmdResources}); err != nil {
 					t.Fatal(err)
 				}
-				resp, err := ipc.ReadResourcesResponse(reader)
-				if err != nil || resp.Code != ipc.CodeOK || len(resp.Message) <= ipc.MaxLineBytes {
-					t.Fatal("大资源响应被拒绝或截断", err, resp.Code, len(resp.Message))
+				resp, err := ipc.ReadResponse(reader)
+				if err != nil {
+					t.Fatal(err)
 				}
-				var list []ztna.Resource
-				if err := json.Unmarshal([]byte(resp.Message), &list); err != nil || len(list) != tc.count {
-					t.Fatal("资源行丢失", err, len(list))
+				if tc.overflow {
+					if resp.Code != ipc.CodeServerError || !strings.Contains(resp.Message, "65536") || strings.Contains(resp.Message, "192.0.2.1") {
+						t.Fatal("超限响应被截断或放宽", resp)
+					}
+					continue
 				}
-				for _, app := range list {
-					if app.ID != "app" || len(app.AddressList) != 1 || app.AddressList[0].Host != tc.host {
-						t.Fatal("资源字段丢失")
+				if resp.Code != ipc.CodeOK || len(resp.Message)+len("200 \n") > ipc.MaxLineBytes {
+					t.Fatal("归一化资源响应错误", resp.Code, len(resp.Message))
+				}
+				var list ztna.L3Resources
+				if err := json.Unmarshal([]byte(resp.Message), &list); err != nil || list.IP == nil || list.NodeGroup == nil {
+					t.Fatal("资源对象格式非法", err)
+				}
+				want := tc.count
+				if tc.name == "large-domains" {
+					want = 0
+				}
+				if len(list.IP) != want {
+					t.Fatal("归一化资源数量错误", len(list.IP), want)
+				}
+				for _, rule := range list.IP {
+					if rule.ID != "app" || rule.Host.String() != "192.0.2.1/32" || rule.Port != [2]uint16{443, 443} {
+						t.Fatal("规则字段丢失")
 					}
 				}
 			}
@@ -108,7 +126,7 @@ func TestResourceReplyBudgetCoversBlockedWriteAndReleasesOnError(t *testing.T) {
 		errs := make(chan error, 1)
 		go func() { errs <- server.reply(b, req) }()
 		a.SetDeadline(time.Now().Add(time.Second))
-		resp, err := ipc.ReadResourcesResponse(bufio.NewReader(a))
+		resp, err := ipc.ReadResponse(bufio.NewReader(a))
 		if err != nil {
 			t.Fatal(err)
 		}

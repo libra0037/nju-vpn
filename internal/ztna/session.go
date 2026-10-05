@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -26,9 +28,10 @@ type Options struct {
 	LoginDomain string
 	DeviceID    string
 	Logf        func(format string, args ...any)
-	// InsecureSkipVerify 关闭控制面的证书校验。默认（false）走系统信任链：
-	// 门户证书是公共 CA 签发的，口令与验证码因此不再暴露给中间人。
-	InsecureSkipVerify bool
+	// ControlRootCAs 为离线测试注入受控信任；nil 使用系统信任链。
+	// 始终验证证书链与名称，不接受配置文件控制这项测试依赖。
+	ControlRootCAs *x509.CertPool
+	MTU            int // 两段隧道共用的内层 IPv4 包长上限。
 	// NodeSPKIPins 是配置边界已解析的只读 SPKI SHA-256 白名单。
 	NodeSPKIPins     [][sha256.Size]byte
 	ReconnectBackoff time.Duration
@@ -49,6 +52,12 @@ func New(opts Options) (*Client, error) {
 	}
 	if len(opts.NodeSPKIPins) > 16 {
 		return nil, &ProtocolError{What: "SPKI 白名单超过上限"}
+	}
+	if opts.MTU < ipv4MinHeader || opts.MTU > math.MaxUint16 {
+		return nil, &ProtocolError{What: "MTU 超出 IPv4 长度范围"}
+	}
+	if opts.ControlRootCAs != nil {
+		opts.ControlRootCAs = opts.ControlRootCAs.Clone()
 	}
 	if opts.ReconnectBackoff == 0 {
 		opts.ReconnectBackoff = time.Second
@@ -71,12 +80,12 @@ func (c *Client) logf(format string, args ...any) {
 
 func (c *Client) newControl(deviceID string) (*control, error) {
 	return newControl(controlOptions{
-		Server:             c.opts.Server,
-		DialAddr:           c.opts.DialAddr,
-		Dial:               c.opts.Dial,
-		DeviceID:           deviceID,
-		Debug:              func(s string) { c.logf("%s", s) },
-		InsecureSkipVerify: c.opts.InsecureSkipVerify,
+		Server:   c.opts.Server,
+		DialAddr: c.opts.DialAddr,
+		Dial:     c.opts.Dial,
+		DeviceID: deviceID,
+		Debug:    func(s string) { c.logf("%s", s) },
+		RootCAs:  c.opts.ControlRootCAs,
 	})
 }
 
@@ -282,10 +291,9 @@ func (s *Session) prepare(ctx context.Context) error {
 	}
 	s.table = table
 	s.mu.Unlock()
-	s.client.logf("资源表: %d 条规则，%d 个隧道节点", len(table.entries), len(table.nodes))
-	if table.portFallbacks > 0 {
-		s.client.logf("资源表里有 %d 条规则的端口段看不懂，已按 1-65535 处理（可能会多发几次鉴权请求）",
-			table.portFallbacks)
+	s.client.logf("资源表: %d 条 IPv4 规则，%d 个隧道节点", len(table.IP), len(table.candidateNodes(table.major)))
+	if table.badPorts > 0 {
+		s.client.logf("资源表里有 %d 条 IPv4 规则的端口格式不合法，已丢弃", table.badPorts)
 	}
 	if table.badNodes > 0 {
 		s.client.logf("资源表里有 %d 个节点地址不合法，已丢弃（它们会进探活与 CONNECT 请求行）", table.badNodes)
@@ -329,6 +337,7 @@ func (s *Session) tunnelOptions(node string) tunnelOptions {
 		SignKey:  s.signKey,
 		Logf:     s.client.logf,
 		Pins:     s.client.pins,
+		MTU:      s.client.opts.MTU,
 	}
 }
 

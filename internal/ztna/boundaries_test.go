@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,43 +58,71 @@ func TestControlHTTPResponseBudget(t *testing.T) {
 		t.Fatal("响应超出 8 MiB 仍接受")
 	}
 }
-func TestResourceSnapshotPreservesAdvertisementAndCopiesAllSlices(t *testing.T) {
-	raw := []byte(`{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[
- {"id":"domain","accessModel":"L3VPN","nodeGroupId":"g","addressList":[{"host":"db.example","protocol":"CUSTOM","port":"many","ip":["10.1.2.3","10.1.2.4"]}]},
- {"id":"empty","accessModel":"","nodeGroupId":"g","addressList":[]},
- {"id":"web","accessModel":"WEB","addressList":[{"host":"x"}]},
- {"id":"ip","accessModel":"L3VPN","nodeGroupId":"g","addressList":[{"host":"10.1.2.0/24","protocol":"tcp","port":"443","ip":[]}]}] }]}}}} `)
+func TestResourceSnapshotContainsOnlyNormalizedStateAndIsIndependent(t *testing.T) {
+	raw := []byte(`{"data":{"appList":{"data":{"appInfo":[{"apps":[
+ {"id":"domain","accessModel":"L3VPN","nodeGroupId":"g","addressList":[{"host":"db.example","protocol":"tcp","port":"443","ip":["10.1.2.3"]}]},
+ {"id":"empty","accessModel":"","nodeGroupId":"g","addressList":[{"host":"192.0.2.1","protocol":"all","port":"1-65535"}]},
+ {"id":"web","accessModel":"WEB","addressList":[{"host":"192.0.2.2","protocol":"tcp","port":"443"}]},
+ {"id":"ip","accessModel":"L3VPN","nodeGroupId":"g","addressList":[{"host":"10.1.2.7/24","protocol":"TCP","port":"443"}]}]}],
+ "config":{"nodeGroupConf":{"majorNodeGroup":{"id":"g"},"nodeGroupList":[{"id":"g","addressInfo":[{"address":"node.test:441","type":"wan"}]}]}}}},
+ "sdpPolicy":{"data":{"clientOption":{"dnsOptionV2":{"firstDNS":"10.0.0.53","secondDNS":"10.0.0.54"}}}}}}`)
 	table, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := func() []Resource {
+	snapshot := func() L3Resources {
 		b, err := table.snapshotJSON(65536)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var s []Resource
-		if err := json.Unmarshal(b, &s); err != nil {
+		if strings.Contains(string(b), "db.example") || strings.Contains(string(b), "addressList") {
+			t.Fatal("快照保留了原始资源树")
+		}
+		var result L3Resources
+		if err := json.Unmarshal(b, &result); err != nil {
 			t.Fatal(err)
 		}
-		return s
+		return result
 	}
 	snap := snapshot()
-	if len(snap) != 3 || snap[0].ID != "domain" || snap[1].AccessModel != "" || len(snap[1].AddressList) != 0 || len(table.entries) != 1 {
-		t.Fatal("筛选丢失原始应用或误扩展匹配", snap)
+	if len(snap.IP) != 1 || snap.IP[0].ID != "ip" || snap.IP[0].Host.String() != "10.1.2.0/24" || snap.DNS.FirstDNS != "10.0.0.53" {
+		t.Fatal("筛选或归一化错误", snap)
 	}
-	snap[0].ID = "changed"
-	snap[0].AddressList[0].Host = "changed"
-	snap[0].AddressList[0].IP[0] = "changed"
+	if app, _, ok := table.match(netip.MustParseAddr("10.1.2.3"), protoTCP, 443); !ok || app != "ip" {
+		t.Fatal("没有按显式 IP 资源鉴权", app, ok)
+	}
+	snap.IP[0].ID = "changed"
+	snap.IP[0].Port[0] = 1
+	snap.DNS.FirstDNS = "changed"
+	snap.NodeGroup["g"][0].Address = "changed"
 	again := snapshot()
-	if again[0].ID != "domain" || again[0].AddressList[0].Host != "db.example" || again[0].AddressList[0].IP[0] != "10.1.2.3" {
-		t.Fatal("快照污染会话资源")
+	if again.IP[0].ID != "ip" || again.IP[0].Port != [2]uint16{443, 443} || again.DNS.FirstDNS != "10.0.0.53" || again.NodeGroup["g"][0].Address != "node.test:441" {
+		t.Fatal("IPC 消费者污染了会话状态")
 	}
-	body, _ := (&resourceTable{}).snapshotJSON(2)
-	if string(body) != "[]" {
-		t.Fatal("空列表应为成功的 []")
+	empty, err := parseResourceTable([]byte(`{}`), "vpn.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := empty.snapshotJSON(65536)
+	if err != nil || string(body) != `{"ip":[],"dns":{"firstDNS":"","secondDNS":""},"nodegroup":{}}` {
+		t.Fatal("空资源对象格式改变", string(body), err)
 	}
 }
+
+func TestDomainIPsNeverCreateAnAccessRule(t *testing.T) {
+	raw := []byte(`{"data":{"appList":{"data":{"appInfo":[{"apps":[{"id":"domain","accessModel":"L3VPN","addressList":[{"host":"db.example","protocol":"tcp","port":"443","ip":["192.0.2.1"]}]}]}]}}}}`)
+	table, err := parseResourceTable(raw, "vpn.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(table.IP) != 0 {
+		t.Fatal("域名附带 IP 被转成规则")
+	}
+	if _, _, ok := table.match(netip.MustParseAddr("192.0.2.1"), protoTCP, 443); ok {
+		t.Fatal("仅有域名资源仍允许访问附带 IP")
+	}
+}
+
 func TestResourceInputBudgetsAndVIPFields(t *testing.T) {
 	for _, raw := range []string{
 		strings.Repeat("[", 33) + "0" + strings.Repeat("]", 33),

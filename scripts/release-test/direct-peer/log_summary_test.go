@@ -40,7 +40,7 @@ func TestLogEventsKeepOnlyFixedCategoriesAndNumbers(t *testing.T) {
 	}
 	for _, line := range []string{
 		"2026/99/02 12:34:56 隧道连接已建立",
-		prefix + "njuvpn v0.1.1 服务进程启动 pid=42 账号=private-user",
+		prefix + "njuvpn test-version 服务进程启动 pid=42 账号=private-user",
 		prefix + "njuvpn 服务进程启动 pid=18446744073709551616 账号=private-user",
 		prefix + "wireguard: 丢弃 secret-token（累计 1 个）",
 		prefix + "wireguard: 丢弃 下行队列已满（累计 18446744073709551616 个）",

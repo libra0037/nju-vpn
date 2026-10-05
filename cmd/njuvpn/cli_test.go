@@ -48,7 +48,7 @@ func TestCommandsRejectPositionalArgs(t *testing.T) {
 	}{
 		{"untrust", cmdUntrust, []string{"all"}},
 		{"trust", cmdTrust, []string{"self"}},
-		{"status", cmdStatus, []string{"extra"}},
+		{"status", func(args []string) error { _, err := cmdStatus(args); return err }, []string{"extra"}},
 		{"stop", cmdStop, []string{"foo"}},
 		{"start", cmdStart, []string{"extra"}},
 		{"restart", cmdRestart, []string{"extra"}},
@@ -121,11 +121,7 @@ func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc
 					if err != nil {
 						return
 					}
-					write := ipc.WriteResponse
-					if req.Command == ipc.CmdResources {
-						write = ipc.WriteResourcesResponse
-					}
-					if err := write(conn, handle(req)); err != nil {
+					if err := ipc.WriteResponse(conn, handle(req)); err != nil {
 						return
 					}
 				}

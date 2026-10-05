@@ -71,7 +71,7 @@ try {
     if ($startCode -ne 0) { throw '登录失败' }
     Record 'start'
     $stage = 'status'
-    if ((Logged-Cli 'status' @('-check')) -ne 0) { throw '隧道状态异常' }
+    if ((Logged-Cli 'status') -ne 0) { throw '隧道状态异常' }
     Record 'status'
     $stage = 'resources'
     $ErrorActionPreference = 'Continue'
@@ -85,7 +85,7 @@ try {
     $lines = @(& $binary resources -config $testConfig 2>&1)
     $resourceCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($resourceCode -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 1) { throw '资源打印不完整' }
+    if ($resourceCode -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 4) { throw 'IPv4 资源及 DNS 打印不完整' }
     Record 'resources-complete'
     $stage = 'direct-traffic'
     $ErrorActionPreference = 'Continue'
@@ -105,14 +105,14 @@ try {
     Record 'direct-wireguard-handshake'
     $stage = 'heartbeat'
     Start-Sleep -Seconds 50
-    if ((Logged-Cli 'status' @('-check')) -ne 0) { throw '空闲后隧道状态异常' }
+    if ((Logged-Cli 'status') -ne 0) { throw '空闲后隧道状态异常' }
     Record 'heartbeat-survival'
     $stage = 'stop'
     if ((Logged-Cli 'stop') -ne 0) { throw '断开失败' }
     Record 'stop'
     $stage = 'stopped-status'
-    $stoppedCode = Logged-Cli 'status' @('-check')
-    if ($stoppedCode -eq 0) { throw '断开后仍在正常状态' }
+    $stoppedCode = Logged-Cli 'status'
+    if ($stoppedCode -ne 4) { throw '断开后 status 退出码应为 4' }
     Record 'stopped-status'
     $stage = 'identity'
     $after = Info

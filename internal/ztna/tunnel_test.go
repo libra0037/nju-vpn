@@ -38,6 +38,7 @@ func TestSendReadsFlowStateUnderLock(t *testing.T) {
 
 	tc := &tunnelConn{
 		node:     "test-node",
+		mtu:      1400,
 		conn:     client,
 		ep:       l3.New(),
 		flows:    newFlowTable(),
@@ -90,6 +91,7 @@ func stallOptions(t *testing.T, timeout time.Duration) tunnelOptions {
 		DeviceID:         "device-test-1",
 		SignKey:          []byte("0123456789abcdef"),
 		HandshakeTimeout: timeout,
+		MTU:              1400,
 		Logf:             t.Logf,
 	}
 }

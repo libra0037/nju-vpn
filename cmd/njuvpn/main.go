@@ -19,6 +19,15 @@ import (
 
 const prog = "njuvpn"
 
+// 退出码是命令行契约；3、4 仅用于 status 的正常查询结果。
+const (
+	exitSuccess           = 0
+	exitFailure           = 1
+	exitUsage             = 2
+	exitServiceNotRunning = 3
+	exitTunnelNotReady    = 4
+)
+
 // startTimeout 是需要登录的那些请求的超时。
 //
 // 给足：最坏路径是登录、发短信、拉资源表、逐个探测隧道节点、建隧道，
@@ -36,8 +45,8 @@ func usage() {
   %s run                       以服务进程身份运行（一般由 start 自动拉起）
   %s start [--trust]           建立隧道（必要时自动拉起服务进程）
   %s stop                      断开隧道，服务进程继续运行
-  %s status [--check]          查看服务进程与隧道状态
-  %s resources                只打印当前会话的 VPN 资源列表
+  %s status [--json]           查看服务进程、隧道及分类诊断
+  %s resources                只打印当前会话的 IPv4 L3 资源及校园 DNS
   %s trust                     把本机绑成授信终端（之后登录免二次验证）
   %s untrust [--all]           解除本机授信；--all 解除该账号下全部授信终端
   %s restart                   重启服务进程（改完配置后用它，不必手工杀进程）
@@ -45,6 +54,10 @@ func usage() {
 
 全局参数:
   -config <path>                   配置文件路径（默认见下）
+
+status 退出码:
+  0 校园隧道 up 且未在重连；1 查询失败；2 用法错误
+  3 服务进程未运行；4 隧道未就绪（未连接、登录中、待验证、失败或重连）
 
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
@@ -55,10 +68,11 @@ func usage() {
 func main() {
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(2)
+		os.Exit(exitUsage)
 	}
 
 	var err error
+	code := exitSuccess
 	args := os.Args[2:]
 
 	switch os.Args[1] {
@@ -69,7 +83,7 @@ func main() {
 	case "stop":
 		err = cmdStop(args)
 	case "status":
-		err = cmdStatus(args)
+		code, err = cmdStatus(args)
 	case "resources":
 		err = cmdResources(args)
 	case "trust":
@@ -87,7 +101,7 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "%s: 未知命令 %q\n", prog, os.Args[1])
 		usage()
-		os.Exit(2)
+		os.Exit(exitUsage)
 	}
 
 	if err != nil {
@@ -98,9 +112,14 @@ func main() {
 		var ue *usageError
 		if errors.As(err, &ue) {
 			usage()
-			os.Exit(2)
+			os.Exit(exitUsage)
 		}
-		os.Exit(1)
+		if code == exitSuccess {
+			code = exitFailure
+		}
+	}
+	if code != exitSuccess {
+		os.Exit(code)
 	}
 }
 

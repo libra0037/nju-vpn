@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,8 +12,8 @@ import (
 // writeConfig 写一份配置文件，默认给 0600 权限。
 func writeConfig(t *testing.T, body string, mode os.FileMode) string {
 	t.Helper()
-	if !strings.Contains(body, "tls:") {
-		body += "\ntls:\n  pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\n"
+	if !strings.Contains(body, "pinned_node_spki_sha256:") {
+		body += "\npinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\n"
 	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
@@ -46,6 +47,16 @@ func TestLoadValidConfig(t *testing.T) {
 	}
 	if cfg.MTU != 1320 || cfg.WireGuard.PeerAddress != "10.66.66.2" {
 		t.Errorf("配置解析结果异常: %+v", cfg)
+	}
+}
+
+func TestConfiguredMTUIsNotCappedAt1400(t *testing.T) {
+	for _, mtu := range []int{576, 1500, 9000, 65535} {
+		body := fmt.Sprintf("server: vpn.example.edu\nusername: u\nmtu: %d\n", mtu)
+		cfg, err := Load(writeConfig(t, body, 0600))
+		if err != nil || cfg.MTU != mtu {
+			t.Fatalf("配置 MTU %d 被拒绝或截低: %v", mtu, err)
+		}
 	}
 }
 
@@ -95,7 +106,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		},
 		{
 			"mtu 过大",
-			"server: vpn.example.edu\nusername: u\npassword: p\nmtu: 1500\n",
+			"server: vpn.example.edu\nusername: u\npassword: p\nmtu: 65536\n",
 			"mtu",
 		},
 		{

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 构建发行版本：交叉编译各平台的二进制并生成校验和。
 #
-# 用法: scripts/build-release.sh v0.1.0
+# 用法: scripts/build-release.sh <version>
 #
 # 两个必须的构建参数：
 #   -trimpath      不加的话，二进制里会嵌入本机的源码路径与用户名
@@ -15,7 +15,7 @@ if [[ $(go env GOVERSION) != "go$GO_VERSION" ]]; then
   exit 1
 fi
 
-VERSION=${1:?用法: scripts/build-release.sh v0.1.0}
+VERSION=${1:?用法: scripts/build-release.sh <version>}
 OUT=dist
 PKG=./cmd/njuvpn
 
@@ -43,5 +43,5 @@ done
 ( cd "$OUT" && sha256sum njuvpn-* > SHA256SUMS )
 
 echo
-echo "产物在 $OUT："
+echo "产物在 ${OUT}："
 ls -lh "$OUT" | tail -n +2

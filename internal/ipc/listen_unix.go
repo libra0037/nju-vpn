@@ -20,6 +20,8 @@ import (
 // 实例上——stop 与 restart 会打到别人的服务进程。
 var ErrEmptyEndpoint = errors.New("IPC 端点为空")
 
+func isPlatformDisconnect(error) bool { return false }
+
 // endpointPath 把实例标识拼成 Unix 域套接字路径。
 //
 // 优先用 $XDG_RUNTIME_DIR：它天然是 0700 且按用户隔离，不需要任何特权。

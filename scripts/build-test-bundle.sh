@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/toolchain.sh
-version=${1:?用法: bash scripts/build-test-bundle.sh v0.1.1 [输出目录]}
+version=${1:?用法: bash scripts/build-test-bundle.sh <version> [输出目录]}
 out=${2:-dist/test-$version-$(date -u +%Y%m%dT%H%M%SZ)}
 if [[ $(go env GOVERSION) != "go$GO_VERSION" ]]; then
   echo "要求 Go $GO_VERSION" >&2

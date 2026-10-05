@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -38,8 +40,8 @@ const (
 	// 判断要靠状态做决定。按显示文本切第一段取值的话，显示格式一改，
 	// 判断就静默失效了。
 	CmdState = "state"
-	// CmdStatus 回报给人看的一行状态。带参数 check 时链路不在 up 就以
-	// 409 应答，给巡检脚本用。
+	// CmdStatus 返回状态与诊断；可带一次 json 选择 JSON 格式。
+	// 校园链路不在 up 或正在重连时固定以 409 应答，不检查业务目标可达。
 	CmdStatus    = "status"
 	CmdResources = "resources"
 	// CmdStart 建立隧道：start <trust=0|1> [口令]。
@@ -65,21 +67,24 @@ const (
 	CodeServerError  = 500
 )
 
-// MaxLineBytes 是请求与普通响应的单行长度上限。
+// MaxLineBytes 是请求与响应的单行长度上限，包含分隔符与换行。
 //
 // 没有上限时，一个只发不换行的连接就能让服务进程的内存无界增长：
 // bufio 的 ReadString 会一直扩容直到读到换行为止。
 const MaxLineBytes = 64 * 1024
 
-// MaxResourcesResponseBytes 是完整资源响应（含状态码、分隔符、换行）的上限。
-// 资源表可接近控制面的 8 MiB 接收预算，不能受普通状态消息的 64 KiB 限制；
-// 服务进程须同时限制大响应的编码与发送并发，避免按连接数放大内存。
-const MaxResourcesResponseBytes = 8 * 1024 * 1024
-
 // ErrLineTooLong 表示收到的行超过对应请求或响应的上限。
 var ErrLineTooLong = errors.New("报文行超过长度上限")
 var ErrNotRunning = errors.New("服务进程未运行")
 var ErrUntrustedPeer = errors.New("本地 IPC 对端身份不可信")
+
+// IsDisconnect 识别连接关闭，不表示监听端点已消失。退出轮询仍须等到
+// ErrNotRunning；认证失败、超时和协议错误不能用作退出证据。
+func IsDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		isPlatformDisconnect(err)
+}
 
 // Request 是一条解析后的请求。
 type Request struct {
@@ -120,13 +125,9 @@ func ParseRequest(line string) (Request, error) {
 
 // FormatResponse 把响应编码成一行。
 func FormatResponse(r Response) string {
-	return formatResponse(r, MaxLineBytes)
-}
-
-func formatResponse(r Response, limit int) string {
 	code := strconv.Itoa(r.Code)
 	// sanitize 只做等长替换；先拒绝超限消息，避免为了拒绝而分配整行。
-	if len(code)+len(r.Message)+2 > limit {
+	if len(code)+len(r.Message)+2 > MaxLineBytes {
 		return fmt.Sprintf("%d 响应超过长度上限\n", CodeServerError)
 	}
 	return code + " " + sanitize(r.Message) + "\n"
@@ -195,26 +196,11 @@ func WriteResponse(w io.Writer, resp Response) error {
 
 // ReadResponse 从连接上读一条响应。
 func ReadResponse(r *bufio.Reader) (Response, error) {
-	return readResponse(r, MaxLineBytes)
-}
-
-// ReadResourcesResponse 读取 resources 命令的响应；普通响应仍用 ReadResponse。
-func ReadResourcesResponse(r *bufio.Reader) (Response, error) {
-	return readResponse(r, MaxResourcesResponseBytes)
-}
-
-func readResponse(r *bufio.Reader, limit int) (Response, error) {
-	line, err := readLine(r, limit)
+	line, err := readLine(r, MaxLineBytes)
 	if err != nil {
 		return Response{}, err
 	}
 	return ParseResponse(line)
-}
-
-// WriteResourcesResponse 写出 resources 命令的完整响应，超限时整单失败。
-func WriteResourcesResponse(w io.Writer, resp Response) error {
-	_, err := io.WriteString(w, formatResponse(resp, MaxResourcesResponseBytes))
-	return err
 }
 
 // WriteRequest 向连接写一条请求。
