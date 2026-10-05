@@ -1,4 +1,4 @@
-# v0.1.1 发布前测试包
+# 发布前测试包
 
 所有实机脚本都要求先设置 `NJUVPN_TEST_TARGET_IP`，不要把实际机器地址写入源码。以下 `192.0.2.1` 是文档保留地址，运行时须替换为实际校内目标；目标应在直连时不可达、经本次 VPN 可达。Linux 使用 `export NJUVPN_TEST_TARGET_IP=192.0.2.1`，Windows 使用 `$env:NJUVPN_TEST_TARGET_IP = '192.0.2.1'`。执行 setup／cleanup 的 sudo 命令时增加 `--preserve-env=NJUVPN_TEST_TARGET_IP`。离线用例不需要实际目标、账号或网络服务。
 
@@ -16,7 +16,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
 
 回传脚本打印的 `results-offline-*.zip`。本包没有 Windows race 程序；Windows race 和另外四个支持目标的原生测试须单独验证。
 
-实机配置请放在测试包之外，Linux 使用 `/绝对路径/测试目录/config.yaml`，Windows 建议放到 `$env:LOCALAPPDATA\njuvpn-v011-test\config.yaml`。不要回传配置、密钥目录或服务进程日志。允许仅在配置里填写口令，也可交互输入。沿用已授信的 device_id 时仍可能要求短信；脚本不授信或解除授信。
+实机配置请放在测试包之外，Linux 使用 `/绝对路径/测试目录/config.yaml`，Windows 建议放到 `$env:LOCALAPPDATA\njuvpn-test\config.yaml`。不要回传配置、密钥目录或服务进程日志。允许仅在配置里填写口令，也可交互输入。沿用已授信的 device_id 时仍可能要求短信；脚本不授信或解除授信。
 
 Linux 对端准备：运行 `bash prepare-linux-peer.sh /绝对路径/测试目录/config.yaml`，再按脚本输出执行 sudo 命令，重配专用 `wgtest`，MTU 1400。独立路由表 61121、优先级 21121 只将该目标的 HTTP 18080、UDP 18081 和 ICMP 送入测试接口，保留 SSH 等控制连接原路由；已有同号规则或表时拒绝覆盖。随后运行 `bash live-linux.sh /绝对路径/测试目录/config.yaml`，排障时可用第二个参数指定诊断二进制。实机结果摘要在 `results-live-*`，完整命令输出在配置旁的 `private-*`，只回传摘要。
 
@@ -25,7 +25,7 @@ Windows 对端准备：可复制已有可用配置到独立测试目录，沿用
 完成离线测试后，停止其他使用同账号的 VPN，会与 Linux 端顺序运行实机测试：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\live-windows.ps1 -ConfigPath "$env:LOCALAPPDATA\njuvpn-v011-test\config.yaml" -ProxyName "nju-vpn-test" -ApiUrl "http://127.0.0.1:9097"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\live-windows.ps1 -ConfigPath "$env:LOCALAPPDATA\njuvpn-test\config.yaml" -ProxyName "nju-vpn-test" -ApiUrl "http://127.0.0.1:9097"
 ```
 
 API secret 由脚本在本机询问，留空表示无 secret，不写日志。脚本只读取 mihomo API 和测试指定节点，不改代理选择。API 调用依据 [mihomo 官方文档](https://wiki.metacubex.one/api/)。实机测试服务在你有权访问的校内机器启动，HTTP 端口 `18080`、UDP 端口 `18081`。使用 `python3 target-server.py --bind <实际 IPv4 地址>`；默认仅监听回环。
@@ -36,7 +36,7 @@ API secret 由脚本在本机询问，留空表示无 secret，不写日志。�
 
 检查既有失败日志时，在原包目录运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\collect-logs-windows.ps1 -ConfigPath "实际测试配置路径"`，回传 `results-log-*.zip`。它只读取该配置的当前服务进程日志与最多两份备份，不建立网络连接或改变 VPN 状态；每份最多 4 MiB、每行最多 8 KiB，保留最近 256 个固定事件的 UTC 时间、进程号、原因类别及累计值。原文、路径、账号、密钥和异常正文不会进入摘要。日志目录及结果目录均限 256 项。附带的最近四个结果目录时间仅供粗略关联；轮转、限速、丢弃旧事件及清理时的断开均需考虑，缺少记录不能证明没有发生丢包。
 
-排查 mihomo 之外的路径时，顺序运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\direct-windows.ps1 -ConfigPath "$env:LOCALAPPDATA\njuvpn-v011-test\config.yaml"`。工具自动在配置旁创建新的 `private-direct-*`：复制账号、设备标识、出站代理和 TLS 策略，只替换测试对端公钥及回环端口，原文件保持不变。直接对端使用 wireguard-go 的内存 TUN 与用户态网络栈，不要求管理员权限、网卡、系统路由或 mihomo API；MTU 1400，仅发往上述测试目标。回传 `results-direct-*.zip`，私有配置、密钥和日志不回传。健康检查、UDP 的单请求期限为 30 秒，下载、上传为 90 秒；记录期限、TCP 建连、首字节、总耗时、实际读取长度及固定错误类别。HTTP 客户端是 Go，成功不能单独证明 mihomo 或 .NET 中的哪一层有错，须和同机 live 结果及目标关闭记录对照。
+排查 mihomo 之外的路径时，顺序运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\direct-windows.ps1 -ConfigPath "$env:LOCALAPPDATA\njuvpn-test\config.yaml"`。工具自动在配置旁创建新的 `private-direct-*`：复制账号、设备标识、出站代理和 TLS 策略，只替换测试对端公钥及回环端口，原文件保持不变。直接对端使用 wireguard-go 的内存 TUN 与用户态网络栈，不要求管理员权限、网卡、系统路由或 mihomo API；MTU 1400，仅发往上述测试目标。回传 `results-direct-*.zip`，私有配置、密钥和日志不回传。健康检查、UDP 的单请求期限为 30 秒，下载、上传为 90 秒；记录期限、TCP 建连、首字节、总耗时、实际读取长度及固定错误类别。HTTP 客户端是 Go，成功不能单独证明 mihomo 或 .NET 中的哪一层有错，须和同机 live 结果及目标关闭记录对照。
 
 维护者检查直接对端使用 `bash scripts/check-direct-peer.sh`；Go 与静态工具版本取仓库工具链，声明范围为 Linux/amd64、Windows/amd64、无构建标签。它是独立测试模块，新增的 gVisor 网络栈固定为现有 wireguard-go 所声明的版本，不进入产品依赖或发布程序。
 

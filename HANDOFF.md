@@ -217,7 +217,7 @@ TLS 有两处，校验方式不同：控制面始终走系统信任链与名称�
 
 ### 9.2 检查清单
 
-提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l` 检查 Git 已跟踪及未忽略的自有 Go 文件、枚举守卫、`go vet ./...`、`go build ./...`、六个发布平台的交叉编译、本机 `go test`（支持时加 `-race`）、`go mod tidy -diff`、`staticcheck ./...`、各平台测试与生产入口的 `deadcode`，加上"README 的子命令与选项跟 usage 双向对齐"与"术语不回潮"（WireGuard 两侧叫承载层与对端，本机那个进程写全"服务进程"）这两条——都应当无输出或全绿。Go 与工具版本、平台和构建标签以 `go.mod`、`scripts/toolchain.sh` 为准。工具装在 `$(go env GOPATH)/bin` 下也会被找到（不必先进 PATH）。`scripts/build-release.sh <版本>` 生成各平台产物（产物目录不进 git）。
+提交前跑 `scripts/check.sh`（CI 用同一个脚本）：`gofmt -l` 检查 Git 已跟踪及未忽略的自有 Go 文件、枚举守卫、`go vet ./...`、`go build ./...`、六个发布平台的交叉编译、本机 `go test`（支持时加 `-race`）、`go mod tidy -diff`、`staticcheck ./...`、各平台测试与生产入口的 `deadcode`，加上"README 的子命令与选项跟 usage 双向对齐"与"术语不回潮"（WireGuard 两侧叫承载层与对端，本机那个进程写全"服务进程"）这两条——都应当无输出或全绿。Go 与工具版本、平台和构建标签以 `go.mod`、`scripts/toolchain.sh` 为准。工具装在 `$(go env GOPATH)/bin` 下也会被找到（不必先进 PATH）。`scripts/build-release.sh <version>` 生成各平台产物（产物目录不进 git）。
 
 2026-10-03：Linux/amd64 完整检查（含 race）、六个目标的构建与测试编译、Linux 服务器和 Windows 10/amd64 的离线与端到端测试通过，含 MTU 1400、顺序分片、资源完整性及受控断线。当时平台原生 CI 和长期运行暂缓，macOS 未实机验证；Linux/amd64 的 `govulncheck` 为 0 条可达漏洞、30 条模块级记录，`gosec` 的 82 条告警已核对。2026-10-05 Linux 内核 WireGuard 端到端回归通过：31 条 IPv4 资源、只读查询与重复启动、8 MiB 下载、1 MiB 上传、UDP 与顺序分片、MTU 1400、心跳及停止后不可达；1500 字节转发另有离线固定样例。[六个平台原生 CI](https://github.com/libra0037/nju-vpn/actions/runs/37317780056) 全部通过：runner 核对实际 GOOS / GOARCH 并执行同一检查，Windows/arm64 不支持 race，其余目标运行 race，Windows/amd64 另验证发布测试脚本，新增用例核对 `status` 的固定退出码、旧选项拒绝及两种输出格式；修复 Windows 退出轮询、工具路径与换行、macOS 测试 socket 与默认 Bash、协议测试会话清理及 Linux 脚本隐含工具依赖。长期运行仍暂缓，原生离线 CI 不代替 macOS 校园实机测试。以下为历史扫描记录。
 
@@ -247,9 +247,9 @@ TLS 有两处，校验方式不同：控制面始终走系统信任链与名称�
 ### 9.6 发布流程
 
 1. 提交前确认真实配置、密钥、实机地址、日志与结果未入库；确认工作区干净、`scripts/check.sh` 全绿，再把分支推到 `origin/main`（CI 会在 push 时跑同一个脚本）。
-2. 在独立、干净的 worktree 中运行 `scripts/build-release.sh v0.1.1`（脚本会清空 `dist/`）：生成 `dist/` 下六个平台的产物与 `SHA256SUMS`。
+2. 在独立、干净的 worktree 中运行 `scripts/build-release.sh <version>`（脚本会清空 `dist/`）：生成 `dist/` 下六个平台的产物与 `SHA256SUMS`。
 3. 自检产物：`dist/njuvpn-linux-amd64 version` 要打印注入的版本号；`cd dist && sha256sum -c SHA256SUMS`；抽查二进制里没有本机路径（`strings dist/njuvpn-linux-amd64 | grep "$HOME"` 应当没有输出）。
-4. `git tag v0.1.1 && git push origin v0.1.1`，再 `gh release create v0.1.1 dist/njuvpn-linux-* dist/njuvpn-windows-* dist/njuvpn-darwin-* dist/SHA256SUMS --notes-file <说明>`。
+4. `git tag <version> && git push origin <version>`，再 `gh release create <version> dist/njuvpn-linux-* dist/njuvpn-windows-* dist/njuvpn-darwin-* dist/SHA256SUMS --notes-file <说明>`。
 5. 发布说明写清已知限制：Windows 产物未签名（SmartScreen 会拦一次）、macOS 原生离线验证通过但校园实机未测、同一账号同一时刻只允许一条隧道会话、新设备首次登录要短信验证码、能访问哪些校内地址由服务端资源表决定。
 
 ## 10. 待办
