@@ -45,7 +45,7 @@ tool() {
 
 # flag_set 从文件（或 - 表示的标准输入）里提取选项，归一化后排序去重。
 # 归一化是因为 Go 的 flag 包把 -x 与 --x 当同一个：只比字面量会把
-# README 的 -check 与 usage 的 --check 误判成两个不同的选项。
+# README 的 -json 与 usage 的 --json 误判成两个不同的选项。
 flag_set() {
   grep -oE -- '(^|[^[:alnum:]-])--?[a-z][a-z0-9-]*' "$@" |
     grep -oE -- '--?[a-z][a-z0-9-]*' | sed -E 's/^--/-/' | sort -u

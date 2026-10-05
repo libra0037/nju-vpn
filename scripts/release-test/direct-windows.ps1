@@ -71,7 +71,7 @@ try {
     if ($startCode -ne 0) { throw '登录失败' }
     Record 'start'
     $stage = 'status'
-    if ((Logged-Cli 'status' @('-check')) -ne 0) { throw '隧道状态异常' }
+    if ((Logged-Cli 'status') -ne 0) { throw '隧道状态异常' }
     Record 'status'
     $stage = 'resources'
     $ErrorActionPreference = 'Continue'
@@ -105,14 +105,14 @@ try {
     Record 'direct-wireguard-handshake'
     $stage = 'heartbeat'
     Start-Sleep -Seconds 50
-    if ((Logged-Cli 'status' @('-check')) -ne 0) { throw '空闲后隧道状态异常' }
+    if ((Logged-Cli 'status') -ne 0) { throw '空闲后隧道状态异常' }
     Record 'heartbeat-survival'
     $stage = 'stop'
     if ((Logged-Cli 'stop') -ne 0) { throw '断开失败' }
     Record 'stop'
     $stage = 'stopped-status'
-    $stoppedCode = Logged-Cli 'status' @('-check')
-    if ($stoppedCode -eq 0) { throw '断开后仍在正常状态' }
+    $stoppedCode = Logged-Cli 'status'
+    if ($stoppedCode -ne 4) { throw '断开后 status 退出码应为 4' }
     Record 'stopped-status'
     $stage = 'identity'
     $after = Info

@@ -328,7 +328,7 @@ try {
     & $binary start -config $ConfigPath
     if ($LASTEXITCODE -ne 0) { throw '登录未成功' }
     Record 'start'
-    $status = & $binary status -check -config $ConfigPath 2>&1
+    $status = & $binary status -config $ConfigPath 2>&1
     if ($LASTEXITCODE -ne 0) { throw '隧道不在正常状态' }
     Record 'status'
     $stage = 'resources'
@@ -404,16 +404,16 @@ try {
     Test-Udp $socksPort
     $stage = 'heartbeat'
     Start-Sleep -Seconds 50
-    $status = & $binary status -check -config $ConfigPath 2>&1
+    $status = & $binary status -config $ConfigPath 2>&1
     if ($LASTEXITCODE -ne 0) { throw '心跳后隧道状态异常' }
     Record 'heartbeat-survival'
     $stage = 'stop'
     Invoke-Cli 'stop'
     $ErrorActionPreference = 'Continue'
-    $status = & $binary status -check -config $ConfigPath 2>&1
+    $status = & $binary status -config $ConfigPath 2>&1
     $stoppedCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($stoppedCode -eq 0) { throw 'stop 后 status -check 仍然成功' }
+    if ($stoppedCode -ne 4) { throw 'stop 后 status 退出码应为 4' }
     Record 'stopped-status'
     $stillReachable = $false
     try {
@@ -450,7 +450,7 @@ try {
         $savedPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            & $binary status -check -config $ConfigPath 2>&1 | Out-File -LiteralPath (Join-Path $private 'failure-status.log') -Encoding utf8
+            & $binary status -config $ConfigPath 2>&1 | Out-File -LiteralPath (Join-Path $private 'failure-status.log') -Encoding utf8
             $details['vpn_status_after_failure'] = ($LASTEXITCODE -eq 0)
         } catch {
             $details['vpn_status_after_failure'] = $null

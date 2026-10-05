@@ -301,7 +301,7 @@ func waitStatus(parent context.Context, path, wantState string, wantCode int, bu
 	defer cancel()
 	for ctx.Err() == nil {
 		state, err := ipcCall(ctx, path, ipc.CmdState, nil, time.Second)
-		status, statusErr := ipcCall(ctx, path, ipc.CmdStatus, []string{"check"}, time.Second)
+		status, statusErr := ipcCall(ctx, path, ipc.CmdStatus, nil, time.Second)
 		if err == nil && statusErr == nil && state.Code == ipc.CodeOK && state.Message == wantState && status.Code == wantCode {
 			return true
 		}

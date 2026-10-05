@@ -37,8 +37,14 @@ func TestStatusDiagnosticsAreReadOnlyAndSeparateReadiness(t *testing.T) {
 	}
 	before := []int{srv.ResourceCalls(), srv.Tunnels(), srv.SMSSends(), srv.LogoutCount()}
 	server := NewServer(svc, nil)
-	for _, args := range [][]string{{"json"}, {"check", "json"}, {"json", "check"}} {
+	for _, args := range [][]string{nil, {"json"}} {
 		resp := server.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: args})
+		if len(args) == 0 {
+			if resp.Code != ipc.CodeOK {
+				t.Fatal("默认状态查询没有按校园链路返回成功")
+			}
+			continue
+		}
 		var snapshot Status
 		if resp.Code != ipc.CodeOK || json.Unmarshal([]byte(resp.Message), &snapshot) != nil {
 			t.Fatal("JSON 诊断响应失败", resp.Code)
@@ -54,7 +60,7 @@ func TestStatusDiagnosticsAreReadOnlyAndSeparateReadiness(t *testing.T) {
 	if svc.Status().Tunnel.Rejected.ResourceUnmatched != 1 {
 		t.Fatal("快照修改了内部状态")
 	}
-	for _, args := range [][]string{{"bogus"}, {"json", "json"}, {"check", "check"}} {
+	for _, args := range [][]string{{"bogus"}, {"json", "json"}, {"check"}, {"json", "check"}} {
 		if resp := server.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: args}); resp.Code != ipc.CodeBadRequest {
 			t.Fatal("非法状态参数未拒绝")
 		}
@@ -62,10 +68,51 @@ func TestStatusDiagnosticsAreReadOnlyAndSeparateReadiness(t *testing.T) {
 	if err := svc.Stop(); err != nil {
 		t.Fatal(err)
 	}
-	resp := server.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: []string{"json", "check"}})
+	resp := server.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: []string{"json"}})
 	var stopped Status
 	if resp.Code != ipc.CodeRejected || json.Unmarshal([]byte(resp.Message), &stopped) != nil || stopped.WireGuard.Ready || stopped.Tunnel != nil {
 		t.Fatal("停止后的 JSON 巡检状态错误")
+	}
+}
+
+func TestStatusReadinessDoesNotDependOnOutputFormat(t *testing.T) {
+	for _, tc := range []struct {
+		state    State
+		retrying bool
+		wantCode int
+	}{
+		{StateIdle, false, 409},
+		{StateLoggingIn, false, 409},
+		{StateAuthPending, false, 409},
+		{StateError, false, 409},
+		{StateUp, false, 200},
+		{StateUp, true, 409},
+	} {
+		t.Run(fmt.Sprintf("%s/retrying=%t", tc.state, tc.retrying), func(t *testing.T) {
+			srv := newFakeServer(t, ztnatest.Options{})
+			svc := newTestService(t, srv, newTestConfig(t, srv))
+			// 只推进状态模型，避免为测试输出契约启动网络会话。
+			if tc.state == StateAuthPending || tc.state == StateUp {
+				svc.status.set(StateLoggingIn, "")
+			}
+			svc.status.set(tc.state, "")
+			if tc.retrying {
+				svc.status.setRetrying(true)
+			}
+			server := NewServer(svc, nil)
+			for _, args := range [][]string{nil, {"json"}} {
+				resp := server.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: args})
+				if resp.Code != tc.wantCode {
+					t.Fatal("输出格式改变了就绪判据", args, resp.Code)
+				}
+				if len(args) != 0 {
+					var snapshot Status
+					if json.Unmarshal([]byte(resp.Message), &snapshot) != nil || snapshot.State != tc.state || snapshot.Retrying != tc.retrying {
+						t.Fatal("非零结果未保留完整状态快照")
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -223,15 +223,13 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		return ipc.Response{Code: ipc.CodeOK, Message: string(s.svc.Status().State)}
 
 	case ipc.CmdStatus:
-		check, jsonOutput := false, false
+		jsonOutput := false
 		for _, arg := range req.Args {
 			switch {
-			case arg == "check" && !check:
-				check = true
 			case arg == "json" && !jsonOutput:
 				jsonOutput = true
 			default:
-				return ipc.Response{Code: ipc.CodeBadRequest, Message: "status 只接受 check 与 json 各一次"}
+				return ipc.Response{Code: ipc.CodeBadRequest, Message: "status 只接受一次 json"}
 			}
 		}
 		st := s.svc.Status()
@@ -243,10 +241,8 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			}
 			message = string(body)
 		}
-		// status check 给巡检脚本用：链路不在 up 时以非 0 退出，而不是把
-		// "进程活着"当成"链路正常"。正在退避重连时也算不正常：状态还是
-		// up（隧道对象还在），但链路是断的。
-		if check && (st.State != StateUp || st.Retrying) {
+		// 输出格式不改变就绪判据；退避重连时对象虽在，链路仍未就绪。
+		if st.State != StateUp || st.Retrying {
 			return ipc.Response{Code: ipc.CodeRejected, Message: message}
 		}
 		return ipc.Response{Code: ipc.CodeOK, Message: message}
@@ -457,17 +453,17 @@ func statusLine(st Status) string {
 // 只包含 PID、账号、配置路径与端点——都不算秘密，能连上本地端点的人本来
 // 就看得到这些文件。
 func identityText(id Identity) string {
-	parts := []string{fmt.Sprintf("pid=%d", id.PID)}
+	text := fmt.Sprintf("pid=%d", id.PID)
 	if id.Username != "" {
-		parts = append(parts, fmt.Sprintf("账号=%q", id.Username))
+		text += fmt.Sprintf(" | 账号=%q", id.Username)
 	}
 	if id.ConfigPath != "" {
-		parts = append(parts, fmt.Sprintf("配置=%q", id.ConfigPath))
+		text += fmt.Sprintf(" | 配置=%q", id.ConfigPath)
 	}
 	if id.Endpoint != "" {
-		parts = append(parts, fmt.Sprintf("端点=%q", id.Endpoint))
+		text += fmt.Sprintf(" | 端点=%q", id.Endpoint)
 	}
-	return strings.Join(parts, " ")
+	return text
 }
 
 // RunServer 是服务进程的入口：监听本地端点并处理请求，返回时说明服务已停止。

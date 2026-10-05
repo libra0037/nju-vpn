@@ -48,7 +48,7 @@ func TestCommandsRejectPositionalArgs(t *testing.T) {
 	}{
 		{"untrust", cmdUntrust, []string{"all"}},
 		{"trust", cmdTrust, []string{"self"}},
-		{"status", cmdStatus, []string{"extra"}},
+		{"status", func(args []string) error { _, err := cmdStatus(args); return err }, []string{"extra"}},
 		{"stop", cmdStop, []string{"foo"}},
 		{"start", cmdStart, []string{"extra"}},
 		{"restart", cmdRestart, []string{"extra"}},

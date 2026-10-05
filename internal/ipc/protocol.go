@@ -40,8 +40,8 @@ const (
 	// 判断要靠状态做决定。按显示文本切第一段取值的话，显示格式一改，
 	// 判断就静默失效了。
 	CmdState = "state"
-	// CmdStatus 返回状态与诊断；json 请求 JSON，check 在校园链路不在 up
-	// 或正在重连时以 409 应答。两参数各最多一次，不检查业务目标可达。
+	// CmdStatus 返回状态与诊断；可带一次 json 选择 JSON 格式。
+	// 校园链路不在 up 或正在重连时固定以 409 应答，不检查业务目标可达。
 	CmdStatus    = "status"
 	CmdResources = "resources"
 	// CmdStart 建立隧道：start <trust=0|1> [口令]。

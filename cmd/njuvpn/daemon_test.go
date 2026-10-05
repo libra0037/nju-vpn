@@ -26,17 +26,14 @@ import (
 //
 // 默认编译当前包；发布前测试包通过 NJUVPN_TEST_BINARY 指定同一源码构建的
 // 候选程序，让没有 Go 的机器也能验证真实的进程启动与 IPC。
-func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
+func testCLIBinary(t *testing.T) string {
+	t.Helper()
 	bin := os.Getenv("NJUVPN_TEST_BINARY")
 	if bin == "" {
 		if _, err := exec.LookPath("go"); err != nil {
 			t.Skip("未指定候选程序且没有 go 命令")
 		}
-		bin = filepath.Join(dir, "njuvpn")
+		bin = filepath.Join(t.TempDir(), "njuvpn")
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
 		}
@@ -50,6 +47,15 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return bin
+}
+
+func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	bin := testCLIBinary(t)
 	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -97,8 +103,9 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	}
 
 	out, err := run("status", "-config", configPath)
-	if err != nil {
-		t.Fatalf("status 失败: %v\n%s", err, out)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 4 {
+		t.Fatalf("空闲状态退出码应为 4: %v\n%s", err, out)
 	}
 	if !strings.Contains(out, string("idle")) {
 		t.Errorf("刚拉起的服务进程应处于 idle，得到 %q", out)
@@ -123,8 +130,8 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	if out, err := run("restart", "-config", configPath); err != nil {
 		t.Fatalf("第二次 restart 失败: %v\n%s", err, out)
 	}
-	if out, err := run("status", "-config", configPath); err != nil {
-		t.Fatalf("第二次 status 失败: %v\n%s", err, out)
+	if out, err := run("status", "-config", configPath); !errors.As(err, &exitErr) || exitErr.ExitCode() != 4 {
+		t.Fatalf("第二次空闲状态退出码应为 4: %v\n%s", err, out)
 	}
 	restarted, err := config.Load(configPath)
 	if err != nil {

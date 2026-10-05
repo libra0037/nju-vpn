@@ -372,9 +372,6 @@ func TestServerDispatchContract(t *testing.T) {
 		t.Errorf("带 --trust 的重复 start 应完成绑定，服务端授信终端 = %v", got)
 	}
 
-	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: []string{"check"}}); resp.Code != ipc.CodeOK {
-		t.Errorf("status check = %d %s", resp.Code, resp.Message)
-	}
 	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus}); resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, testVIP) {
 		t.Errorf("status = %d %q，期望带上校园网地址", resp.Code, resp.Message)
 	}
@@ -392,8 +389,8 @@ func TestServerDispatchContract(t *testing.T) {
 	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStop}); resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, "本来就没有运行") {
 		t.Errorf("重复 stop = %d %q，期望按成功处理", resp.Code, resp.Message)
 	}
-	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus, Args: []string{"check"}}); resp.Code != ipc.CodeRejected {
-		t.Errorf("链路不在 up 时 status check = %d，期望 409", resp.Code)
+	if resp = s.dispatch(ipc.Request{Command: ipc.CmdStatus}); resp.Code != ipc.CodeRejected {
+		t.Errorf("链路不在 up 时 status = %d，期望 409", resp.Code)
 	}
 
 	if resp = s.dispatch(ipc.Request{Command: ipc.CmdShutdown}); resp.Code != ipc.CodeOK {

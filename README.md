@@ -2,13 +2,13 @@
 
 南京大学校园网 VPN 的第三方客户端。支持 Windows 与 Linux，理论上支持 macOS 但未实测。
 
-服务进程把校园网隧道拼接到 WireGuard 隧道上，Clash、sing-box 之类的程序都能以 WireGuard 对端的身份接入，从而访问校内资源。
+服务进程把 VPN 的 L3 隧道拼接到自己的 WireGuard 隧道上，Clash、sing-box 之类的程序都能以 WireGuard 对端的身份接入，从而访问校内资源。
 
 > 实测结论、设计取舍与踩过的坑见 [HANDOFF.md](HANDOFF.md)。
 
 ## 特性
 
-- **不需管理员权限**：承载层是用户态 WireGuard，不强制安装 TUN 驱动或虚拟网卡，装了 Clash 就能用。
+- **不需管理员权限**：承载层是用户态 WireGuard，不需安装 TUN 驱动或虚拟网卡，不改系统路由或 DNS，装了 Clash 就能用。
 - **一条命令启动**：`njuvpn start` 会按需拉起服务进程，不必配置为系统服务，只在登录密码或短信验证码必需时才向用户索要。
 - **二次验证可免**：把本机绑成授信终端之后，登录不再需要短信验证码。
 - **同机可跑多个实例**：每份配置文件各自一个实例，端点与日志互不打扰。
@@ -46,8 +46,8 @@ go build -o njuvpn ./cmd/njuvpn
 
 ```bash
 njuvpn start [--trust]  建立隧道（加 --trust 时在这次登录成功后把本机绑成授信终端）
-njuvpn status           查看状态与诊断（-check 检查校园链路；-json 输出 JSON）
-njuvpn resources        打印当前登录会话的 IPv4 L3 资源及校园 DNS（不启动服务进程、登录或重新拉取资源表）
+njuvpn status [-json]   查看状态与诊断
+njuvpn resources        打印当前登录会话的 IPv4 访问资源和校园 DNS（包括协议、网段、端口）
 njuvpn stop             断开隧道（本来就没在跑也按成功处理）
 njuvpn restart          重启服务进程（改完配置后用它）
 njuvpn trust            把本机绑成授信终端（之后登录免二次验证）
@@ -58,6 +58,16 @@ njuvpn version          查看版本
 所有命令都认 `-config <路径>`。
 
 `start` 支持管道输入，便于脚本：`printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start`。
+
+`status` 的文本与 JSON 使用相同退出码，不主动探测网络，不包括 WireGuard 握手或校园网可达性。
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 校园隧道和 WireGuard 承载层均正常工作 |
+| 1 | 查询失败（IPC 超时、认证、协议或服务进程错误） |
+| 2 | 命令用法错误 |
+| 3 | 服务进程未运行 |
+| 4 | 隧道未就绪（未连接、登录中、待验证、失败或重连） |
 
 ### 3. WireGuard 对端接入
 
@@ -130,9 +140,7 @@ njuvpn version          查看版本
    sudo wg show                # 看握手与流量
    ```
 
-   VPN 能访问的范围由 IPv4 资源规则的 IP／CIDR、协议、端口及服务端逐流鉴权决定，不按公网或私网地址区分。仅支持 `accessModel=L3VPN` 且 `host` 为 IPv4 或 IPv4 CIDR 的资源。上面的 `172.16.0.0/12` 只是部分网段示例，请按 `njuvpn resources` 和自身实际需求填写。
-
-   mihomo 的 `allowed-ips` 定义节点可承载的目的地址；示例允许 IPv4 全网段，由代理规则决定哪些连接使用该节点。`wg-quick` 则按 `AllowedIPs` 自动安装系统路由，因此应收窄到需要访问的资源网段。CIDR 路由不能表达协议和端口，最终仍由程序匹配和服务端鉴权。
+   校园 VPN **不能**随意访问任意目标 IP 地址（协议上的禁止，非本程序的有意设计）；`njuvpn resources` 打印当前可访问的目标地址。mihomo 的 `allowed-ips` 定义节点可承载的目标；示例允许 IPv4 全网段，由代理规则决定哪些连接使用该节点。`wg-quick` 则按 `AllowedIPs` 自动安装系统路由，因此应收窄到需要访问的资源网段。上面的 `172.16.0.0/12` 只是部分网段示例，请按 `njuvpn resources` 和自身实际需求填写。
 
 4. 配置分流。Clash 需手动设置代理规则，`wg-quick` 会自动设置系统路由表。只将需要且已授权的资源送入校园隧道，其余流量按自己的原有策略处理；DNS 查询分流由对端负责。
 

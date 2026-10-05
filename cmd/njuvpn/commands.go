@@ -205,35 +205,38 @@ func cmdStop(args []string) error {
 	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop}, time.Minute)
 }
 
-// cmdStatus 查看状态。--check 让链路不在 up 时以非 0 退出，给巡检脚本用。
-func cmdStatus(args []string) error {
+// cmdStatus 只读查询；输出格式不改变退出码，未就绪结果不作为查询错误。
+func cmdStatus(args []string) (int, error) {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
-	check := fs.Bool("check", false, "链路不在 up 状态时以非 0 退出（给巡检脚本用）")
 	jsonOutput := fs.Bool("json", false, "打印只读状态与分类诊断 JSON")
 	if err := parseNoPositional(fs, args); err != nil {
-		return err
+		return exitUsage, err
 	}
 	endpoint, err := endpointFor(*configPath)
 	if err != nil {
-		return err
+		return exitFailure, err
 	}
 	req := ipc.Request{Command: ipc.CmdStatus}
-	if *check {
-		req.Args = append(req.Args, "check")
-	}
 	if *jsonOutput {
 		req.Args = append(req.Args, "json")
 	}
 	resp, err := call(endpoint, req, 30*time.Second)
 	if err != nil {
-		return err
+		if errors.Is(err, ipc.ErrNotRunning) {
+			return exitServiceNotRunning, err
+		}
+		return exitFailure, err
 	}
 	fmt.Println(resp.Message)
-	if resp.Code != ipc.CodeOK {
-		return fmt.Errorf("链路不在正常状态")
+	switch resp.Code {
+	case ipc.CodeOK:
+		return exitSuccess, nil
+	case ipc.CodeRejected:
+		return exitTunnelNotReady, nil
+	default:
+		return exitFailure, fmt.Errorf("状态查询失败，服务进程返回 %d", resp.Code)
 	}
-	return nil
 }
 
 // cmdRestart 重启服务进程：先请它自己退出（会登出），再拉起一个新的。
