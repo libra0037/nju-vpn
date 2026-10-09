@@ -40,6 +40,10 @@ API secret 由脚本在本机询问，留空表示无 secret，不写日志。�
 
 维护者检查直接对端使用 `bash scripts/check-direct-peer.sh`；Go 与静态工具版本取仓库工具链，声明范围为 Linux/amd64、Windows/amd64、无构建标签。它是独立测试模块，新增的 gVisor 网络栈固定为现有 wireguard-go 所声明的版本，不进入产品依赖或发布程序。
 
+双端校园补充入口为 `campus-windows.ps1`，须另备包含候选程序、`test-peer.exe` 和 `native-tests.exe` 的包目录；沿用当前格式的私有配置，通过 `-ConfigPath` 指定，验证 WireGuard／SOCKS 的真实流量、独立启停和收尾。原配置保持不变，结果 ZIP 保留本实例原始日志；只有准备进入 Git 历史的材料需要脱敏。
+
+维护者用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\release-test\windows-guards-test.ps1` 在同一 PowerShell 进程执行校园八项、离线运行器两项和假命令清理守卫；它们只使用固定假程序与临时文件。预期拒绝样例的 FAIL／模拟竞争报告不代表产品失败，不能替代真实校园或 Go race 验收。
+
 Windows 的分片／ICMP 实机验证使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\direct-windows.ps1 -ConfigPath "实际测试配置路径" -PacketChecks`，回传 `results-packets-*.zip`。它使用独立用户态 WireGuard 对端，记录 2000／4000 字节 UDP 的实际 IPv4 首末分片及包长，目标以固定 SHA-256 确认重组内容；ICMP 发送 1372 字节正文、DF、总 IP 长度 1400 并验证响应。大 UDP 只验证上行分片，目标回传小摘要，避免把目标下行 MTU 的差异混入上行判据。
 
 短时断线验证使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\resilience-windows.ps1 -ConfigPath "实际测试配置路径"`，回传 `results-resilience-*.zip`。原测试配置需已初始化身份并在本机填写 password；脚本复制到新的私有实例，出站经过受控回环 CONNECT 转发后沿用原 proxy 或直连方式。验证短暂断线恢复、静默约 45 秒后的心跳判死及恢复、持续拒绝连接耗尽重连预算、手动重新 start、重连期间 stop 及停止后不可达；主流程期限 5 分钟，收尾另设 15 秒期限，不运行授信／解除授信。原配置保持不变，结束时等待独立服务、对端与代理退出；系统网卡和 SSH 路由沿用原设置。Linux 可调用 `test-peer resilience -config <原配置> -binary <njuvpn 程序> -out <新的私有目录> -result <新的公开 JSON> -run-id <32位随机标识>` 执行同一工具。

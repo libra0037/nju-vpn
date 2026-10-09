@@ -2,13 +2,13 @@
 
 南京大学校园网 VPN 的第三方客户端。支持 Windows 与 Linux，理论上支持 macOS 但未实测。
 
-服务进程把 VPN 的 L3 隧道拼接到自己的 WireGuard 隧道上，Clash、sing-box 之类的程序都能以 WireGuard 对端的身份接入，从而访问校内资源。
+服务进程以标准 WireGuard 与 SOCKS5 端点分别暴露校园 VPN 的 L3 隧道和 TCP 代理通道。Clash、sing-box 之类的程序可通过任一端点访问校内资源，两端可以独立启用、同时服务，共用校园登录。
 
 > 实测结论、设计取舍与踩过的坑见 [HANDOFF.md](HANDOFF.md)。
 
 ## 特性
 
-- **不需管理员权限**：承载层是用户态 WireGuard，不需安装 TUN 驱动或虚拟网卡，不改系统路由或 DNS，装了 Clash 就能用。
+- **不需管理员权限**：提供用户态 WireGuard 与 SOCKS5 接入，不内置业务网络栈，不需安装 TUN 驱动或虚拟网卡，不改系统路由或 DNS。
 - **一条命令启动**：`njuvpn start` 会按需拉起服务进程，不必配置为系统服务，只在登录密码或短信验证码必需时才向用户索要。
 - **二次验证可免**：把本机绑成授信终端之后，登录不再需要短信验证码。
 - **同机可跑多个实例**：每份配置文件各自一个实例，端点与日志互不打扰。
@@ -38,6 +38,7 @@ go build -o njuvpn ./cmd/njuvpn
 
 - 通常不需填写 `server_ip`，除非本机 DNS 解析不了 `server`。
 - 通常不需填写 `proxy`，除非本机到服务端需要另择出口。该出口必须是稳定的单一地址。
+- `wireguard.enabled` 与 `socks5.enabled` 分别控制端点，省略等同于 `false`；模板同时开启两端，不需要的一端可关闭。WireGuard 的内层 MTU 在 `wireguard.mtu`。
 - `device_id` 用于标识授信终端，由程序自动生成并写回配置。删掉或换掉等于换了一台设备，下次登录会需要短信验证码。
 - 首次生成身份需要配置文件所在目录可写；Unix 下目录须属于当前用户且不允许其他用户写入。写回失败会停止启动。
 - 配置文件里有凭据，服务进程启动时会把它收紧到 `0600`。
@@ -45,10 +46,10 @@ go build -o njuvpn ./cmd/njuvpn
 ### 2. 命令行
 
 ```bash
-njuvpn start [--trust]  建立隧道（加 --trust 时在这次登录成功后把本机绑成授信终端）
+njuvpn start [--trust] [--endpoint <wireguard|socks5>]  登录并启动配置的端点；--trust 在登录成功后授信
 njuvpn status [-json]   查看状态与诊断
-njuvpn resources        打印当前登录会话的 IPv4 访问资源和校园 DNS（包括协议、网段、端口）
-njuvpn stop             断开隧道（本来就没在跑也按成功处理）
+njuvpn resources        打印当前登录会话的 IPv4 / TCP 域名资源和校园 DNS（包括协议、端口）
+njuvpn stop [--endpoint <wireguard|socks5>]  全局断开并登出，或只停止指定端点
 njuvpn restart          重启服务进程（改完配置后用它）
 njuvpn trust            把本机绑成授信终端（之后登录免二次验证）
 njuvpn untrust [--all]  解除本机授信；--all 解除该账号下全部授信终端
@@ -57,17 +58,19 @@ njuvpn version          查看版本
 
 所有命令都认 `-config <路径>`。
 
+带 `--endpoint` 的 start / stop 只操作指定端点，保留另一端与校园登录；单端点启动要求已经登录且配置启用了该端点，不能同时使用 `--trust`。不带该选项的 start 按配置启动各端点，stop 停止两端并登出。
+
 `start` 支持管道输入，便于脚本：`printf '%s\n%s\n' "$PASSWORD" "$CODE" | njuvpn start`。
 
-`status` 的文本与 JSON 使用相同退出码，不主动探测网络，不包括 WireGuard 握手或校园网可达性。
+`status` 的文本与 JSON 使用相同退出码，不主动探测网络，也不以 WireGuard 对端握手或业务可达性作为就绪条件。
 
 | 退出码 | 含义 |
 |---|---|
-| 0 | 校园隧道和 WireGuard 承载层均正常工作 |
+| 0 | 共享校园登录与当前启用的端点均就绪 |
 | 1 | 查询失败（IPC 超时、认证、协议或服务进程错误） |
 | 2 | 命令用法错误 |
 | 3 | 服务进程未运行 |
-| 4 | 隧道未就绪（未连接、登录中、待验证、失败或重连） |
+| 4 | 数据端点未就绪（未登录、待验证、失败、停止或重连） |
 
 ### 3. WireGuard 对端接入
 
@@ -144,9 +147,23 @@ njuvpn version          查看版本
 
 4. 配置分流。Clash 需手动设置代理规则，`wg-quick` 会自动设置系统路由表。只将需要且已授权的资源送入校园隧道，其余流量按自己的原有策略处理；DNS 查询分流由对端负责。
 
+### 4. SOCKS5 接入
+
+启用 `socks5.enabled` 后，默认监听 `127.0.0.1:1080`。代理客户端可配置 [SOCKS5 节点](https://wiki.metacubex.one/config/proxies/socks/)：
+
+```yaml
+- name: nju-vpn-socks
+  type: socks5
+  server: 127.0.0.1
+  port: 1080
+  udp: false
+```
+
+只支持 IPv4／域名 TCP CONNECT，不提供 BIND、UDP ASSOCIATE 或 IPv6。访问域名资源时，让客户端把域名交给 SOCKS 端点，避免本地解析成 IP 后丢失域名授权；分流与 DNS 策略仍由客户端负责。可访问范围以 `njuvpn resources` 和校园逐流鉴权为准。
+
 ### 多实例与开机自启
 
-同一台机器上跑多个实例：每实例一份配置文件，各自派生自己的 IPC 端点与日志名，再各配一个不同的 `wireguard.listen_port` 即可。`njuvpn status` 会报出实例身份（PID、账号、配置路径与端点），用来确认命令打在了哪个实例上。
+同一台机器上跑多个实例：每实例一份配置文件，各自派生自己的 IPC 端点与日志名，分别为启用的 WireGuard／SOCKS5 配置不同的监听端口即可。`njuvpn status` 会报出实例身份（PID、账号、配置路径与端点），用来确认命令打在了哪个实例上。
 
 不内置开机自启：Windows 用任务计划程序建一个「登录时启动」的任务（程序填 `njuvpn.exe`，参数填 `run -config <配置路径>`）；Linux 写一个 systemd user unit。
 
