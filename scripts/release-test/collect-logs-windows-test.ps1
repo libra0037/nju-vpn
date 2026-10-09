@@ -9,17 +9,17 @@ try {
     $configPath = Join-Path $directory '测试 配置.yaml'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\..\config.example.yaml') -Destination $configPath
     $configDigest = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
-    # 固定 Windows 文件名契约的独立判据，不从被测工具的输出取得实例标识。
+    # 固定 Windows 文件名契约：128 位 SHA-256 前缀，不从被测工具取得判据。
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try {
         $hash = $algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($configPath.ToLowerInvariant()))
-        $tag = [BitConverter]::ToString($hash, 0, 4).Replace('-', '').ToLowerInvariant()
+        $tag = [BitConverter]::ToString($hash, 0, 16).Replace('-', '').ToLowerInvariant()
     } finally { $algorithm.Dispose() }
     $logPath = Join-Path $directory ('njuvpn-' + $tag + '-config.log')
     $body = @'
 2026/10/02 12:34:00 njuvpn 服务进程启动 pid=42 账号="private-user" 配置="secret-path"
 2026/10/02 12:34:01 隧道连接已建立
-2026/10/02 12:34:02 wireguard: 丢弃 下行队列已满（累计 19 个）
+2026/10/02 12:34:02 wireguard: 丢弃 下行队列已满（reason=downlink_full，累计 19 个包）
 2026/10/02 12:34:03 隧道断开: secret-token at 192.0.2.1:443
 '@
     [IO.File]::WriteAllText($logPath, $body, [Text.UTF8Encoding]::new($false))
@@ -42,7 +42,9 @@ try {
             $objects[$entry.Name] = $text | ConvertFrom-Json
         }
         $logs = $objects['daemon-summary.json']
-        if (-not $logs.found -or $logs.files_scanned -ne 1 -or $logs.events.Count -ne 4 -or $logs.events_omitted -ne 0) { throw '日志选择或事件数量不符' }
+        if (-not $logs.found -or $logs.files_scanned -ne 1 -or $logs.events.Count -ne 4 -or $logs.events_omitted -ne 0) {
+            throw ('日志选择或事件数量不符：found={0}，files_scanned={1}，events={2}，events_omitted={3}' -f $logs.found, $logs.files_scanned, $logs.events.Count, $logs.events_omitted)
+        }
         if ($logs.events[0].kind -ne 'service_started' -or $logs.events[2].reason -ne 'downlink_full' -or $logs.events[2].count -ne 19 -or $logs.events[3].kind -ne 'tunnel_closed') { throw '日志固定分类不符' }
         if (@($logs.events | Where-Object { $_.pid -ne 42 }).Count -ne 0) { throw '事件进程归属不符' }
         if ($objects['summary.json'].recent_runs.Count -ne 1 -or $objects['summary.json'].recent_runs[0].run_id -ne $id) { throw '结果目录标识关联不符' }

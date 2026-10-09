@@ -19,9 +19,11 @@ $summary = Join-Path $results 'summary.txt'
     Out-File -LiteralPath $summary -Encoding utf8
 & (Join-Path $PSScriptRoot 'njuvpn.exe') version | Out-File -LiteralPath $summary -Append -Encoding utf8
 Get-Content -LiteralPath (Join-Path $PSScriptRoot 'BUILD.txt') | Out-File -LiteralPath $summary -Append -Encoding utf8
-'Windows race 未包含在本测试包，须另在原生 Go/CGO 环境验证。' | Out-File -LiteralPath $summary -Append -Encoding utf8
 $oldBinary = $env:NJUVPN_TEST_BINARY
+$oldRace = $env:GORACE
 $env:NJUVPN_TEST_BINARY = Join-Path $PSScriptRoot 'njuvpn.exe'
+# race 报告须进入当前日志并以非零退出码失败；普通构建不读取此变量。
+$env:GORACE = 'log_path=stderr exitcode=66 halt_on_error=1'
 $failed = $false
 # Go 的目录句柄恢复在 WSL 的 UNC 共享上失败；测试工作目录使用本机磁盘。
 Push-Location $env:TEMP
@@ -37,12 +39,13 @@ try {
         if ($code -eq 0) { $result = 'PASS' } else { $result = 'FAIL'; $failed = $true }
         Write-Host $result
         ($result + ' ' + $test.Name) | Out-File -LiteralPath $summary -Append -Encoding utf8
-        Select-String -LiteralPath $log -Pattern '^--- SKIP:' |
+        Select-String -LiteralPath $log -Pattern '^\s*--- SKIP:' |
             ForEach-Object { 'SKIP ' + $_.Line } | Out-File -LiteralPath $summary -Append -Encoding utf8
     }
 } finally {
     Pop-Location
     $env:NJUVPN_TEST_BINARY = $oldBinary
+    $env:GORACE = $oldRace
 }
 Get-Content -LiteralPath $summary
 $archive = $results + '.zip'

@@ -61,3 +61,4 @@ jobs:
           .\scripts\release-test\target-test.ps1
           .\scripts\release-test\live-windows-test.ps1 -PeerToolPath "$env:RUNNER_TEMP/test-peer.exe"
           .\scripts\release-test\collect-logs-windows-test.ps1 -PeerToolPath "$env:RUNNER_TEMP/test-peer.exe"
+          .\scripts\release-test\windows-guards-test.ps1

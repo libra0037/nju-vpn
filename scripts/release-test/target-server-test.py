@@ -2,6 +2,7 @@
 """检查受控目标的真实请求期限、关闭等待和脱敏记录。"""
 import contextlib
 import http.client
+import hashlib
 import importlib.util
 import io
 import json
@@ -29,7 +30,100 @@ class ObservedServer(target.Server):
         self.recorded.set()
 
 
+class ObservedTCPServer(target.TCPServer):
+    def __init__(self, half_close, timeout):
+        super().__init__(('127.0.0.1', 0), half_close, timeout)
+        self.recorded = threading.Event()
+        self.records = []
+
+    def record(self, record):
+        self.records.append(record)
+        self.recorded.set()
+
+
 class TargetTest(unittest.TestCase):
+    def start_tcp(self, half_close, timeout=2):
+        server = ObservedTCPServer(half_close, timeout)
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={'poll_interval': 0.01})
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_tcp_response_requires_eof_and_matches_independent_digest(self):
+        server = self.start_tcp(True)
+        with socket.create_connection(server.server_address, timeout=1) as client:
+            client.sendall(bytes(range(256)) * 4096)
+            client.settimeout(0.05)
+            with self.assertRaises(socket.timeout):
+                client.recv(1)
+            client.settimeout(1)
+            client.shutdown(socket.SHUT_WR)
+            body = bytearray()
+            while part := client.recv(65536):
+                body.extend(part)
+                self.assertLessEqual(len(body), 1048576)
+            self.assertEqual(len(body), 1048576)
+            self.assertEqual(hashlib.sha256(body).hexdigest(),
+                             'fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83')
+        self.assertTrue(server.recorded.wait(1))
+        self.assertIsNone(server.records[0]['error_type'])
+        self.assertEqual(server.records[0]['input_bytes'], 1048576)
+
+    def test_tcp_input_overflow_is_rejected_without_response(self):
+        server = self.start_tcp(True)
+        with socket.create_connection(server.server_address, timeout=1) as client:
+            client.sendall(bytes(range(256)) * 4096 + b'x')
+            self.assertEqual(client.recv(1), b'')
+        self.assertTrue(server.recorded.wait(1))
+        self.assertEqual(server.records[0]['input_bytes'], 1048577)
+        self.assertEqual(server.records[0]['error_type'], 'ValueError')
+
+    def test_tcp_deadline_closes_active_echo(self):
+        server = self.start_tcp(False, timeout=0.1)
+        with socket.create_connection(server.server_address, timeout=1) as client:
+            client.sendall(b'fixed-echo')
+            self.assertEqual(client.recv(10), b'fixed-echo')
+            self.assertEqual(client.recv(1), b'')
+        self.assertTrue(server.recorded.wait(1))
+        self.assertLess(server.records[0]['elapsed_ms'], 1000)
+
+    def test_tcp_close_waits_for_owned_worker_and_clears_connections(self):
+        server = self.start_tcp(False)
+        with socket.create_connection(server.server_address, timeout=1) as client:
+            client.sendall(b'held')
+            self.assertEqual(client.recv(4), b'held')
+            started = time.monotonic()
+            server.server_close()
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(client.recv(1), b'')
+        self.assertTrue(server.recorded.is_set())
+        self.assertEqual(server.connections, set())
+
+    def test_tcp_connection_limit_rejects_ninth_active_connection(self):
+        server = self.start_tcp(False)
+        clients = []
+        try:
+            for _ in range(8):
+                client = socket.create_connection(server.server_address, timeout=1)
+                clients.append(client)
+                client.sendall(b'x')
+                self.assertEqual(client.recv(1), b'x')
+            with socket.create_connection(server.server_address, timeout=1) as ninth:
+                self.assertEqual(ninth.recv(1), b'')
+        finally:
+            for client in clients:
+                client.close()
+
+    def test_tcp_bind_failure_preserves_os_error(self):
+        with socket.socket() as occupied:
+            occupied.bind(('127.0.0.1', 0))
+            occupied.listen()
+            with self.assertRaises(OSError):
+                target.TCPServer(occupied.getsockname(), half_close=True)
+
     def start_server(self, timeout, idle_timeout=2):
         server = ObservedServer(timeout, idle_timeout)
         thread = threading.Thread(target=server.serve_forever,

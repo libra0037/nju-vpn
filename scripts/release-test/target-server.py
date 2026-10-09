@@ -8,6 +8,7 @@ import json
 import re
 import signal
 import socket
+import socketserver
 import threading
 import time
 
@@ -17,6 +18,110 @@ HEALTH_BODY = b'njuvpn-release-test\n'
 REQUEST_TIMEOUT = 60
 IDLE_TIMEOUT = 20
 MAX_HTTP_TRACES = 64
+TCP_FIXTURE = bytes(range(256)) * 4096
+TCP_FIXTURE_HASH = 'fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83'
+
+
+class TCPServer(socketserver.ThreadingTCPServer):
+    """18082 等上传 EOF 后回应，18083 回显供端点交错测试持有连接。"""
+    allow_reuse_address = True
+    daemon_threads = False
+
+    def __init__(self, address, half_close, timeout=120):
+        self.half_close = half_close
+        self.request_timeout = timeout
+        self.slots = threading.BoundedSemaphore(8)
+        self.lock = threading.Lock()
+        self.connections = set()
+        self.closing = False
+        self.trace_count = 0
+        # TCPServer 绑定失败时也会调用 server_close，状态必须先成立。
+        super().__init__(address, TCPHandler)
+
+    def process_request(self, request, address):
+        with self.lock:
+            if self.closing or not self.slots.acquire(blocking=False):
+                request.close()
+                return
+            self.connections.add(request)
+            # 注册工作者须与关闭快照串行；这里只启动线程，不做网络读写。
+            try:
+                super().process_request(request, address)
+            except BaseException:
+                self.connections.discard(request)
+                self.slots.release()
+                request.close()
+                raise
+
+    def process_request_thread(self, request, address):
+        def deadline():
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        timer = threading.Timer(self.request_timeout, deadline)
+        timer.start()
+        try:
+            request.settimeout(self.request_timeout)
+            super().process_request_thread(request, address)
+        finally:
+            timer.cancel()
+            timer.join()
+            with self.lock:
+                self.connections.discard(request)
+            self.slots.release()
+
+    def server_close(self):
+        # 先阻止接收并关闭现有连接，再由 ThreadingMixIn 等待工作者。
+        with self.lock:
+            self.closing = True
+            connections = list(self.connections)
+        for request in connections:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        super().server_close()
+
+    def handle_error(self, request, address):
+        pass
+
+    def record(self, record):
+        with self.lock:
+            if self.trace_count < 32:
+                self.trace_count += 1
+                print('TCP ' + json.dumps(record, separators=(',', ':')), flush=True)
+
+
+class TCPHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        started = time.monotonic()
+        count = 0
+        digest = hashlib.sha256()
+        error = None
+        try:
+            limit = len(TCP_FIXTURE) if self.server.half_close else 2 * len(TCP_FIXTURE)
+            while True:
+                body = self.request.recv(min(65536, limit - count + 1))
+                if not body:
+                    break
+                count += len(body)
+                if count > limit:
+                    raise ValueError('输入超过固定上限')
+                digest.update(body)
+                if not self.server.half_close:
+                    self.request.sendall(body)
+            if self.server.half_close:
+                if count != len(TCP_FIXTURE) or digest.hexdigest() != TCP_FIXTURE_HASH:
+                    raise ValueError('固定上传内容错误')
+                self.request.sendall(TCP_FIXTURE)
+                self.request.shutdown(socket.SHUT_WR)
+        except (OSError, ValueError) as exc:
+            error = type(exc).__name__
+        finally:
+            self.server.record(dict(kind='half_close' if self.server.half_close else 'echo',
+                                    input_bytes=count, sha256=digest.hexdigest(), error_type=error,
+                                    elapsed_ms=round((time.monotonic() - started) * 1000)))
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -211,19 +316,29 @@ def main():
         raise SystemExit('绑定参数必须为 IPv4 地址') from None
     closed = threading.Event()
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tcp_servers = []
     try:
         udp.bind((bind, 18081))
         udp.settimeout(0.5)
         server = Server((bind, 18080))
+        tcp_servers.append(TCPServer((bind, 18082), half_close=True))
+        tcp_servers.append(TCPServer((bind, 18083), half_close=False))
     except BaseException:
         udp.close()
+        for tcp in tcp_servers:
+            tcp.server_close()
+        if 'server' in locals():
+            server.server_close()
         raise
     thread = threading.Thread(target=echo_udp, args=(udp, closed))
     thread.start()
+    tcp_threads = [threading.Thread(target=tcp.serve_forever) for tcp in tcp_servers]
+    for worker in tcp_threads:
+        worker.start()
     signal.signal(signal.SIGTERM, lambda *args: closed.set())
     signal.signal(signal.SIGINT, lambda *args: closed.set())
     server.timeout = 0.5
-    print('测试目标已启动：HTTP 18080、UDP 18081', flush=True)
+    print('测试目标已启动：HTTP 18080、UDP 18081、TCP 18082/18083', flush=True)
     try:
         while not closed.is_set():
             server.handle_request()
@@ -232,6 +347,11 @@ def main():
         server.server_close()
         udp.close()
         thread.join()
+        for tcp in tcp_servers:
+            tcp.shutdown()
+            tcp.server_close()
+        for worker in tcp_threads:
+            worker.join()
 
 
 if __name__ == '__main__':
