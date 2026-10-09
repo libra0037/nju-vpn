@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/ipc"
+	"github.com/libra0037/nju-vpn/internal/packetlog"
 )
 
 const (
@@ -37,34 +38,6 @@ type logSummary struct {
 
 // 只解析候选程序自身的固定日志契约；不输出原文、路径、身份或底层错误。
 // 日志会限速且可能从备份中间开始，所以没有记录不等于没有发生丢包。
-var relayLogReasons = map[string]string{
-	"下行数据切不出 IPv4 包": "downlink_invalid",
-	"下行包的目的地址不是本次分配到的地址（检查对端 allowed_ips 与 peer_address）": "downlink_address",
-	"下行队列已满": "downlink_full",
-	"会话已摘掉，下行包被丢弃（断开窗口里的尾巴）":               "downlink_no_session",
-	"上行解出来的不是 IPv4 包":                      "uplink_invalid",
-	"上行包的源地址不是 peer_address（对端 ip 配置不一致？）": "uplink_address",
-	"对端尚未握手，下行包被丢弃（对端还没连上，或密钥不匹配）":         "peer_not_ready",
-	"读缓冲装不下这个包":                            "no_buffer",
-	"隧道尚未建立，对端发来的包被丢弃":                     "no_session",
-	"隧道上行通道未就绪，包被丢弃":                       "no_uplink",
-	"隧道拒绝了这个上行包":                           "uplink_rejected",
-	"会话切换时丢掉了队列里属于旧会话的下行包（重连时正常）":          "stale_queue",
-}
-
-var rejectionLogReasons = map[string]string{
-	"链路或会话不可用":   "link_unavailable",
-	"资源表外":       "resource_unmatched",
-	"流鉴权失败":      "flow_auth_failed",
-	"待鉴权缓存已满":    "pending_full",
-	"流表已满":       "flow_table_full",
-	"分片关联不存在或过期": "fragment_missing",
-	"分片乱序或重叠":    "fragment_order",
-	"报文格式或容量超限":  "packet_capacity",
-}
-
-var relayLogPattern = regexp.MustCompile(`^wireguard: 丢弃 (.+)（累计 ([0-9]+) 个）$`)
-var rejectionLogPattern = regexp.MustCompile(`^上行拒绝：(.+)，累计 ([0-9]+) 个包$`)
 var startedLogPattern = regexp.MustCompile(`^njuvpn 服务进程启动 pid=([0-9]+) `)
 
 func parseLogEvent(line string) (logEvent, bool) {
@@ -90,22 +63,11 @@ func parseLogEvent(line string) (logEvent, bool) {
 	case message == "逐流鉴权暂未就绪（状态 0x86），已安排 10s 后的一次重试":
 		event.Kind = "auth_retry"
 	default:
-		match := relayLogPattern.FindStringSubmatch(message)
-		reasons := relayLogReasons
-		event.Kind = "relay_drop"
-		if match == nil {
-			match = rejectionLogPattern.FindStringSubmatch(message)
-			reasons = rejectionLogReasons
-			event.Kind = "tunnel_reject"
-		}
-		if match == nil || reasons[match[1]] == "" {
+		packet, ok := packetlog.Parse(message)
+		if !ok {
 			return logEvent{}, false
 		}
-		event.Reason = reasons[match[1]]
-		event.Count, err = strconv.ParseUint(match[2], 10, 64)
-		if err != nil {
-			return logEvent{}, false
-		}
+		event.Kind, event.Reason, event.Count = string(packet.Kind), string(packet.Reason), packet.Count
 	}
 	return event, true
 }

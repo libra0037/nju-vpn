@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"sync"
 	"time"
@@ -31,13 +30,12 @@ type Options struct {
 	// ControlRootCAs 为离线测试注入受控信任；nil 使用系统信任链。
 	// 始终验证证书链与名称，不接受配置文件控制这项测试依赖。
 	ControlRootCAs *x509.CertPool
-	MTU            int // 两段隧道共用的内层 IPv4 包长上限。
 	// NodeSPKIPins 是配置边界已解析的只读 SPKI SHA-256 白名单。
 	NodeSPKIPins     [][sha256.Size]byte
 	ReconnectBackoff time.Duration
 }
 
-// Client 是协议层门面：一次"连接"= 登录 + 取资源 + 建隧道。
+// Client 持有共享校园登录参数；Connect 只登录并发布资源。
 type Client struct {
 	opts Options
 	pins *nodeSPKIPins
@@ -52,9 +50,6 @@ func New(opts Options) (*Client, error) {
 	}
 	if len(opts.NodeSPKIPins) > 16 {
 		return nil, &ProtocolError{What: "SPKI 白名单超过上限"}
-	}
-	if opts.MTU < ipv4MinHeader || opts.MTU > math.MaxUint16 {
-		return nil, &ProtocolError{What: "MTU 超出 IPv4 长度范围"}
 	}
 	if opts.ControlRootCAs != nil {
 		opts.ControlRootCAs = opts.ControlRootCAs.Clone()
@@ -114,22 +109,26 @@ type Session struct {
 	ticket     string
 
 	node    string
+	l3MTU   int
 	signKey []byte
 	// devicesOnly 表示这次登录只用于授信终端操作，不建隧道。
 	devicesOnly bool
 
-	mu      sync.Mutex
-	active  *tunnelConn
-	closed  bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	runDone chan struct{}
+	mu             sync.Mutex
+	active         *tunnelConn
+	closed         bool
+	failure        error
+	tcpConnections map[*TCPConn]struct{}
+	dials          sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	runDone        chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-// Connect 完成登录并建立隧道。需要验证码时返回 (session, ErrAuthRequired)。
+// Connect 登录并取资源。L3 由 StartL3 单独启动；需要验证码时保留会话。
 func (c *Client) Connect(ctx context.Context, co ConnectOptions) (*Session, error) {
 	s, err := c.newSession(ctx, co.Password, false)
 	if err != nil {
@@ -160,7 +159,7 @@ func (c *Client) newSession(ctx context.Context, password string, devicesOnly bo
 		return nil, err
 	}
 	ownedCtx, cancel := context.WithCancel(context.Background())
-	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New(), devicesOnly: devicesOnly, ctx: ownedCtx, cancel: cancel}
+	s := &Session{client: c, ctrl: ctrl, password: password, ep: l3.New(), devicesOnly: devicesOnly, ctx: ownedCtx, cancel: cancel, tcpConnections: make(map[*TCPConn]struct{})}
 
 	if err := s.beginLogin(ctx); err != nil {
 		_ = s.Close(context.Background())
@@ -228,7 +227,7 @@ func (s *Session) continueAuth(ctx context.Context) error {
 	return &ProtocolError{What: "认证链过长"}
 }
 
-// Auth 提交验证码并继续。成功后资源与地址就绪。
+// Auth 提交验证码并继续。成功后资源就绪，端点由调用方分别启动。
 func (s *Session) Auth(ctx context.Context, code string) error {
 	if s.step.Service != "auth/sms" {
 		return &ProtocolError{What: "当前不需要验证码"}
@@ -268,7 +267,7 @@ func (s *Session) smsHint(ctx context.Context) string {
 	return fmt.Sprintf("验证码将发送至 %s", maskPhone(phones[0]))
 }
 
-// prepare 取资源表、选节点、建立第一条隧道连接并拿到校园网地址。
+// prepare 只建立共享登录资源，发布后不修改。
 func (s *Session) prepare(ctx context.Context) error {
 	info, err := s.ctrl.onlineInfo(ctx)
 	if err != nil {
@@ -280,7 +279,7 @@ func (s *Session) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	table, err := parseResourceTable(raw, s.client.opts.Server)
+	table, stats, err := parseResourceTable(raw, s.client.opts.Server)
 	if err != nil {
 		return err
 	}
@@ -289,31 +288,56 @@ func (s *Session) prepare(ctx context.Context) error {
 		s.mu.Unlock()
 		return context.Canceled
 	}
+	s.signKey = randomSignKey()
 	s.table = table
 	s.mu.Unlock()
-	s.client.logf("资源表: %d 条 IPv4 规则，%d 个隧道节点", len(table.IP), len(table.candidateNodes(table.major)))
-	if table.badPorts > 0 {
-		s.client.logf("资源表里有 %d 条 IPv4 规则的端口格式不合法，已丢弃", table.badPorts)
+	s.client.logf("资源表: %d 条 IPv4 规则，%d 条 TCP 域名规则，%d 个节点", len(table.ipRules), len(table.domainRules), len(table.candidateNodes(table.majorGroup)))
+	s.client.logf("资源解析跳过: 应用 %d，空标识 %d，协议 %d，地址 %d，端口 %d，非法 IP %d，不支持 IP %d，缺少建连 IP %d，节点 %d", stats.skippedApps, stats.emptyAppID, stats.unsupportedProtocol, stats.unsupportedAddress, stats.badPorts, stats.badIPs, stats.unsupportedIPs, stats.missingDialIPs, stats.badNodes)
+	return nil
+}
+
+// StartL3 建立 IPv4 通道；MTU 只约束这一端点。调用方串行启停 L3。
+func (s *Session) StartL3(ctx context.Context, mtu int) error {
+	if mtu < ipv4MinHeader || mtu > 65535 {
+		return &ProtocolError{What: "MTU 超出 IPv4 长度范围"}
 	}
-	if table.badNodes > 0 {
-		s.client.logf("资源表里有 %d 个节点地址不合法，已丢弃（它们会进探活与 CONNECT 请求行）", table.badNodes)
+	s.mu.Lock()
+	if s.closed || s.ctx.Err() != nil || s.table == nil {
+		s.mu.Unlock()
+		return ErrResourcesUnavailable
 	}
+	if s.active != nil || s.runDone != nil {
+		s.mu.Unlock()
+		return errors.New("L3 任务已启动")
+	}
+	s.l3MTU = mtu
+	table := s.table
+	s.dials.Add(1)
+	s.mu.Unlock()
+	defer s.dials.Done()
+	ownedCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	ctx = ownedCtx
 
 	node, tlsConn, err := probeNodes(ctx, func(ctx context.Context, node string) (*tls.Conn, error) {
 		return dialNodeTLS(ctx, s.tunnelOptions(node))
-	}, table.candidateNodes(table.major), 6*time.Second)
+	}, table.candidateNodes(table.majorGroup), 6*time.Second)
 	if err != nil {
 		return err
 	}
 	s.node = node
-	s.signKey = randomSignKey()
 
 	conn, err := handshakeTunnel(ctx, s.tunnelOptions(s.node), tlsConn)
 	if err != nil {
+		var gone *ErrSessionGone
+		if errors.As(err, &gone) {
+			s.invalidate(gone)
+		}
 		return err
 	}
 	s.mu.Lock()
-	if s.closed || ctx.Err() != nil {
+	if s.closed || s.ctx.Err() != nil || ctx.Err() != nil {
 		s.mu.Unlock()
 		conn.Close()
 		return context.Canceled
@@ -337,7 +361,7 @@ func (s *Session) tunnelOptions(node string) tunnelOptions {
 		SignKey:  s.signKey,
 		Logf:     s.client.logf,
 		Pins:     s.client.pins,
-		MTU:      s.client.opts.MTU,
+		MTU:      s.l3MTU,
 	}
 }
 
@@ -436,6 +460,11 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 			return ctx.Err()
 		}
 
+		var gone *ErrSessionGone
+		if errors.As(conn.Err(), &gone) {
+			s.invalidate(gone)
+			return gone
+		}
 		attempt++
 		if events.Dropped != nil {
 			events.Dropped(attempt, conn.Err())
@@ -461,6 +490,10 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if errors.As(lastErr, &gone) {
+				s.invalidate(gone)
+				return gone
+			}
 			failures++
 			if failures >= maxReconnectFailures {
 				s.mu.Lock()
@@ -474,7 +507,7 @@ func (s *Session) Run(ctx context.Context, events LinkEvents) error {
 		}
 
 		s.mu.Lock()
-		if s.closed || ctx.Err() != nil {
+		if s.closed || s.ctx.Err() != nil || ctx.Err() != nil {
 			s.mu.Unlock()
 			reconnected.Close()
 			return context.Canceled
@@ -501,7 +534,7 @@ func (s *Session) reconnectNodes() []string {
 		return out
 	}
 	seen := map[string]bool{s.node: true}
-	for _, addr := range s.table.candidateNodes(s.table.major) {
+	for _, addr := range s.table.candidateNodes(s.table.majorGroup) {
 		if seen[addr] {
 			continue
 		}
@@ -525,7 +558,15 @@ func (s *Session) Close(ctx context.Context) error {
 		conn := s.active
 		s.active = nil
 		done := s.runDone
+		streams := make([]*TCPConn, 0, len(s.tcpConnections))
+		for stream := range s.tcpConnections {
+			streams = append(streams, stream)
+		}
 		s.mu.Unlock()
+		for _, stream := range streams {
+			_ = stream.Close()
+		}
+		s.dials.Wait()
 
 		if conn != nil {
 			_ = conn.Close()
@@ -581,20 +622,6 @@ func randomSignKey() []byte {
 	return b
 }
 
-var ErrResourcesUnavailable = errors.New("当前没有已登录会话的资源快照")
-
-// ResourcesJSON 编码已发布的只读资源，预算包含 JSON 转义；不发控制面请求。
-func (s *Session) ResourcesJSON(limit int) ([]byte, error) {
-	s.mu.Lock()
-	if s.closed || s.active == nil || s.table == nil {
-		s.mu.Unlock()
-		return nil, ErrResourcesUnavailable
-	}
-	table := s.table
-	s.mu.Unlock()
-	return table.snapshotJSON(limit)
-}
-
 func maskPhone(raw string) string {
 	var digits []byte
 	for i := 0; i < len(raw); i++ {
@@ -606,4 +633,51 @@ func maskPhone(raw string) string {
 		return "已登记手机号"
 	}
 	return "***" + string(digits[len(digits)-4:])
+}
+
+// Done 关闭表示共享登录结束；局部 L3 故障不会关闭它。
+func (s *Session) Done() <-chan struct{} { return s.ctx.Done() }
+
+func (s *Session) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failure != nil {
+		return s.failure
+	}
+	return s.ctx.Err()
+}
+
+// invalidate 只发起收敛，不在调用它的读协程内等待自身。Close 负责等待和登出。
+func (s *Session) invalidate(err error) {
+	s.mu.Lock()
+	if s.failure != nil || s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.failure = err
+	s.cancel()
+	conn := s.active
+	streams := make([]*TCPConn, 0, len(s.tcpConnections))
+	for c := range s.tcpConnections {
+		streams = append(streams, c)
+	}
+	s.mu.Unlock()
+	if conn != nil {
+		conn.close(err)
+	}
+	for _, c := range streams {
+		_ = c.Close()
+	}
+}
+
+// StopL3 只释放 L3 连接；调用方先取消并等待 Run，再调用本方法。
+func (s *Session) StopL3() {
+	s.mu.Lock()
+	conn := s.active
+	s.active = nil
+	s.runDone = nil
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }

@@ -22,6 +22,8 @@ func main() {
 		{"internal/ztna/conntrack.go", "flowState", "queuePacket", "f.state"},
 		{"internal/ztna/resource.go", "ResourceProtocol", "String", "p"},
 		{"internal/wireguard/bind.go", "ListenHost", "newBind", "host"},
+		{"internal/packetlog/packet.go", "Kind", "prefix", "k"},
+		{"internal/packetlog/packet.go", "Reason", "description", "r"},
 	}
 	failed := false
 	for _, s := range specs {

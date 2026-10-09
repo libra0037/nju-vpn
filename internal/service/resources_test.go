@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/ipc"
-	"github.com/libra0037/nju-vpn/internal/ztna"
 	"github.com/libra0037/nju-vpn/internal/ztnatest"
 )
 
@@ -36,8 +35,8 @@ func TestResourcesReadsCurrentSessionWithoutSideEffects(t *testing.T) {
 				if r.Code != 200 {
 					t.Fatal(r)
 				}
-				var list ztna.L3Resources
-				if err := json.Unmarshal([]byte(r.Message), &list); err != nil || list.IP == nil || list.NodeGroup == nil {
+				var list ipc.Resources
+				if err := json.Unmarshal([]byte(r.Message), &list); err != nil || list.IP == nil || list.TCPDomains == nil {
 					t.Fatal("无效快照", r)
 				}
 				if empty && len(list.IP) != 0 || !empty && len(list.IP) != 1 {

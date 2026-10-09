@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -69,9 +68,10 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 		"username: u",
 		"password: \"\"",
 		"port: 443",
-		"mtu: 1400",
 		"pinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]",
 		"wireguard:",
+		"  enabled: true",
+		"  mtu: 1400",
 		fmt.Sprintf("  listen_port: %d", port),
 		"  peer_address: 10.66.66.2",
 		"log:",
@@ -93,9 +93,7 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 
 	t.Cleanup(func() {
 		// 测试结束时把服务进程收掉：它是脱离终端跑的，不会跟着测试进程退出。
-		if endpoint, err := endpointFor(configPath); err == nil {
-			_ = shutdownDaemon(endpoint)
-		}
+		_ = shutdownDaemon(ipc.NewClient(configPath))
 	})
 	// restart 会拉起服务进程；它不登录，所以不需要服务端。
 	if out, err := run("restart", "-config", configPath); err != nil {
@@ -151,16 +149,13 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 	}
 
 	// 收到 shutdown 之后端点不再响应。
-	endpoint, err := endpointFor(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := shutdownDaemon(endpoint); err != nil {
+	client := ipc.NewClient(configPath)
+	if err := shutdownDaemon(client); err != nil {
 		t.Fatalf("shutdown 失败: %v", err)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := pingService(endpoint); err != nil {
+		if err := pingService(client); err != nil {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -169,43 +164,12 @@ func TestRestartSpawnsAndStopsDaemon(t *testing.T) {
 }
 
 // shutdownDaemon 直连端点请服务进程退出，供测试收尾用。
-func shutdownDaemon(endpoint string) error {
-	conn, err := ipc.Dial(endpoint)
-	if err != nil {
-		return nil // 本来就没在跑
+func shutdownDaemon(client *ipc.Client) error {
+	_, err := client.Call(ipc.Request{Command: ipc.CmdShutdown}, 10*time.Second)
+	if errors.Is(err, ipc.ErrNotRunning) {
+		return nil
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := ipc.WriteRequest(conn, ipc.Request{Command: ipc.CmdShutdown}); err != nil {
-		return err
-	}
-	_, err = ipc.ReadResponse(bufio.NewReader(conn))
 	return err
-}
-
-// pongServer 在端点上应答探活，模拟另一个已经就绪的服务进程。
-func pongServer(t *testing.T, endpoint string) {
-	t.Helper()
-	ln, err := ipc.Listen(endpoint)
-	if err != nil {
-		t.Fatalf("监听测试端点失败: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				if _, err := ipc.ReadRequest(bufio.NewReader(c)); err != nil {
-					return
-				}
-				_ = ipc.WriteResponse(c, ipc.Response{Code: ipc.CodeOK, Message: "pong 另一个调用拉起的服务进程"})
-			}(conn)
-		}
-	}()
 }
 
 // TestWaitServiceReadyAdoptsConcurrentDaemon 验证“我们拉起的子进程退了、但端点
@@ -213,7 +177,8 @@ func pongServer(t *testing.T, endpoint string) {
 // 输的那个立刻退出，不该让看门狗脚本收到一个 exit 1 的假警报。
 func TestWaitServiceReadyAdoptsConcurrentDaemon(t *testing.T) {
 	dir := t.TempDir()
-	endpoint := ipc.EndpointFor(filepath.Join(dir, "fixture.yaml"))
+	configPath := filepath.Join(dir, "fixture.yaml")
+	client := ipc.NewClient(configPath)
 	logPath := filepath.Join(dir, "service.log")
 	if err := os.WriteFile(logPath, []byte("[日志] 启动失败: 端点已被占用\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -222,12 +187,12 @@ func TestWaitServiceReadyAdoptsConcurrentDaemon(t *testing.T) {
 	// 赢家此刻正在就绪：端点晚一小会儿才开始应答。
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		pongServer(t, endpoint)
+		startFakeServiceFor(t, configPath, func(ipc.Request) ipc.Response { return ipc.Response{Code: ipc.CodeBadRequest} })
 	}()
 
 	exited := make(chan error, 1)
 	exited <- errors.New("exit status 1")
-	if err := waitServiceReady(endpoint, logPath, exited, 10*time.Second); err != nil {
+	if err := waitServiceReady(client, logPath, exited, 10*time.Second); err != nil {
 		t.Fatalf("另一个服务进程已就绪时应当按成功处理，得到 %v", err)
 	}
 }
@@ -236,12 +201,12 @@ func TestWaitServiceReadyAdoptsConcurrentDaemon(t *testing.T) {
 // 不会因为上面那条“等一下赢家”的逻辑而把失败吞掉。
 func TestWaitServiceReadyReportsStartupFailure(t *testing.T) {
 	dir := t.TempDir()
-	endpoint := filepath.Join(dir, "njuvpn-test.sock")
+	client := ipc.NewClient(filepath.Join(dir, "fixture.yaml"))
 	logPath := filepath.Join(dir, "service.log")
 
 	exited := make(chan error, 1)
 	exited <- errors.New("exit status 1")
-	err := waitServiceReady(endpoint, logPath, exited, 10*time.Second)
+	err := waitServiceReady(client, logPath, exited, 10*time.Second)
 	if err == nil {
 		t.Fatal("没有任何服务进程应答时应当报错")
 	}
@@ -259,7 +224,7 @@ func TestWaitServiceGoneRequiresAbsentEndpoint(t *testing.T) {
 	for _, failure := range []error{ipc.ErrUntrustedPeer, context.DeadlineExceeded, errStateUnknown} {
 		t.Run(failure.Error(), func(t *testing.T) {
 			calls := 0
-			err := waitServiceGone("test-endpoint", time.Second, func(string) error {
+			err := waitServiceGone(ipc.NewClient("fixture.yaml"), time.Second, func(*ipc.Client) error {
 				calls++
 				return fmt.Errorf("探活: %w", failure)
 			})
@@ -273,9 +238,10 @@ func TestWaitServiceGoneRequiresAbsentEndpoint(t *testing.T) {
 func assertWaitServiceGoneAfterDisconnect(t *testing.T, disconnect error) {
 	t.Helper()
 	calls := 0
-	err := waitServiceGone("test-endpoint", time.Second, func(endpoint string) error {
-		if endpoint != "test-endpoint" {
-			t.Fatalf("探活了错误端点 %q", endpoint)
+	client := ipc.NewClient("fixture.yaml")
+	err := waitServiceGone(client, time.Second, func(got *ipc.Client) error {
+		if got != client {
+			t.Fatal("探活了错误实例")
 		}
 		calls++
 		if calls == 1 {

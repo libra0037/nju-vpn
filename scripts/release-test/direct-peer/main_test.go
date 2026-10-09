@@ -158,7 +158,11 @@ func testPeer(t *testing.T, truncate bool, wrap func(tun.Device) tun.Device) *di
 
 func TestDirectPeerCarriesVerifiedHTTPAndUDP(t *testing.T) {
 	peer := testPeer(t, false, nil)
-	report := probe(context.Background(), peer, testRunID, probeBudgets{request: 10 * time.Second, transfer: 10 * time.Second})
+	// 双核主机的离线双栈用例已观测到超过十秒的传输。本例校验正文与
+	// 握手，沿用工具的传输预算并限制整轮，不把十秒当作吞吐契约。
+	ctx, cancel := context.WithTimeout(t.Context(), transferBudget)
+	defer cancel()
+	report := probe(ctx, peer, testRunID, probeBudgets{request: 10 * time.Second, transfer: transferBudget})
 	if !report.Passed || !report.HandshakeSeen || len(report.Checks) != 5 {
 		t.Fatalf("直接握手或固定样例未通过: %+v", report)
 	}
@@ -198,8 +202,8 @@ func TestPrepareLeavesSourceAndPinsUnchanged(t *testing.T) {
 	}
 	cfg := &config.Config{
 		Server: "test.invalid", Username: "release-test", Password: "secret-never-printed",
-		DeviceID: "test-device", MTU: 1400, Proxy: "socks5://test.invalid:1000",
-		WireGuard:            config.WireGuard{ListenPort: 51821, ListenHost: "loopback", PeerAddress: "10.66.66.2", PrivateKey: serverKey.String()},
+		DeviceID: "test-device", Proxy: "socks5://test.invalid:1000",
+		WireGuard:            config.WireGuard{Enabled: true, MTU: 1400, ListenPort: 51821, ListenHost: "loopback", PeerAddress: "10.66.66.2", PrivateKey: serverKey.String()},
 		PinnedNodeSPKISHA256: []string{base64.StdEncoding.EncodeToString(make([]byte, 32))},
 	}
 	body, err := yaml.Marshal(cfg)

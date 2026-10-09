@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	"github.com/libra0037/nju-vpn/internal/dial"
 )
 
 // 线上格式。这些常量是与服务端的契约，改动前先看 protocol_test.go：
@@ -155,7 +157,7 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 
 	method := make([]byte, 2)
 	if _, err := io.ReadFull(r, method); err != nil {
-		return res, fmt.Errorf("读方法响应: %w", err)
+		return res, dial.Wrap("读方法响应", err)
 	}
 	if method[0] != Version || method[1] != methodHandshake {
 		return res, &ProtocolError{What: "非预期的方法响应"}
@@ -167,7 +169,7 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 		}
 		head := make([]byte, 4)
 		if _, err := io.ReadFull(r, head); err != nil {
-			return res, fmt.Errorf("读信封头: %w", err)
+			return res, dial.Wrap("读信封头", err)
 		}
 		switch head[0] {
 		case envelopeVersion:
@@ -176,25 +178,26 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 			n := int(binary.BigEndian.Uint16(head[2:4]))
 			payload := make([]byte, n)
 			if _, err := io.ReadFull(r, payload); err != nil {
-				return res, fmt.Errorf("读信封体: %w", err)
-			}
-			if status != 0 {
-				return res, &ProtocolError{What: "握手被拒"}
+				return res, dial.Wrap("读信封体", err)
 			}
 			if len(payload) == 0 {
+				if status != 0 {
+					return res, &ProtocolError{What: "握手被拒"}
+				}
 				continue
 			} // 实测允许先发空信封。
 			code, _, ok := parseEnvelopeCode(payload)
 			if !ok {
 				return res, &ProtocolError{What: "握手信封缺少整数 code"}
 			}
+			// 共享会话失效先于局部握手状态处理，不能进入重连预算。
+			if code == codeSessionGone {
+				return res, &ErrSessionGone{Code: code}
+			}
+			if status != 0 {
+				return res, &ProtocolError{What: "握手被拒"}
+			}
 			if code != 0 {
-				// 状态字节为 0 也可能是失败：会话失效时服务端正是这么回的。
-				// 会话失效码按"需要重新登录"归类，别包成协议错误——那会让调用方
-				// 按通用失败重试三次，而不是直接告诉用户重新登录。
-				if code == codeSessionGone {
-					return res, &ErrSessionGone{Code: code}
-				}
 				return res, &ProtocolError{What: fmt.Sprintf("握手被拒（%d）", code)}
 			}
 		case Version:
@@ -206,7 +209,7 @@ func readHandshake(r *bufio.Reader) (handshakeResult, error) {
 			}
 			body := make([]byte, bodyLen)
 			if _, err := io.ReadFull(r, body); err != nil {
-				return res, fmt.Errorf("读虚拟地址: %w", err)
+				return res, dial.Wrap("读虚拟地址", err)
 			}
 			if head[1] != 0 {
 				return res, &ProtocolError{What: "虚拟地址下发失败"}

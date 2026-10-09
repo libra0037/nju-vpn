@@ -1,4 +1,4 @@
-// Package service 是服务进程的主体：状态机加上隧道生命周期。
+// Package service 管理共享校园会话及 WireGuard、SOCKS5 的生命周期。
 //
 // 结构上是一个 actor：所有会改状态的操作都被送到单条命令通道上串行执行，
 // 因此状态不需要用锁保护，也不会出现两个操作同时动同一份资源。对外的
@@ -9,7 +9,7 @@
 //   - 不在持锁时做网络 I/O；
 //   - 半完成的登录必须留下来（拿着它才登得出去），不能丢掉，否则服务端
 //     那条"同一账号只允许一条隧道会话"的名额要等它自己超时才释放；
-//   - 隧道协程的每一条汇报都带代次，过期汇报不许改状态。
+//   - 异步汇报携带任务身份，局部 L3 用代次，共享会话与 SOCKS 用对象身份。
 package service
 
 import (
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/libra0037/nju-vpn/internal/dial"
+	"github.com/libra0037/nju-vpn/internal/socks5"
 	"github.com/libra0037/nju-vpn/internal/wireguard"
 	"github.com/libra0037/nju-vpn/internal/ztna"
 )
@@ -31,17 +32,20 @@ const (
 	StateIdle        State = "idle"         // 未连接
 	StateLoggingIn   State = "logging_in"   // 正在登录 / 建隧道
 	StateAuthPending State = "auth_pending" // 等待用户提交验证码
-	StateUp          State = "up"           // 隧道已通
+	StateUp          State = "up"           // 校园会话已登录；各端点就绪另行派生
 	StateError       State = "error"        // 上一次操作失败
 )
 
 // Status 是一次状态查询的完整结果。
 type Status struct {
-	State     State                   `json:"state"`
-	Detail    string                  `json:"detail,omitempty"`
-	Failure   string                  `json:"failure,omitempty"` // 有限错误类别，不依赖错误文本。
-	WireGuard wireguard.Diagnostics   `json:"wireguard"`
-	Tunnel    *ztna.TunnelDiagnostics `json:"tunnel,omitempty"`
+	State        State                   `json:"state"`
+	Detail       string                  `json:"detail,omitempty"`
+	Failure      string                  `json:"failure,omitempty"` // 有限错误类别，不依赖错误文本。
+	WireGuard    WireGuardStatus         `json:"wireguard"`
+	SOCKS5       SOCKS5Status            `json:"socks5"`
+	Ready        bool                    `json:"ready"`
+	SessionReady bool                    `json:"session_ready"`
+	Tunnel       *ztna.TunnelDiagnostics `json:"tunnel,omitempty"`
 	// Retrying 表示链路已经断开、正在退避重连。
 	//
 	// 这时状态仍是 up（登录会话、隧道对象与承载层都还在，重连成功后不必
@@ -56,6 +60,19 @@ type Status struct {
 	Since time.Time `json:"since"`
 	// Identity 是实例身份，用来区分同机上的多个实例。
 	Identity Identity `json:"identity"`
+}
+
+// Enabled 是当前任务的启用意图，局部 stop 可关闭它；全局 start 按配置重置。
+type WireGuardStatus struct {
+	wireguard.Diagnostics
+	Enabled   bool   `json:"enabled"`
+	Listening bool   `json:"listening"`
+	Failure   string `json:"failure,omitempty"`
+}
+type SOCKS5Status struct {
+	socks5.Diagnostics
+	Enabled bool   `json:"enabled"`
+	Failure string `json:"failure,omitempty"`
 }
 
 func failureKind(err error) string {
@@ -199,5 +216,18 @@ func (s *statusStore) applyLocked(next State, detail string) {
 	// 现取，会话摘掉后自然为空（见那里的注释）。
 	if next == StateIdle || next == StateError {
 		s.status.Retrying = false
+	}
+}
+
+// 端点意图与失败仅由 actor 更新；连接/监听诊断在 Status 时从实际对象派生。
+func (s *statusStore) endpoint(wireguard bool, enabled bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if wireguard {
+		s.status.WireGuard.Enabled = enabled
+		s.status.WireGuard.Failure = failureKind(err)
+	} else {
+		s.status.SOCKS5.Enabled = enabled
+		s.status.SOCKS5.Failure = failureKind(err)
 	}
 }

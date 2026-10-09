@@ -41,9 +41,11 @@ type App struct {
 	AccessModel string
 	// Protocol 是 tcp / udp / all。
 	Protocol string
-	// Host 支持单个地址、CIDR 与 "起-止" 三种写法。
-	Host string
-	Port string
+	// Host 使用 IPv4、CIDR 或域名模式；AddrPretend 属于应用，不属于地址。
+	Host        string
+	Port        string
+	AddrPretend bool
+	IP          []string
 }
 
 // Options 是假服务端的行为参数。
@@ -76,6 +78,14 @@ type Options struct {
 	// AlreadyOnlineCode 为已登录时的第二次口令登录指定拒绝码。
 	// 0 不限制；测试用占位码不表示真实部署的错误码契约。
 	AlreadyOnlineCode int
+	RejectL3Reconnect bool
+	L3AuthCode        int
+	L3HandshakeCode   int
+	L4AuthCode        int
+	L4ConnectStatus   byte
+	QueryDeviceCode   int
+	TCPGreeting       []byte
+	TCPHandler        func(net.Conn)
 }
 
 // Server 是假服务端。
@@ -105,6 +115,7 @@ type Server struct {
 	authRequests  atomic.Int32
 	heartbeats    atomic.Int32
 	resourceCalls atomic.Int32
+	tcpRequests   []TCPRequest
 	serveDone     chan struct{}
 	connections   map[*ownedConn]struct{}
 	handlers      sync.WaitGroup
@@ -371,6 +382,14 @@ func (s *Server) handleConn(raw *ownedConn) {
 		return
 	}
 	if first[0] == 0x05 {
+		header, err := br.Peek(3)
+		if err != nil {
+			return
+		}
+		if header[2] == 0x81 {
+			s.handleTCP(tlsConn, br)
+			return
+		}
 		s.handleTunnel(tlsConn, br)
 		return
 	}
@@ -553,6 +572,10 @@ func (s *Server) routes() *http.ServeMux {
 		if !s.requireLogin(w) {
 			return
 		}
+		if s.opts.QueryDeviceCode != 0 {
+			writeEnvelope(w, s.opts.QueryDeviceCode, "", nil)
+			return
+		}
 		s.mu.Lock()
 		trusted := append([]string(nil), s.trusted...)
 		s.mu.Unlock()
@@ -664,7 +687,8 @@ func (s *Server) resourceTable() map[string]any {
 			"id":          a.ID,
 			"nodeGroupId": a.NodeGroupID,
 			"accessModel": a.AccessModel,
-			"addressList": []map[string]any{{"protocol": a.Protocol, "port": a.Port, "host": a.Host}},
+			"addrPretend": a.AddrPretend,
+			"addressList": []map[string]any{{"protocol": a.Protocol, "port": a.Port, "host": a.Host, "ip": a.IP}},
 		})
 	}
 	nodes := s.opts.Nodes
@@ -791,7 +815,7 @@ const (
 // handleTunnel 处理一条隧道连接。
 func (s *Server) handleTunnel(conn net.Conn, r *bufio.Reader) {
 	defer conn.Close()
-	s.tunnelCount.Add(1)
+	count := s.tunnelCount.Add(1)
 
 	head := make([]byte, 5)
 	if _, err := io.ReadFull(r, head); err != nil {
@@ -820,6 +844,17 @@ func (s *Server) handleTunnel(conn net.Conn, r *bufio.Reader) {
 	// 客户端在“TLS 通了但节点不响应”时必须自己收场。
 	if s.opts.StallTunnelHandshake {
 		_, _ = io.Copy(io.Discard, r)
+		return
+	}
+
+	code := s.opts.L3HandshakeCode
+	if count > 1 && s.opts.RejectL3Reconnect {
+		code = 12345
+	}
+	if code != 0 {
+		body, _ := json.Marshal(map[string]any{"code": code})
+		reply := binary.BigEndian.AppendUint16([]byte{5, 0xd0, 0x53, 0}, uint16(len(body)))
+		_, _ = conn.Write(append(reply, body...))
 		return
 	}
 
@@ -866,7 +901,7 @@ func (s *Server) handleTunnel(conn net.Conn, r *bufio.Reader) {
 				return
 			}
 			answer, err := json.Marshal(map[string]any{
-				"code": 0,
+				"code": s.opts.L3AuthCode,
 				"data": map[string]any{"connectToken": "tok-1", "conntrackHash": req.ConntrackHash},
 			})
 			if err != nil {

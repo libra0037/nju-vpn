@@ -28,7 +28,7 @@ func TestSendReadsFlowStateUnderLock(t *testing.T) {
 	// net.Pipe 是同步的：没人在另一头读，写入会一直阻塞。
 	go func() { _, _ = io.Copy(io.Discard, server) }()
 
-	table, err := parseResourceTable([]byte(`{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[
+	table, _, err := parseResourceTable([]byte(`{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[
 		{"id":"app-a","nodeGroupId":"groupWan","accessModel":"L3VPN","addressList":[
 			{"protocol":"tcp","port":"443","host":"10.1.0.0/16"}]}]}],"config":{"nodeGroupConf":{
 		"majorNodeGroup":{"id":"groupWan"},"nodeGroupList":[{"id":"groupWan","addressInfo":[]}]}}}}}}`), "vpn.test")

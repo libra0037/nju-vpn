@@ -69,8 +69,8 @@ func configDocument(data []byte) (*yaml.Node, error) {
 }
 
 // InitializeIdentity 在已独占实例端点的启动事务内调用；重新读取磁盘，
-// 一次写回两个字段，并返回实际落盘的完整配置。失败时不发布临时身份。
-func InitializeIdentity(path string, generate func() (deviceID, privateKey string, err error)) (*Config, error) {
+// 设备身份始终独立；仅启用 WireGuard 时生成私钥，一次写回后才发布。
+func InitializeIdentity(path string, generateDevice func() (string, error), generateKey func() (string, error)) (*Config, error) {
 	if path == "" {
 		path = DefaultPath()
 	}
@@ -83,16 +83,29 @@ func InitializeIdentity(path string, generate func() (deviceID, privateKey strin
 	if err != nil {
 		return nil, err
 	}
-	if cfg.DeviceID != "" && cfg.WireGuard.PrivateKey != "" {
+	if cfg.DeviceID != "" && (!cfg.WireGuard.Enabled || cfg.WireGuard.PrivateKey != "") {
 		return cfg, nil
 	}
-	id, key, err := generate()
-	if err != nil {
-		return nil, err
+	id, key := cfg.DeviceID, cfg.WireGuard.PrivateKey
+	if id == "" {
+		id, err = generateDevice()
+		if err != nil {
+			return nil, err
+		}
+		if id == "" {
+			return nil, errors.New("生成的设备标识为空")
+		}
 	}
-	if id == "" || key == "" {
-		return nil, errors.New("生成的身份为空")
+	if cfg.WireGuard.Enabled && key == "" {
+		key, err = generateKey()
+		if err != nil {
+			return nil, err
+		}
+		if key == "" {
+			return nil, errors.New("生成的 WireGuard 私钥为空")
+		}
 	}
+
 	doc, err := configDocument(data)
 	if err != nil {
 		return nil, err
@@ -102,7 +115,7 @@ func InitializeIdentity(path string, generate func() (deviceID, privateKey strin
 		setScalar(root, "device_id", id)
 		cfg.DeviceID = id
 	}
-	if cfg.WireGuard.PrivateKey == "" {
+	if cfg.WireGuard.Enabled && cfg.WireGuard.PrivateKey == "" {
 		wg := mappingValue(root, "wireguard")
 		if wg == nil {
 			wg = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}

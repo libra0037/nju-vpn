@@ -3,6 +3,7 @@
 package ipc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -76,11 +77,16 @@ func currentUserSDDL() (string, error) {
 
 // Dial 连接服务进程。
 func Dial(endpoint string) (net.Conn, error) {
+	return dialContext(context.Background(), endpoint)
+}
+
+func dialContext(parent context.Context, endpoint string) (net.Conn, error) {
 	if endpoint == "" {
 		return nil, ErrEmptyEndpoint
 	}
-	timeout := dialTimeout
-	conn, err := winio.DialPipe(endpoint, &timeout)
+	ctx, cancel := context.WithTimeout(parent, dialTimeout)
+	defer cancel()
+	conn, err := winio.DialPipeContext(ctx, endpoint)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
 			return nil, ErrNotRunning

@@ -63,14 +63,21 @@ func logFileName(configPath string) string {
 			b.WriteRune('_')
 		}
 	}
-	return "njuvpn-" + ipc.InstanceTag(configPath) + "-" + b.String() + ".log"
+	prefix := "njuvpn-" + ipc.InstanceTag(configPath) + "-"
+	base = b.String()
+	// 支持文件系统的单文件名预算为 255 字节，包含轮转后缀；清洗后仅有 ASCII。
+	const maxFileNameBytes = 255
+	if budget := maxFileNameBytes - len(prefix) - len(".log.2"); len(base) > budget {
+		base = base[:budget]
+	}
+	return prefix + base + ".log"
 }
 
-// pingService 探活：连得上并得到 pong 才算服务进程在运行。
+// pingService 探活：同一连接上核验完整配置身份后才采用已有服务进程。
 //
 // 超时单独给一个很小的值：探活失败是常态（进程没起），不该让调用方等太久。
-func pingService(endpoint string) error {
-	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdPing}, pingTimeout)
+func pingService(client *ipc.Client) error {
+	resp, err := client.Call(ipc.Request{Command: ipc.CmdPing}, pingTimeout)
 	if err != nil {
 		return err
 	}
@@ -85,11 +92,8 @@ func pingService(endpoint string) error {
 // 服务进程由命令行按需拉起，而不是装成系统服务——它不需要任何特权，也只在
 // 你要用的时候才有存在意义。
 func ensureService(configPath string) error {
-	endpoint, err := endpointFor(configPath)
-	if err != nil {
-		return err
-	}
-	if err := pingService(endpoint); err == nil {
+	client := ipc.NewClient(configPath)
+	if err := pingService(client); err == nil {
 		return nil
 	} else if !errors.Is(err, ipc.ErrNotRunning) {
 		return err
@@ -102,14 +106,14 @@ func ensureService(configPath string) error {
 	}
 	log.Printf("已拉起服务进程（日志: %s）", logPath)
 
-	return waitServiceReady(endpoint, logPath, exited, serviceStartTimeout)
+	return waitServiceReady(client, logPath, exited, serviceStartTimeout)
 }
 
 // waitServiceReady 等到服务进程开始应答，或者在它提前退出时立刻报错。
 //
 // 两个信号要一起等：只轮询端点时，"子进程起来就崩"（配置写错、端口被占
 // 之类）会一直等到超时，而原因其实已经写在日志里了。
-func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout time.Duration) error {
+func waitServiceReady(client *ipc.Client, logPath string, exited <-chan error, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if exited != nil {
@@ -120,9 +124,11 @@ func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout tim
 				// 并发调用（看门狗与人工同时执行）里只有一个能占住端点，输的
 				// 那个立刻退出，赢的那个此刻正在就绪。直接报“启动后立即退出”
 				// 会给巡检脚本一个假警报，所以先给赢家一点时间。
-				if pumpErr := pingUntil(endpoint, daemonAdoptGrace); pumpErr == nil {
+				if pumpErr := pingUntil(client, daemonAdoptGrace); pumpErr == nil {
 					log.Printf("服务进程已由另一个调用拉起（本次拉起的子进程退出: %v）", err)
 					return nil
+				} else if errors.Is(pumpErr, ipc.ErrInstanceMismatch) || errors.Is(pumpErr, ipc.ErrUntrustedPeer) {
+					return pumpErr
 				}
 				if err == nil {
 					err = errors.New("退出码 0")
@@ -131,8 +137,10 @@ func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout tim
 			default:
 			}
 		}
-		if err := pingService(endpoint); err == nil {
+		if err := pingService(client); err == nil {
 			return nil
+		} else if errors.Is(err, ipc.ErrInstanceMismatch) || errors.Is(err, ipc.ErrUntrustedPeer) {
+			return err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -146,12 +154,15 @@ func waitServiceReady(endpoint, logPath string, exited <-chan error, timeout tim
 const daemonAdoptGrace = 2 * time.Second
 
 // pingUntil 在 give 时间内轮询端点，应答了就返回 nil。
-func pingUntil(endpoint string, give time.Duration) error {
+func pingUntil(client *ipc.Client, give time.Duration) error {
 	deadline := time.Now().Add(give)
 	var last error
 	for {
-		if last = pingService(endpoint); last == nil {
+		if last = pingService(client); last == nil {
 			return nil
+		}
+		if errors.Is(last, ipc.ErrInstanceMismatch) || errors.Is(last, ipc.ErrUntrustedPeer) {
+			return last
 		}
 		if !time.Now().Before(deadline) {
 			return last
@@ -201,7 +212,7 @@ func spawnService(configPath, logPath string) (<-chan error, error) {
 
 // logTail 取日志文件的最后几行，附在"服务进程没起来"这类错误后面。
 //
-// 只读尾部：日志不做轮转，跑久了的文件不该整个读进内存。
+// 只读当前日志的尾部；即使单份日志有 4 MiB，也不整份读进内存。
 func logTail(path string) string {
 	const maxBytes = 8 << 10
 	const maxLines = 15
@@ -247,8 +258,8 @@ func logTail(path string) string {
 }
 
 // shutdownService 请服务进程收尾退出（它会先登出再退出）。
-func shutdownService(endpoint string) error {
-	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdShutdown}, serviceStopTimeout)
+func shutdownService(client *ipc.Client) error {
+	resp, err := client.Call(ipc.Request{Command: ipc.CmdShutdown}, serviceStopTimeout)
 	if err != nil {
 		return err
 	}
@@ -260,10 +271,10 @@ func shutdownService(endpoint string) error {
 }
 
 // waitServiceGone 等到服务进程真的退出（端点不再响应）。
-func waitServiceGone(endpoint string, timeout time.Duration, probe func(string) error) error {
+func waitServiceGone(client *ipc.Client, timeout time.Duration, probe func(*ipc.Client) error) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := probe(endpoint); err != nil {
+		if err := probe(client); err != nil {
 			if errors.Is(err, ipc.ErrNotRunning) {
 				return nil
 			}

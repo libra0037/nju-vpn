@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -203,7 +202,7 @@ func TestRelayWriteWithoutUplink(t *testing.T) {
 
 	var counted bool
 	for reason := range dropStats(r) {
-		if strings.Contains(reason, "上行通道") {
+		if reason == "uplink_unavailable" {
 			counted = true
 		}
 	}
@@ -225,7 +224,7 @@ func TestRelayWriteWithoutSession(t *testing.T) {
 	}
 	var counted bool
 	for reason := range dropStats(r) {
-		if strings.Contains(reason, "隧道尚未建立") {
+		if reason == "uplink_no_session" {
 			counted = true
 		}
 	}
@@ -312,7 +311,7 @@ func TestDropReasonsAreDistinguished(t *testing.T) {
 	stats := dropStats(r)
 	var gotAddr bool
 	for reason := range stats {
-		if strings.Contains(reason, "peer_address") {
+		if reason == "uplink_address" {
 			gotAddr = true
 		}
 	}
@@ -357,20 +356,10 @@ func dropStats(r *Relay) map[string]uint64 {
 	out := make(map[string]uint64, dropReasonCount)
 	for reason := dropReason(0); reason < dropReasonCount; reason++ {
 		if n := r.drops[reason].n.Load(); n > 0 {
-			out[dropReasonText[reason]] = n
+			out[dropReasonName[reason]] = n
 		}
 	}
 	return out
-}
-
-// hasDrop 判断某种原因的丢包计到了没有。
-func hasDrop(r *Relay, text string) bool {
-	for reason := dropReason(0); reason < dropReasonCount; reason++ {
-		if dropReasonText[reason] == text && r.drops[reason].n.Load() > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // waitCount 等某种原因的累计丢包数达到 want。
@@ -380,7 +369,7 @@ func waitCount(t *testing.T, r *Relay, reason dropReason, want uint64) {
 	for r.drops[reason].n.Load() < want {
 		if time.Now().After(deadline) {
 			t.Fatalf("「%s」的累计丢包 = %d，期望至少 %d",
-				dropReasonText[reason], r.drops[reason].n.Load(), want)
+				dropReasonName[reason], r.drops[reason].n.Load(), want)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -392,13 +381,7 @@ func waitCount(t *testing.T, r *Relay, reason dropReason, want uint64) {
 // 需要一点时间：计数没出现之前不能断言"包没被交出去"。
 func waitDrop(t *testing.T, r *Relay, reason dropReason) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for !hasDrop(r, dropReasonText[reason]) {
-		if time.Now().After(deadline) {
-			t.Fatalf("等不到「%s」的丢包计数", dropReasonText[reason])
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitCount(t, r, reason, 1)
 }
 
 // readResult 是一次 Read 的结果。

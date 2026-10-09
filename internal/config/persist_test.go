@@ -11,16 +11,16 @@ import (
 
 func TestInitializeIdentityPreservesYAMLAndAdoptsDisk(t *testing.T) {
 	for _, fields := range []string{
-		"device_id: null # 设备注释\nwireguard: {private_key: null, peer_address: 10.66.66.2}\n",
-		"\"device_id\": '' # 设备注释\n\"wireguard\":\n  \"private_key\": '' # 私钥注释\n",
+		"device_id: null # 设备注释\nwireguard: {enabled: true, private_key: null, peer_address: 10.66.66.2}\n",
+		"\"device_id\": '' # 设备注释\n\"wireguard\":\n  enabled: true\n  \"private_key\": '' # 私钥注释\n",
 	} {
 		t.Run(fields, func(t *testing.T) {
 			path := writeConfig(t, "# 配置注释\nserver: vpn.example.edu\nusername: u\n"+fields, 0600)
-			first, err := InitializeIdentity(path, func() (string, string, error) { return "device-a", "key-a", nil })
+			first, err := InitializeIdentity(path, func() (string, error) { return "device-a", nil }, func() (string, error) { return "key-a", nil })
 			if err != nil {
 				t.Fatal(err)
 			}
-			second, err := InitializeIdentity(path, func() (string, string, error) { t.Fatal("已有身份不能再生成"); return "", "", nil })
+			second, err := InitializeIdentity(path, func() (string, error) { t.Fatal("已有身份不能再生成"); return "", nil }, func() (string, error) { t.Fatal("已有密钥不能再生成"); return "", nil })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -64,7 +64,7 @@ func TestIdentityWriteDoesNotFollowPlantedTemp(t *testing.T) {
 	if err := os.Symlink(victim, fmt.Sprintf("%s.tmp.%d", path, os.Getpid())); err != nil {
 		t.Fatal(err)
 	}
-	_, err := InitializeIdentity(path, func() (string, string, error) { return "id", "key", nil })
+	_, err := InitializeIdentity(path, func() (string, error) { return "id", nil }, func() (string, error) { return "key", nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestIdentityWriteDoesNotFollowPlantedTemp(t *testing.T) {
 func TestIdentityFailureDoesNotPublish(t *testing.T) {
 	path := writeConfig(t, validConfig, 0600)
 	before, _ := os.ReadFile(path)
-	cfg, err := InitializeIdentity(path, func() (string, string, error) { return "id", "key", fmt.Errorf("entropy failed") })
+	cfg, err := InitializeIdentity(path, func() (string, error) { return "", fmt.Errorf("entropy failed") }, func() (string, error) { return "key", nil })
 	if err == nil || cfg != nil {
 		t.Fatal("失败仍发布身份")
 	}
@@ -123,8 +123,8 @@ func TestConfiguredSPKIPinsOnly(t *testing.T) {
 		t.Fatal("缺失 pin 不得回退")
 	}
 	// 1400 是默认内层 MTU，无第二次封装扣减。
-	cfg, err := Load(writeConfig(t, "server: vpn.example.edu\nusername: u\n", 0600))
-	if err != nil || cfg.MTU != 1400 {
+	cfg, err := Load(writeConfig(t, "server: vpn.example.edu\nusername: u\nwireguard:\n  enabled: true\n", 0600))
+	if err != nil || cfg.WireGuard.MTU != 1400 {
 		t.Fatal("默认 MTU 应为 1400", err)
 	}
 }

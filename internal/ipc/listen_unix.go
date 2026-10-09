@@ -3,6 +3,7 @@
 package ipc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -31,7 +32,13 @@ func endpointPath(id string) string {
 	if dir == "" {
 		dir = filepath.Join(os.TempDir(), fmt.Sprintf("njuvpn-%d", os.Getuid()))
 	}
-	return filepath.Join(dir, "njuvpn-"+id+".sock")
+	name := "njuvpn-" + id + ".sock"
+	// 支持目标中 macOS 的 sun_path 最短（104 字节，含终止符）。加长的
+	// 身份遇到长 TMPDIR/XDG_RUNTIME_DIR 时使用仍经属主与权限校验的短目录。
+	if len(filepath.Join(dir, name)) > 103 {
+		dir = filepath.Join("/tmp", fmt.Sprintf("njuvpn-%d", os.Getuid()))
+	}
+	return filepath.Join(dir, name)
 }
 
 // dialProbeTimeout 是探测这个套接字上还有没有活实例的超时。
@@ -193,6 +200,10 @@ func ownerUID(fi os.FileInfo) (int, bool) {
 
 // Dial 连接服务进程。
 func Dial(endpoint string) (net.Conn, error) {
+	return dialContext(context.Background(), endpoint)
+}
+
+func dialContext(ctx context.Context, endpoint string) (net.Conn, error) {
 	if endpoint == "" {
 		return nil, ErrEmptyEndpoint
 	}
@@ -201,7 +212,8 @@ func Dial(endpoint string) (net.Conn, error) {
 	}
 	// 带超时：服务进程活着但不再 accept 时，没有超时的 connect 会永久挂住，
 	// 客户端连 SetDeadline 都执行不到。
-	conn, err := net.DialTimeout("unix", endpoint, dialTimeout)
+	dialer := net.Dialer{Timeout: dialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", endpoint)
 	if err != nil {
 		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
 			return nil, fmt.Errorf("%w", ErrNotRunning)

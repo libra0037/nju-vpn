@@ -70,7 +70,7 @@ func TestCloseRejectsReconnectCompletedDuringShutdown(t *testing.T) {
 		}
 		return c, err
 	}
-	sess, err := client.Connect(t.Context(), ConnectOptions{})
+	sess, err := connectL3(t.Context(), client, ConnectOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

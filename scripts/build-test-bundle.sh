@@ -59,6 +59,8 @@ for target in linux/amd64 windows/amd64; do
     GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go test -c -tags "$BUILD_TAGS" -trimpath \
       -o "$bundle/tests/$name.test$ext" "$pkg"
   done
+  # 嵌套模块不在主模块 ./... 中；诊断采集与文件边界守卫同样随包执行。
+  (cd scripts/release-test/direct-peer && GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go test -c -trimpath -o "$bundle/tests/direct-peer.test$ext" .)
   if [[ $goos == linux ]]; then
     cp scripts/release-test/run-linux.sh scripts/release-test/live-linux.sh scripts/release-test/prepare-linux-peer.sh scripts/release-test/setup-linux-peer.sh scripts/release-test/cleanup-linux-peer.sh scripts/release-test/live-probe.py scripts/release-test/target.sh scripts/release-test/target_ip.py "$bundle/"
     chmod +x "$bundle/"*.sh
@@ -70,6 +72,7 @@ for target in linux/amd64 windows/amd64; do
         name=${name//\//_}
         CGO_ENABLED=1 go test -c -race -tags "$BUILD_TAGS" -trimpath -o "$bundle/race/$name.test" "$pkg"
       done
+      (cd scripts/release-test/direct-peer && CGO_ENABLED=1 go test -c -race -trimpath -o "$bundle/race/direct-peer.test" .)
     fi
   else
     cp scripts/release-test/target.ps1 "$bundle/target.ps1"

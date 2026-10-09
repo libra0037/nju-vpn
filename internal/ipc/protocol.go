@@ -32,7 +32,7 @@ const dialTimeout = 5 * time.Second
 // 请求命令。每个命令的参数都是固定位置、固定个数，布尔值写成 名字=0/1：
 // 这样"少写一个参数"与"写错一个值"不会互相冒充。
 const (
-	// CmdPing 探活。服务进程在运行就回 pong 与自己的身份。
+	// CmdPing 探活并返回 InstanceIdentity 的 JSON；参数为空。
 	CmdPing = "ping"
 	// CmdState 只回报状态名（idle / logging_in / ...）。
 	//
@@ -41,11 +41,13 @@ const (
 	// 判断就静默失效了。
 	CmdState = "state"
 	// CmdStatus 返回状态与诊断；可带一次 json 选择 JSON 格式。
-	// 校园链路不在 up 或正在重连时固定以 409 应答，不检查业务目标可达。
+	// 共享会话与当前启用端点未就绪时以 409 应答，不检查业务目标可达。
 	CmdStatus    = "status"
 	CmdResources = "resources"
 	// CmdStart 建立隧道：start <trust=0|1> [口令]。
-	CmdStart = "start"
+	CmdStart         = "start"
+	CmdEndpointStart = "endpoint-start"
+	CmdEndpointStop  = "endpoint-stop"
 	// CmdAuth 提交二次验证码，继续上一次停下来的登录：auth <验证码>。
 	CmdAuth = "auth"
 	// CmdTrust 把本机绑成授信终端：trust [口令]。
@@ -77,6 +79,12 @@ const MaxLineBytes = 64 * 1024
 var ErrLineTooLong = errors.New("报文行超过长度上限")
 var ErrNotRunning = errors.New("服务进程未运行")
 var ErrUntrustedPeer = errors.New("本地 IPC 对端身份不可信")
+var ErrInstanceMismatch = errors.New("本地 IPC 配置身份不匹配")
+
+// InstanceIdentity 只用于连接上的实例核验；完整规范路径不以短标识代替。
+type InstanceIdentity struct {
+	ConfigPath string `json:"config"`
+}
 
 // IsDisconnect 识别连接关闭，不表示监听端点已消失。退出轮询仍须等到
 // ErrNotRunning；认证失败、超时和协议错误不能用作退出证据。

@@ -14,8 +14,7 @@ import (
 func TestTunnelUsesConfiguredMTUAndCopiesDiagnostics(t *testing.T) {
 	srv := newFake(t, ztnatest.Options{})
 	client := newTestClient(t, srv, testPass)
-	client.opts.MTU = 1500
-	sess, err := client.Connect(t.Context(), ConnectOptions{})
+	sess, err := connectL3WithMTU(t.Context(), client, 1500, ConnectOptions{})
 	if sess != nil {
 		t.Cleanup(func() { sess.Close(context.Background()) })
 	}

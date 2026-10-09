@@ -23,7 +23,7 @@ func TestNormalizedResourcesReplyIsCompleteBoundedAndReadOnly(t *testing.T) {
 	}{
 		{"60KiB-input", 512, "192.0.2.1", false},
 		{"large-domains", 128, strings.Repeat("x", 1024), false},
-		{"over-budget", 1024, "192.0.2.1", true},
+		{"over-budget", 2048, "192.0.2.1", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			apps := make([]ztnatest.App, tc.count)
@@ -63,8 +63,8 @@ func TestNormalizedResourcesReplyIsCompleteBoundedAndReadOnly(t *testing.T) {
 				if resp.Code != ipc.CodeOK || len(resp.Message)+len("200 \n") > ipc.MaxLineBytes {
 					t.Fatal("归一化资源响应错误", resp.Code, len(resp.Message))
 				}
-				var list ztna.L3Resources
-				if err := json.Unmarshal([]byte(resp.Message), &list); err != nil || list.IP == nil || list.NodeGroup == nil {
+				var list ipc.Resources
+				if err := json.Unmarshal([]byte(resp.Message), &list); err != nil || list.IP == nil || list.TCPDomains == nil {
 					t.Fatal("资源对象格式非法", err)
 				}
 				want := tc.count
@@ -75,7 +75,7 @@ func TestNormalizedResourcesReplyIsCompleteBoundedAndReadOnly(t *testing.T) {
 					t.Fatal("归一化资源数量错误", len(list.IP), want)
 				}
 				for _, rule := range list.IP {
-					if rule.ID != "app" || rule.Host.String() != "192.0.2.1/32" || rule.Port != [2]uint16{443, 443} {
+					if rule.Prefix.String() != "192.0.2.1/32" || rule.Ports != [2]uint16{443, 443} {
 						t.Fatal("规则字段丢失")
 					}
 				}

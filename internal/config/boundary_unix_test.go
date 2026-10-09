@@ -32,7 +32,7 @@ func TestIdentityWriteRejectsWritableDirectory(t *testing.T) {
 	before, _ := os.ReadFile(path)
 	os.Chmod(dir, 0777)
 	defer os.Chmod(dir, 0700)
-	cfg, err := InitializeIdentity(path, func() (string, string, error) { return "id", "key", nil })
+	cfg, err := InitializeIdentity(path, func() (string, error) { return "id", nil }, func() (string, error) { return "key", nil })
 	if cfg != nil || err == nil {
 		t.Fatal("不安全目录仍允许写回")
 	}

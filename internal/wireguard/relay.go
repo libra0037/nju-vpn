@@ -21,6 +21,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 
 	"github.com/libra0037/nju-vpn/internal/l3"
+	"github.com/libra0037/nju-vpn/internal/packetlog"
 )
 
 // ErrClosed 表示 relay 已经关闭。
@@ -289,22 +290,6 @@ const (
 	dropReasonCount
 )
 
-var dropReasonText = [dropReasonCount]string{
-	dropMTUExceeded:       "报文超过配置 MTU",
-	dropDownlinkInvalid:   "下行数据切不出 IPv4 包",
-	dropDownlinkAddr:      "下行包的目的地址不是本次分配到的地址（检查对端 allowed_ips 与 peer_address）",
-	dropDownlinkFull:      "下行队列已满",
-	dropDownlinkNoSession: "会话已摘掉，下行包被丢弃（断开窗口里的尾巴）",
-	dropUplinkNotIPv4:     "上行解出来的不是 IPv4 包",
-	dropUplinkAddr:        "上行包的源地址不是 peer_address（对端 ip 配置不一致？）",
-	dropPeerNotReady:      "对端尚未握手，下行包被丢弃（对端还没连上，或密钥不匹配）",
-	dropNoBuffer:          "读缓冲装不下这个包",
-	dropNoSession:         "隧道尚未建立，对端发来的包被丢弃",
-	dropNoUplink:          "隧道上行通道未就绪，包被丢弃",
-	dropUplinkRejected:    "隧道拒绝了这个上行包",
-	dropStaleQueue:        "会话切换时丢掉了队列里属于旧会话的下行包（重连时正常）",
-}
-
 // dropQuietInterval 是几种"预期之内、会一直重复"的丢包原因的日志间隔。
 //
 // 典型的是对端还没露面：校园网网关自己就会往分配到的地址发包，隧道刚
@@ -326,20 +311,10 @@ type dropCounter struct {
 // countDrop 记录一次丢包，并按原因限速打日志。
 //
 // 每种原因第一次出现必定打一条（否则用户第一次踩配置错误时什么都没看到），
-// 之后按间隔限速；原因文案变了则立刻再打一条。
-func (r *Relay) countDrop(reason dropReason) { r.countDropDetail(reason, nil) }
-
-// countDropDetail 与 countDrop 同样限速，但把具体原因一起打出来。
-//
-// 上行被拒的理由只有调用点知道（目标不在资源表内、该流鉴权失败……），
-// 混进一句固定文案就等于把排查推回"猜"：实测时日志只说"上行通道未就绪"，
-// 而真实原因是资源表的端口范围把 ICMP 挡在了门外。
-func (r *Relay) countDropDetail(reason dropReason, detail error) {
+// 之后按间隔限速，不接收可能含地址或令牌的外部错误。
+func (r *Relay) countDrop(reason dropReason) {
 	c := &r.drops[reason]
 	n := c.n.Add(1)
-	text := dropReasonText[reason]
-	// 外部错误可能含地址或令牌；日志只记录有限的本地原因类别。
-	report := func() { log.Printf("wireguard: 丢弃 %s（累计 %d 个）", text, n) }
 	interval := dropLogInterval
 	if quiet := dropQuietInterval[reason]; quiet > 0 {
 		interval = quiet
@@ -349,7 +324,7 @@ func (r *Relay) countDropDetail(reason dropReason, detail error) {
 	if now-last < int64(interval) || !c.lastLog.CompareAndSwap(last, now) {
 		return
 	}
-	report()
+	log.Print(packetlog.Format(packetlog.RelayDrop, packetlog.Reason(dropReasonName[reason]), n))
 }
 
 // File 返回 nil：这里没有操作系统层面的网卡文件描述符。
@@ -455,7 +430,7 @@ func (r *Relay) Write(bufs [][]byte, offset int) (int, error) {
 			if errors.Is(err, l3.ErrNoUplink) {
 				r.countDrop(dropNoUplink)
 			} else {
-				r.countDropDetail(dropUplinkRejected, err)
+				r.countDrop(dropUplinkRejected)
 			}
 			continue
 		}

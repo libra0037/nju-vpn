@@ -39,14 +39,14 @@ const startTimeout = 5 * time.Minute
 var version = "dev"
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `%s - 把校园网隧道接出成本地 WireGuard 承载
+	fmt.Fprintf(os.Stderr, `%s - 通过 WireGuard / SOCKS5 访问校园资源
 
 用法:
   %s run                       以服务进程身份运行（一般由 start 自动拉起）
-  %s start [--trust]           建立隧道（必要时自动拉起服务进程）
-  %s stop                      断开隧道，服务进程继续运行
+  %s start [--trust] [--endpoint <wireguard|socks5>]  登录并启动配置的端点；单端点操作要求已登录
+  %s stop [--endpoint <wireguard|socks5>]  全局断开并登出，或只停止指定端点
   %s status [--json]           查看服务进程、隧道及分类诊断
-  %s resources                只打印当前会话的 IPv4 L3 资源及校园 DNS
+  %s resources                只打印当前会话的 IP / TCP 域名资源及校园 DNS
   %s trust                     把本机绑成授信终端（之后登录免二次验证）
   %s untrust [--all]           解除本机授信；--all 解除该账号下全部授信终端
   %s restart                   重启服务进程（改完配置后用它，不必手工杀进程）
@@ -56,8 +56,8 @@ func usage() {
   -config <path>                   配置文件路径（默认见下）
 
 status 退出码:
-  0 校园隧道 up 且未在重连；1 查询失败；2 用法错误
-  3 服务进程未运行；4 隧道未就绪（未连接、登录中、待验证、失败或重连）
+  0 共享登录和当前启用端点就绪；1 查询失败；2 用法错误
+  3 服务进程未运行；4 数据端点未就绪（未登录、待验证、失败、停止或重连）
 
 默认配置路径:
   Linux    $XDG_CONFIG_HOME/njuvpn/config.yaml（未设置时 ~/.config/njuvpn/config.yaml）
@@ -129,41 +129,21 @@ type usageError struct{ msg string }
 
 func (e *usageError) Error() string { return e.msg }
 
-// parseInterleaved 解析出全部 flag 与位置参数，允许两者交错出现。
-//
-// Go 的 flag 包遇到第一个位置参数就停止解析，而命令行里这两者经常混着写。
-// 这里循环调用 Parse：每轮吃掉一个位置参数，再从剩下的继续解析。解析语义
-// 完全由标准库决定（-flag=value、布尔 flag、-- 终止符都正确）。
-func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
-	var positional []string
-	for {
-		if err := fs.Parse(args); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				return nil, err
-			}
-			return nil, &usageError{err.Error()}
-		}
-		args = fs.Args()
-		if len(args) == 0 {
-			return positional, nil
-		}
-		positional = append(positional, args[0])
-		args = args[1:]
-	}
-}
-
 // parseNoPositional 是各命令的入口：解析出 flag，并拒绝多余的位置参数。
 //
 // 这些命令都不接受位置参数，而"解析出位置参数再丢掉"会把 `untrust all` 降级
 // 成"只解绑本机"——提示语还跟真做了全量一样，一个安全操作被悄悄降级；
 // `status extra`、`stop foo` 同理。宁可报用法错误并打印用法。
 func parseNoPositional(fs *flag.FlagSet, args []string) error {
-	rest, err := parseInterleaved(fs, args)
-	if err != nil {
-		return err
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return &usageError{err.Error()}
 	}
-	if len(rest) > 0 {
-		return &usageError{fmt.Sprintf("%s: 不接受位置参数，多写了 %q", fs.Name(), rest[0])}
+	if fs.NArg() > 0 {
+		return &usageError{fmt.Sprintf("%s: 不接受位置参数，多写了 %q", fs.Name(), fs.Arg(0))}
 	}
+
 	return nil
 }

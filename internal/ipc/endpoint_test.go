@@ -53,6 +53,17 @@ func TestEndpointForDifferentConfigs(t *testing.T) {
 	}
 }
 
+func TestEndpointForDistinguishesKnownShortHashCollision(t *testing.T) {
+	a := "/tmp/njuvpn-review-collision/config-22319.yaml"
+	b := "/tmp/njuvpn-review-collision/config-43628.yaml"
+	if InstanceTag(a) == InstanceTag(b) || EndpointFor(a) == EndpointFor(b) {
+		t.Fatal("两份已知碰撞配置仍共用实例端点")
+	}
+	if len(InstanceTag(a)) != 32 || len(InstanceTag(b)) != 32 {
+		t.Fatal("实例标识未达到 128 位")
+	}
+}
+
 // TestEndpointForRelativePath 验证相对路径按当前工作目录规范化。
 func TestEndpointForRelativePath(t *testing.T) {
 	dir := t.TempDir()

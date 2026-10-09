@@ -38,8 +38,8 @@ python3 - "$private" <<'PY'
 import json, os, pathlib, sys
 directory = pathlib.Path(sys.argv[1])
 info = json.loads((directory / 'info.json').read_text())
-if info['mtu'] != 1400 or info['listen_host'] not in ('', 'loopback'):
-    raise SystemExit('实机测试要求 MTU 1400、loopback 监听')
+if not info['wireguard_enabled'] or info['mtu'] != 1400 or info['listen_host'] not in ('', 'loopback'):
+    raise SystemExit('实机测试要求启用 WireGuard、MTU 1400、loopback 监听')
 key = (directory / 'peer.key').read_text().strip()
 body = '[Interface]\nPrivateKey = ' + key + '\n\n[Peer]\nPublicKey = ' + info['public_key'] + '\nEndpoint = 127.0.0.1:' + str(info['listen_port']) + '\nAllowedIPs = ' + os.environ['NJUVPN_TEST_TARGET_IP'] + '/32\nPersistentKeepalive = 25\n'
 (directory / 'peer.conf').write_text(body)

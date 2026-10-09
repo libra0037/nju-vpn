@@ -55,17 +55,25 @@ func TestSessionSwitchDuringMappingRejectsOldPacket(t *testing.T) {
 		t.Fatal("消费处未拒绝旧绑定包")
 	}
 }
-func TestChangingDropDetailsCannotFloodOrExposeAddresses(t *testing.T) {
+func TestChangingUplinkErrorsCannotFloodOrExposeAddresses(t *testing.T) {
 	var out bytes.Buffer
 	old := log.Writer()
 	log.SetOutput(&out)
 	defer log.SetOutput(old)
 	r := NewRelay(RelayOptions{MTU: 1400})
 	defer r.Close()
+	ep := l3.New()
+	calls := 0
+	ep.SetUplink(func([]byte) error {
+		calls++
+		return fmt.Errorf("secret-token 10.0.0.%d", calls)
+	})
+	r.InstallSession(ep, nil)
+	packet := ipv4Pkt([4]byte{10, 66, 66, 2}, [4]byte{10, 1, 2, 3}, 20)
 	for i := 0; i < 100; i++ {
-		r.countDropDetail(dropUplinkRejected, fmt.Errorf("secret-token 10.0.0.%d", i))
+		r.Write([][]byte{packet}, 0)
 	}
-	if bytes.Count(out.Bytes(), []byte("\n")) > 1 || strings.Contains(out.String(), "secret-token") || strings.Contains(out.String(), "10.0.0.") {
+	if calls != 100 || bytes.Count(out.Bytes(), []byte("\n")) != 1 || strings.Contains(out.String(), "secret-token") || strings.Contains(out.String(), "10.0.0.") {
 		t.Fatal("丢包详情绕过限速或泄密", out.String())
 	}
 }

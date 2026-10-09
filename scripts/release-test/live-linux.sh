@@ -47,7 +47,8 @@ python3 - "$private" <<'PY'
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 info = json.loads((p / 'resources-json.log').read_text())
-if len((p / 'resources-cli.log').read_text().splitlines()) != info['rows'] + 4 or info['apps'] == 0:
+rules = info['ip_rules'] + info['tcp_domains']
+if len((p / 'resources-cli.log').read_text().splitlines()) != rules + 6 or rules == 0:
     raise SystemExit('资源打印行数不完整或资源表为空')
 PY
 check repeat-start "$binary" start -config "$config"

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/libra0037/nju-vpn/internal/socks5"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,20 +41,32 @@ type Config struct {
 	DeviceID  string    `yaml:"device_id"`
 	Proxy     string    `yaml:"proxy"`
 	WireGuard WireGuard `yaml:"wireguard"`
+	SOCKS5    SOCKS5    `yaml:"socks5"`
 	// PinnedNodeSPKISHA256 是自签节点唯一的信任来源，程序只读、不自动补录。
 	// 每项为 DER SubjectPublicKeyInfo 的 SHA-256 摘要，使用标准 Base64。
 	PinnedNodeSPKISHA256 []string `yaml:"pinned_node_spki_sha256"`
-	MTU                  int      `yaml:"mtu"`
 	Log                  Log      `yaml:"log"`
 }
 
 type WireGuard struct {
-	ListenPort int `yaml:"listen_port"`
+	Enabled    bool `yaml:"enabled"`
+	MTU        int  `yaml:"mtu"`
+	ListenPort int  `yaml:"listen_port"`
 	// ListenHost 是 loopback（默认）或 all。
 	ListenHost    string `yaml:"listen_host"`
 	PrivateKey    string `yaml:"private_key"`
 	PeerPublicKey string `yaml:"peer_public_key"`
 	PeerAddress   string `yaml:"peer_address"`
+}
+
+type SOCKS5 struct {
+	Enabled        bool   `yaml:"enabled"`
+	ListenHost     string `yaml:"listen_host"`
+	ListenPort     int    `yaml:"listen_port"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	MaxConnections int    `yaml:"max_connections"`
+	MaxDials       int    `yaml:"max_dials"`
 }
 
 type Log struct {
@@ -234,19 +247,37 @@ func (c *Config) applyDefaults() {
 	if c.Port == 0 {
 		c.Port = 443
 	}
-	if c.MTU == 0 {
+	if c.WireGuard.Enabled && c.WireGuard.MTU == 0 {
 		// 1400 是已实测可用的默认值，不是服务端的已知上限。
-		c.MTU = 1400
+		c.WireGuard.MTU = 1400
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
-	if c.WireGuard.ListenPort == 0 {
+	if c.WireGuard.Enabled && c.WireGuard.ListenPort == 0 {
 		c.WireGuard.ListenPort = 51820
 	}
-	if c.WireGuard.PeerAddress == "" {
+	if c.WireGuard.Enabled && c.WireGuard.PeerAddress == "" {
 		c.WireGuard.PeerAddress = "10.66.66.2"
 	}
+	if c.WireGuard.Enabled && c.WireGuard.ListenHost == "" {
+		c.WireGuard.ListenHost = "loopback"
+	}
+	if c.SOCKS5.Enabled {
+		if c.SOCKS5.ListenHost == "" {
+			c.SOCKS5.ListenHost = "loopback"
+		}
+		if c.SOCKS5.ListenPort == 0 {
+			c.SOCKS5.ListenPort = 1080
+		}
+		if c.SOCKS5.MaxConnections == 0 {
+			c.SOCKS5.MaxConnections = socks5.DefaultMaxConnections
+		}
+		if c.SOCKS5.MaxDials == 0 {
+			c.SOCKS5.MaxDials = socks5.DefaultMaxDials
+		}
+	}
+
 }
 
 func (c *Config) validate() error {
@@ -269,14 +300,6 @@ func (c *Config) validate() error {
 	}
 	// password 允许留空：此时由 `njuvpn start` 在终端现问，经本地套接字
 	// 交给服务进程，只留在内存里（不落盘、不进 argv、不进日志）。
-	// IPv4 总长度与校园数据帧的包长均为 16 位；1400 只是默认值。
-	if c.MTU < MinMTU || c.MTU > math.MaxUint16 {
-		return fmt.Errorf("mtu 超出范围（应在 %d-%d 之间）", MinMTU, math.MaxUint16)
-	}
-	// 0 在 applyDefaults 里已经被换成默认端口，这里不会见到。
-	if p := c.WireGuard.ListenPort; p < 1 || p > 65535 {
-		return fmt.Errorf("wireguard.listen_port 超出范围: %d", p)
-	}
 	// 取值不校验的话，写错（例如 warn）会静默按 info 跑，
 	// 而用户以为拿到了更详细的日志。
 	switch c.Log.Level {
@@ -284,16 +307,42 @@ func (c *Config) validate() error {
 	default:
 		return errors.New("log.level 只能是 info 或 debug")
 	}
-	if err := validateListenHost(c.WireGuard.ListenHost); err != nil {
-		return err
-	}
 	// 指纹写错一个字符就永远连不上，必须在加载时就报出来，而不是等建隧道。
 	if _, err := c.NodeSPKIPins(); err != nil {
 		return err
 	}
-	if ip := net.ParseIP(c.WireGuard.PeerAddress); ip == nil || ip.To4() == nil {
-		return errors.New("wireguard.peer_address 必须是 IPv4 地址")
+	if c.WireGuard.Enabled {
+		if c.WireGuard.MTU < MinMTU || c.WireGuard.MTU > math.MaxUint16 {
+			return fmt.Errorf("wireguard.mtu 超出范围（应在 %d-%d 之间）", MinMTU, math.MaxUint16)
+		}
+		if p := c.WireGuard.ListenPort; p < 1 || p > 65535 {
+			return errors.New("wireguard.listen_port 超出范围")
+		}
+		if err := validateListenHost("wireguard", c.WireGuard.ListenHost); err != nil {
+			return err
+		}
+		if ip := net.ParseIP(c.WireGuard.PeerAddress); ip == nil || ip.To4() == nil {
+			return errors.New("wireguard.peer_address 必须是 IPv4 地址")
+		}
 	}
+	if c.SOCKS5.Enabled {
+		if err := validateListenHost("socks5", c.SOCKS5.ListenHost); err != nil {
+			return err
+		}
+		if p := c.SOCKS5.ListenPort; p < 1 || p > 65535 {
+			return errors.New("socks5.listen_port 超出范围")
+		}
+		if (c.SOCKS5.Username == "") != (c.SOCKS5.Password == "") || len(c.SOCKS5.Username) > 255 || len(c.SOCKS5.Password) > 255 {
+			return errors.New("socks5 认证须同时提供 1-255 字节的用户名和口令")
+		}
+		if c.SOCKS5.ListenHost == "all" && c.SOCKS5.Username == "" {
+			return errors.New("socks5.listen_host=all 必须配置独立的认证凭据")
+		}
+		if c.SOCKS5.MaxConnections < 1 || c.SOCKS5.MaxConnections > socks5.MaxConnections || c.SOCKS5.MaxDials < 1 || c.SOCKS5.MaxDials > socks5.MaxDials || c.SOCKS5.MaxDials > c.SOCKS5.MaxConnections {
+			return errors.New("socks5 连接或建连预算超出范围")
+		}
+	}
+
 	return nil
 }
 
@@ -303,7 +352,7 @@ func (c *Config) Warnings() []string {
 	if c.permNote != "" {
 		out = append(out, c.permNote)
 	}
-	if c.WireGuard.PeerPublicKey == "" {
+	if c.WireGuard.Enabled && c.WireGuard.PeerPublicKey == "" {
 		out = append(out, "未配置 wireguard.peer_public_key，任何对端都无法接入")
 	}
 	if c.LoginDomain == "" {
@@ -318,16 +367,13 @@ func (c *Config) Warnings() []string {
 	return out
 }
 
-// validateListenHost 校验监听范围。
-//
-// 这里不引用 wireguard 包：那会让 config → wireguard → vpn 形成依赖，
-// 而 vpn 的测试又要读配置。取值集合必须与 wireguard.ParseListenHost 一致。
-func validateListenHost(s string) error {
-	switch s {
-	case "", "loopback", "all":
+// 两端点共用配置监听范围；适配层转换为具体套接字地址。
+func validateListenHost(endpoint, value string) error {
+	switch value {
+	case "loopback", "all":
 		return nil
 	default:
-		return errors.New("wireguard.listen_host 只能是 loopback 或 all")
+		return fmt.Errorf("%s.listen_host 只能是 loopback 或 all", endpoint)
 	}
 }
 

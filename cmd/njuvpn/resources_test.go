@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"github.com/libra0037/nju-vpn/internal/ipc"
-	"github.com/libra0037/nju-vpn/internal/ztna"
 )
 
 func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
@@ -26,8 +25,8 @@ func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls atomic.Int32
-	const rule = `{"id":"app","nodeGroupId":"g","protocol":6,"host":"192.0.2.1/32","port":[443,443]}`
-	body := `{"ip":[` + strings.TrimSuffix(strings.Repeat(rule+",", 512), ",") + `],"dns":{"firstDNS":"192.0.2.53","secondDNS":"192.0.2.54"},"nodegroup":{}}`
+	const rule = `{"protocol":"tcp","prefix":"192.0.2.1/32","ports":[443,443]}`
+	body := `{"ip":[` + strings.TrimSuffix(strings.Repeat(rule+",", 512), ",") + `],"tcpDomains":[],"dns":{"primary":"192.0.2.53","secondary":"192.0.2.54"}}`
 	if len(body)+len("200 \n") > ipc.MaxLineBytes {
 		t.Fatal("归一化样例超过统一响应预算")
 	}
@@ -57,7 +56,7 @@ func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 1 || bytes.Count(out, []byte("\n")) != 516 || !bytes.Contains(out, []byte("192.0.2.1/32")) || !bytes.Contains(out, []byte("192.0.2.53")) {
+	if calls.Load() != 1 || bytes.Count(out, []byte("\n")) != 518 || !bytes.Contains(out, []byte("192.0.2.1/32")) || !bytes.Contains(out, []byte("192.0.2.53")) {
 		t.Fatal("没有只读查询并完整打印", calls.Load(), bytes.Count(out, []byte("\n")))
 	}
 	data, _ := os.ReadFile(path)
@@ -73,13 +72,13 @@ func TestResourcesCommandOnlyReadsSnapshotFromExistingInstance(t *testing.T) {
 	}
 }
 func TestResourceOutputUsesPublishedOrderWithoutMutation(t *testing.T) {
-	resources := ztna.L3Resources{
-		IP: []ztna.IPv4Resource{
-			{ID: "unused\x1b[2J\n", Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: ztna.ResourceProtocolUDP, Port: [2]uint16{53, 53}},
-			{Host: netip.MustParsePrefix("198.51.100.0/24"), Protocol: ztna.ResourceProtocolAll, Port: [2]uint16{8000, 8100}},
+	resources := ipc.Resources{
+		IP: []ipc.IPResource{
+			{Prefix: netip.MustParsePrefix("192.0.2.1/32"), Protocol: "udp", Ports: [2]uint16{53, 53}},
+			{Prefix: netip.MustParsePrefix("198.51.100.0/24"), Protocol: "all", Ports: [2]uint16{8000, 8100}},
 		},
-		DNS:       ztna.ResourceDNS{FirstDNS: "192.0.2.53", SecondDNS: "192.0.2.54"},
-		NodeGroup: map[string][]ztna.ResourceNode{},
+		DNS:        ipc.ResourceDNS{Primary: "192.0.2.53", Secondary: "192.0.2.54"},
+		TCPDomains: []ipc.TCPDomainResource{},
 	}
 	before, err := json.Marshal(resources)
 	if err != nil {
@@ -90,10 +89,10 @@ func TestResourceOutputUsesPublishedOrderWithoutMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
-	if len(lines) != 6 || lines[0] != "IPv4 资源表" ||
+	if len(lines) != 8 || lines[0] != "IPv4 资源表" ||
 		!slices.Equal(strings.Fields(lines[1]), []string{"udp", "192.0.2.1/32", "53"}) ||
 		!slices.Equal(strings.Fields(lines[2]), []string{"all", "198.51.100.0/24", "8000-8100"}) ||
-		lines[4] != "DNS 服务器" || lines[5] != "首选  192.0.2.53  备选  192.0.2.54" || strings.ContainsRune(out.String(), '\x1b') {
+		lines[6] != "DNS 服务器" || lines[7] != "首选  192.0.2.53  备选  192.0.2.54" || strings.ContainsRune(out.String(), '\x1b') {
 		t.Fatal("打印顺序、格式或字段错误", out.String())
 	}
 	after, _ := json.Marshal(resources)
@@ -101,18 +100,18 @@ func TestResourceOutputUsesPublishedOrderWithoutMutation(t *testing.T) {
 		t.Fatal("打印修改了发布状态")
 	}
 	var empty bytes.Buffer
-	if err := printResources(&empty, ztna.L3Resources{}); err != nil || !strings.Contains(empty.String(), "IPv4 资源表为空") || !strings.Contains(empty.String(), "DNS 服务器") {
+	if err := printResources(&empty, ipc.Resources{IP: []ipc.IPResource{}, TCPDomains: []ipc.TCPDomainResource{}}); err != nil || !strings.Contains(empty.String(), "IPv4 资源表为空") || !strings.Contains(empty.String(), "DNS 服务器") {
 		t.Fatal("空规则列表未保留 DNS 展示", empty.String(), err)
 	}
 }
 
 func TestResourceOutputRejectsInvalidIPCFieldsBeforePrinting(t *testing.T) {
-	for i, resource := range []ztna.L3Resources{
-		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("::/0"), Protocol: ztna.ResourceProtocolAll, Port: [2]uint16{1, 65535}}}},
-		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("192.0.2.1/24"), Protocol: ztna.ResourceProtocolTCP, Port: [2]uint16{443, 443}}}},
-		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: 0, Port: [2]uint16{443, 443}}}},
-		{IP: []ztna.IPv4Resource{{Host: netip.MustParsePrefix("192.0.2.1/32"), Protocol: ztna.ResourceProtocolTCP, Port: [2]uint16{443, 80}}}},
-		{DNS: ztna.ResourceDNS{FirstDNS: "192.0.2.53\n\x1b[2J"}},
+	for i, resource := range []ipc.Resources{
+		{IP: []ipc.IPResource{{Prefix: netip.MustParsePrefix("::/0"), Protocol: "all", Ports: [2]uint16{1, 65535}}}},
+		{IP: []ipc.IPResource{{Prefix: netip.MustParsePrefix("192.0.2.1/24"), Protocol: "tcp", Ports: [2]uint16{443, 443}}}},
+		{IP: []ipc.IPResource{{Prefix: netip.MustParsePrefix("192.0.2.1/32"), Protocol: "unknown", Ports: [2]uint16{443, 443}}}},
+		{IP: []ipc.IPResource{{Prefix: netip.MustParsePrefix("192.0.2.1/32"), Protocol: "tcp", Ports: [2]uint16{443, 80}}}},
+		{DNS: ipc.ResourceDNS{Primary: "192.0.2.53\n\x1b[2J"}},
 	} {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			var out bytes.Buffer

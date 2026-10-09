@@ -30,14 +30,14 @@ func TestControlPlaneVerifiesCertificate(t *testing.T) {
 			client, err := New(Options{
 				NodeSPKIPins: [][32]byte{srv.SPKIPin()}, ControlRootCAs: tc.roots,
 				Server: tc.server, DialAddr: srv.Addr(), Dial: srv.Dial,
-				Username: testUser, Password: testPass, DeviceID: "device-test-1", MTU: 1500, Logf: t.Logf,
+				Username: testUser, Password: testPass, DeviceID: "device-test-1", Logf: t.Logf,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			sess, err := client.Connect(ctx, ConnectOptions{})
+			sess, err := connectL3(ctx, client, ConnectOptions{})
 			if sess != nil {
 				t.Cleanup(func() { sess.Close(context.Background()) })
 			}

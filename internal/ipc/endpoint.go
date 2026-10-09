@@ -24,7 +24,7 @@ func EndpointFor(configPath string) string {
 	return endpointPath(InstanceTag(configPath))
 }
 
-// InstanceTag 返回配置文件的短标识，8 个十六进制字符。
+// InstanceTag 返回配置文件的 128 位标识，32 个十六进制字符。
 //
 // 实例的本地痕迹都从这一个标识派生（IPC 端点、日志文件名、状态输出），
 // 多实例时对得上号。它由路径决定，与配置内容无关。
@@ -36,12 +36,21 @@ func InstanceTag(configPath string) string {
 	if configPath == "" {
 		return "default"
 	}
+	return instanceTag(ConfigIdentity(configPath))
+}
+
+func instanceTag(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:16])
+}
+
+// ConfigIdentity 是完整配置身份；端点哈希与连接上的核验共用这个口径。
+func ConfigIdentity(configPath string) string {
 	p := config.CanonicalPath(configPath)
 	// Windows 的文件系统不区分大小写，同一份配置写成 Config.yaml 与
 	// config.yaml 会派生出两个端点，所以哈希输入统一小写。
 	if runtime.GOOS == "windows" {
 		p = strings.ToLower(p)
 	}
-	sum := sha256.Sum256([]byte(p))
-	return hex.EncodeToString(sum[:4])
+	return p
 }

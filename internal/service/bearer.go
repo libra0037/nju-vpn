@@ -44,7 +44,7 @@ func newBearer(cfg *config.Config) (*bearer, error) {
 	}
 
 	dev, err := wireguard.NewDevice(wireguard.DeviceOptions{
-		MTU:        cfg.MTU,
+		MTU:        cfg.WireGuard.MTU,
 		PrivateKey: privateKey,
 		ListenPort: cfg.WireGuard.ListenPort,
 		ListenHost: listenHost(cfg.WireGuard.ListenHost),

@@ -20,6 +20,7 @@ import (
 
 	"github.com/libra0037/nju-vpn/internal/dial"
 	"github.com/libra0037/nju-vpn/internal/l3"
+	"github.com/libra0037/nju-vpn/internal/packetlog"
 )
 
 const (
@@ -205,7 +206,7 @@ func handshakeTunnel(ctx context.Context, opts tunnelOptions, tlsConn *tls.Conn)
 	}
 	if _, err := tlsConn.Write(request); err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("发送握手: %w", err)
+		return nil, dial.Wrap("发送握手", err)
 	}
 	res, err := readHandshake(br)
 	if err != nil {
@@ -322,7 +323,8 @@ func (t *tunnelConn) Send(pkt []byte) (resultErr error) {
 	var appID string
 	if info.offset == 0 {
 		var ok bool
-		appID, _, ok = t.table.match(netip.AddrFrom4(info.key.dst), info.proto, info.dstPort)
+		grant, matched := t.table.matchIP(netip.AddrFrom4(info.key.dst), info.proto, info.dstPort)
+		appID, ok = grant.appID, matched
 		if !ok {
 			if info.fragmented() {
 				t.flows.rejectFragment(info.fragment)
@@ -348,27 +350,27 @@ func (t *tunnelConn) Send(pkt []byte) (resultErr error) {
 // 拒包详情不可用作限速键；有限类别只带累计数量，不输出包地址或服务端文案。
 func (t *tunnelConn) recordRejection(err error) {
 	t.rejectMu.Lock()
-	count, label := &t.rejected.LinkUnavailable, "链路或会话不可用"
+	count, reason := &t.rejected.LinkUnavailable, packetlog.LinkUnavailable
 	var protocolErr *ProtocolError
 	switch {
 	case errors.Is(err, ErrResourceUnmatched):
-		count, label = &t.rejected.ResourceUnmatched, "资源表外"
+		count, reason = &t.rejected.ResourceUnmatched, packetlog.ResourceUnmatched
 	case errors.Is(err, ErrFlowRejected):
-		count, label = &t.rejected.FlowRejected, "流鉴权失败"
+		count, reason = &t.rejected.FlowRejected, packetlog.FlowRejected
 	case errors.Is(err, ErrPendingFull):
-		count, label = &t.rejected.PendingFull, "待鉴权缓存已满"
+		count, reason = &t.rejected.PendingFull, packetlog.PendingFull
 	case errors.Is(err, ErrFlowTableFull):
-		count, label = &t.rejected.FlowTableFull, "流表已满"
+		count, reason = &t.rejected.FlowTableFull, packetlog.FlowTableFull
 	case errors.Is(err, ErrFragmentMissing):
-		count, label = &t.rejected.FragmentMissing, "分片关联不存在或过期"
+		count, reason = &t.rejected.FragmentMissing, packetlog.FragmentMissing
 	case errors.Is(err, ErrFragmentOrder):
-		count, label = &t.rejected.FragmentOrder, "分片乱序或重叠"
+		count, reason = &t.rejected.FragmentOrder, packetlog.FragmentOrder
 	case errors.Is(err, ErrFragmentFull):
-		count, label = &t.rejected.FragmentFull, "分片关联已满"
+		count, reason = &t.rejected.FragmentFull, packetlog.FragmentFull
 	case errors.Is(err, ErrPacketTooLarge):
-		count, label = &t.rejected.MTUExceeded, "报文超过配置 MTU"
+		count, reason = &t.rejected.MTUExceeded, packetlog.MTUExceeded
 	case errors.As(err, &protocolErr):
-		count, label = &t.rejected.InvalidPacket, "报文格式非法"
+		count, reason = &t.rejected.InvalidPacket, packetlog.InvalidPacket
 	}
 	now := time.Now()
 	*count += 1
@@ -379,7 +381,7 @@ func (t *tunnelConn) recordRejection(err error) {
 	}
 	t.rejectMu.Unlock()
 	if report && t.logf != nil {
-		t.logf("上行拒绝：%s，累计 %d 个包", label, n)
+		t.logf("%s", packetlog.Format(packetlog.TunnelRejection, reason, n))
 	}
 }
 
@@ -451,6 +453,11 @@ func (t *tunnelConn) handleAuthResp(status byte, payload []byte) {
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
 		t.close(&ProtocolError{What: "鉴权响应格式非法"})
+		return
+	}
+	// 会话失效属于共享登录；即使没有单流哈希也必须立即结束连接。
+	if resp.Code != nil && *resp.Code == codeSessionGone {
+		t.close(&ErrSessionGone{Code: *resp.Code})
 		return
 	}
 	if resp.Code == nil || resp.Data.ConntrackHash == nil || *resp.Data.ConntrackHash == 0 {
@@ -642,8 +649,7 @@ func (t *tunnelConn) buildAuthRequest(f authFlow) ([]byte, error) {
 	case protoICMP:
 		ipProto = protoICMP
 	}
-	procPath := "/usr/bin/njuvpn"
-	sum := sha256.Sum256([]byte(procPath))
+	env, hash := processEnvironment()
 
 	req := authRequestJSON{
 		Sid:           t.sid,
@@ -658,23 +664,22 @@ func (t *tunnelConn) buildAuthRequest(f authFlow) ([]byte, error) {
 			DestAddr: f.key.dstString(), DestPort: int(f.key.dport),
 			SrcAddr: f.key.srcString(), SrcPort: int(f.key.sport),
 		},
-		ProcHash: fmt.Sprintf("%X", sum),
+		ProcHash: hash,
+		Env:      env,
 	}
-	req.Env.Application.Runtime.Process = processJSON{
-		Name: clientIdentity, DigitalSignature: "TrustAppClosed", Platform: "Linux",
-		Fingerprint: fmt.Sprintf("%X", sum), Description: "TrustAppClosed",
-		Path: procPath, Version: "TrustAppClosed", SecurityEnv: "normal",
-	}
-	req.Env.Application.Runtime.ProcessTrusted = "TRUSTED"
 
 	unsigned, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	mac := hmac.New(sha256.New, t.signKey)
+	return signAuthJSON(unsigned, t.signKey), nil
+}
+
+func signAuthJSON(unsigned, key []byte) []byte {
+	mac := hmac.New(sha256.New, key)
 	mac.Write(unsigned)
 	sig := hex.EncodeToString(mac.Sum(nil))
-	return append([]byte(string(unsigned[:len(unsigned)-1])), []byte(fmt.Sprintf(",%q:%q}", "xRequestSig", upperHex(sig)))...), nil
+	return append([]byte(string(unsigned[:len(unsigned)-1])), []byte(fmt.Sprintf(",%q:%q}", "xRequestSig", upperHex(sig)))...)
 }
 
 func upperHex(s string) string {

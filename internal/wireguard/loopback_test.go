@@ -446,7 +446,7 @@ func TestNoHandshakeNoiseBeforeClientConnects(t *testing.T) {
 	if strings.Contains(logs, "no known endpoint") {
 		t.Fatalf("对端还没接进来时不该有握手噪声，实际日志：\n%s", logs)
 	}
-	if n := strings.Count(logs, dropReasonText[dropPeerNotReady]); n != 1 {
+	if n := strings.Count(logs, "reason=peer_not_ready"); n != 1 {
 		t.Fatalf("被丢掉的下行包应当只留一条记录，实际 %d 条：\n%s", n, logs)
 	}
 }

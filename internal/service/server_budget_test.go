@@ -12,7 +12,7 @@ func TestIPCConnectionLimitAndShutdownWakeIdleClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(nil, ln)
+	server := NewServer(&Service{status: newStatusStore(Identity{})}, ln)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve() }()
 	var clients []net.Conn

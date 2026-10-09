@@ -55,7 +55,6 @@ func newTestClient(t *testing.T, srv *ztnatest.Server, password string) *Client 
 		DeviceID:         "device-test-1",
 		Logf:             t.Logf,
 		ControlRootCAs:   srv.RootCAs(),
-		MTU:              1400,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +77,7 @@ func TestConnectWithSMSTrustAndData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, sess)
 	authErr, ok := AsAuthRequired(err)
 	if !ok {
@@ -114,6 +113,9 @@ func TestConnectWithSMSTrustAndData(t *testing.T) {
 
 	if err := sess.Auth(ctx, testCode); err != nil {
 		t.Fatalf("正确的验证码应通过: %v", err)
+	}
+	if err := sess.StartL3(ctx, 1400); err != nil {
+		t.Fatal(err)
 	}
 	if got := sess.ClientIP().String(); got != "172.16.0.9" {
 		t.Errorf("分配的地址 = %s，期望 172.16.0.9", got)
@@ -178,7 +180,7 @@ func TestConnectLegacySMSForm(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, sess)
 	if _, ok := AsAuthRequired(err); !ok {
 		t.Fatalf("旧形态也应停在等验证码这一步，得到 %v", err)
@@ -188,6 +190,9 @@ func TestConnectLegacySMSForm(t *testing.T) {
 	}
 	if err := sess.Auth(ctx, testCode); err != nil {
 		t.Fatalf("表单提交验证码失败: %v", err)
+	}
+	if err := sess.StartL3(ctx, 1400); err != nil {
+		t.Fatal(err)
 	}
 	if got := sess.ClientIP().String(); got != "172.16.0.9" {
 		t.Errorf("分配的地址 = %s，期望 172.16.0.9", got)
@@ -203,7 +208,7 @@ func TestConnectWithoutSecondFactor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, sess)
 	if err != nil {
 		t.Fatalf("不需要二次验证时 Connect 应直接成功: %v", err)
@@ -221,18 +226,18 @@ func TestConnectUsesPasswordFromOptions(t *testing.T) {
 	client := newTestClient(t, srv, "")
 
 	ctx := context.Background()
-	missing, err := client.Connect(ctx, ConnectOptions{})
+	missing, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, missing)
 	if err == nil {
 		t.Fatal("没有口令时应失败")
 	}
 
-	sess, err := client.Connect(ctx, ConnectOptions{Password: testPass})
+	sess, err := connectL3(ctx, client, ConnectOptions{Password: testPass})
 	closeSessionAfterTest(t, sess)
 	if err != nil {
 		t.Fatalf("带口令的 Connect 应成功: %v", err)
 	}
-	wrong, err := client.Connect(ctx, ConnectOptions{Password: "wrong"})
+	wrong, err := connectL3(ctx, client, ConnectOptions{Password: "wrong"})
 	closeSessionAfterTest(t, wrong)
 	if err == nil {
 		t.Fatal("错误口令应被拒绝")
@@ -256,7 +261,7 @@ func TestConnectUsesPasswordFromOptions(t *testing.T) {
 // 服务端名额，调用方要拿它去登出。空会话因此是合法状态，方法必须自己挡住。
 func TestDeviceSessionWithoutLoginDoesNotPanic(t *testing.T) {
 	// 离线拨号失败发生在会话构造之后，仍须能关闭返回的半完成对象。
-	client, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", DeviceID: "test", Dial: func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("offline") }, Username: testUser, Password: testPass, NodeSPKIPins: [][32]byte{{1}}, MTU: 1400})
+	client, err := New(Options{Server: "vpn.test", DialAddr: "vpn.test:443", DeviceID: "test", Dial: func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("offline") }, Username: testUser, Password: testPass, NodeSPKIPins: [][32]byte{{1}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,12 +360,12 @@ func TestConnectRejectsAlreadyOnline(t *testing.T) {
 	srv := newFake(t, ztnatest.Options{AlreadyOnlineCode: rejectCode})
 	client := newTestClient(t, srv, testPass)
 	ctx := context.Background()
-	first, err := client.Connect(ctx, ConnectOptions{})
+	first, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, first)
 	if err != nil {
 		t.Fatalf("第一次登录应成功: %v", err)
 	}
-	second, err := client.Connect(ctx, ConnectOptions{})
+	second, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, second)
 	rejected, ok := AsRejected(err)
 	if !ok || rejected.Code != rejectCode {
@@ -415,7 +420,7 @@ func TestReconnectRotatesNodes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, sess)
 	if err != nil {
 		t.Fatalf("登录应成功: %v", err)
@@ -480,7 +485,7 @@ func TestTunnelSurvivesHeartbeatRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	closeSessionAfterTest(t, sess)
 	if err != nil {
 		t.Fatalf("登录应成功: %v", err)
@@ -538,3 +543,18 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 var _ = errors.Is
+
+func connectL3(ctx context.Context, client *Client, co ConnectOptions) (*Session, error) {
+	return connectL3WithMTU(ctx, client, 1400, co)
+}
+func connectL3WithMTU(ctx context.Context, client *Client, mtu int, co ConnectOptions) (*Session, error) {
+	sess, err := client.Connect(ctx, co)
+	if err != nil {
+		return sess, err
+	}
+	if err := sess.StartL3(ctx, mtu); err != nil {
+		_ = sess.Close(context.Background())
+		return sess, err
+	}
+	return sess, nil
+}

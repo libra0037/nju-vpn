@@ -35,6 +35,7 @@ const (
 type Server struct {
 	svc      *Service
 	listener net.Listener
+	identity ipc.InstanceIdentity // 构造时冻结，不随配置路径之后的文件系统变化重算。
 
 	closing     chan struct{}
 	once        sync.Once
@@ -52,6 +53,7 @@ func NewServer(svc *Service, listener net.Listener) *Server {
 	return &Server{
 		svc:           svc,
 		listener:      listener,
+		identity:      ipc.InstanceIdentity{ConfigPath: ipc.ConfigIdentity(svc.Identity().ConfigPath)},
 		closing:       make(chan struct{}),
 		quit:          make(chan struct{}),
 		connections:   make(map[net.Conn]struct{}),
@@ -207,9 +209,14 @@ func (s *Server) writeResponse(conn net.Conn, resp ipc.Response) error {
 func (s *Server) dispatch(req ipc.Request) ipc.Response {
 	switch req.Command {
 	case ipc.CmdPing:
-		// 探活顺带报出身份：同机多实例时，"这台机器上跑着谁"是排查的
-		// 第一个问题，而 ping 是唯一永远可用的命令。
-		return ipc.Response{Code: ipc.CodeOK, Message: "pong " + identityText(s.svc.Identity())}
+		if len(req.Args) != 0 {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: "ping 不接受参数"}
+		}
+		body, err := json.Marshal(s.identity)
+		if err != nil {
+			return ipc.Response{Code: ipc.CodeServerError, Message: "实例身份编码失败"}
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: string(body)}
 
 	case ipc.CmdShutdown:
 		// 先安排退出再回包（回包由 handle 写到这条连接上）：客户端要能
@@ -242,7 +249,7 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			message = string(body)
 		}
 		// 输出格式不改变就绪判据；退避重连时对象虽在，链路仍未就绪。
-		if st.State != StateUp || st.Retrying {
+		if !st.Ready {
 			return ipc.Response{Code: ipc.CodeRejected, Message: message}
 		}
 		return ipc.Response{Code: ipc.CodeOK, Message: message}
@@ -253,7 +260,7 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 		}
 		body, err := s.svc.ResourcesJSON(ipc.MaxLineBytes - len("200 \n"))
 		if err != nil {
-			if errors.Is(err, ztna.ErrResourceSnapshotTooLarge) {
+			if errors.Is(err, ipc.ErrResourceSnapshotTooLarge) {
 				return ipc.Response{Code: ipc.CodeServerError, Message: fmt.Sprintf("资源列表超过 %d 字节的 IPC 响应上限", ipc.MaxLineBytes)}
 			}
 			return ipc.Response{Code: ipc.CodeRejected, Message: ztna.ErrResourcesUnavailable.Error()}
@@ -286,6 +293,21 @@ func (s *Server) dispatch(req ipc.Request) ipc.Response {
 			return s.errorResponse(err)
 		}
 		return ipc.Response{Code: ipc.CodeOK, Message: detailOr("隧道已建立", s.svc.Status().Detail)}
+
+	case ipc.CmdEndpointStart, ipc.CmdEndpointStop:
+		if len(req.Args) != 1 || req.Args[0] != "wireguard" && req.Args[0] != "socks5" {
+			return ipc.Response{Code: ipc.CodeBadRequest, Message: "端点只能是 wireguard 或 socks5"}
+		}
+		var err error
+		if req.Command == ipc.CmdEndpointStart {
+			err = s.svc.StartEndpoint(req.Args[0])
+		} else {
+			err = s.svc.StopEndpoint(req.Args[0])
+		}
+		if err != nil {
+			return s.errorResponse(err)
+		}
+		return ipc.Response{Code: ipc.CodeOK, Message: s.svc.Status().Detail}
 
 	case ipc.CmdAuth:
 		// 验证码可能被拆成多个参数（用户敲了空格），拼回去再用。
@@ -413,7 +435,26 @@ func statusLine(st Status) string {
 			peer = "已握手"
 		}
 	}
-	msg += " | WireGuard " + peer
+	if st.WireGuard.Enabled {
+		msg += " | WireGuard " + peer
+		if st.WireGuard.Failure != "" {
+			msg += "（" + st.WireGuard.Failure + "）"
+		}
+	} else {
+		msg += " | WireGuard 未启用"
+	}
+	if st.SOCKS5.Enabled {
+		state := "未监听"
+		if st.SOCKS5.Listening {
+			state = "已监听"
+		}
+		msg += fmt.Sprintf(" | SOCKS5 %s，连接 %d，建连 %d，拒绝 %d，失败 %d", state, st.SOCKS5.Connections, st.SOCKS5.Dialing, st.SOCKS5.Rejected, st.SOCKS5.Failed)
+		if st.SOCKS5.Failure != "" {
+			msg += "（" + st.SOCKS5.Failure + "）"
+		}
+	} else {
+		msg += " | SOCKS5 未启用"
+	}
 	var drops []string
 	for reason, count := range st.WireGuard.Drops {
 		drops = append(drops, fmt.Sprintf("%s=%d", reason, count))
@@ -448,7 +489,7 @@ func statusLine(st Status) string {
 	return msg
 }
 
-// identityText 把实例身份拼成一段文本，供 ping 与 status 共用。
+// identityText 把实例身份拼成状态显示文本；连接核验使用独立的 JSON 契约。
 //
 // 只包含 PID、账号、配置路径与端点——都不算秘密，能连上本地端点的人本来
 // 就看得到这些文件。

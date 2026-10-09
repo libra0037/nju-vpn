@@ -86,16 +86,24 @@ func TestStatusReadinessDoesNotDependOnOutputFormat(t *testing.T) {
 		{StateAuthPending, false, 409},
 		{StateError, false, 409},
 		{StateUp, false, 200},
+		{StateUp, false, 409},
 		{StateUp, true, 409},
 	} {
 		t.Run(fmt.Sprintf("%s/retrying=%t", tc.state, tc.retrying), func(t *testing.T) {
 			srv := newFakeServer(t, ztnatest.Options{})
 			svc := newTestService(t, srv, newTestConfig(t, srv))
-			// 只推进状态模型，避免为测试输出契约启动网络会话。
-			if tc.state == StateAuthPending || tc.state == StateUp {
-				svc.status.set(StateLoggingIn, "")
+			if tc.state == StateUp && (tc.wantCode == 200 || tc.retrying) {
+				if err := svc.Start(false, ""); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				// 无实际会话的 up 必须拒绝，防止只用状态标签判断就绪。
+				if tc.state == StateAuthPending || tc.state == StateUp {
+					svc.status.set(StateLoggingIn, "")
+				}
+				svc.status.set(tc.state, "")
 			}
-			svc.status.set(tc.state, "")
+
 			if tc.retrying {
 				svc.status.setRetrying(true)
 			}

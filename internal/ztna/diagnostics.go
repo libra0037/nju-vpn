@@ -26,10 +26,11 @@ type TunnelDiagnostics struct {
 func (s *Session) Diagnostics() TunnelDiagnostics {
 	s.mu.Lock()
 	conn := s.active
-	closed := s.closed
+	closed := s.closed || s.ctx.Err() != nil
+	mtu := s.l3MTU
 	s.mu.Unlock()
 	if conn == nil || closed {
-		return TunnelDiagnostics{MTU: s.client.opts.MTU}
+		return TunnelDiagnostics{MTU: mtu}
 	}
 	conn.rejectMu.Lock()
 	d := TunnelDiagnostics{MTU: conn.mtu, Rejected: conn.rejected}

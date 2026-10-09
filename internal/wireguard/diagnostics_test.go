@@ -9,15 +9,17 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 
 	"github.com/libra0037/nju-vpn/internal/l3"
+	"github.com/libra0037/nju-vpn/internal/packetlog"
 )
 
 func TestMTUAndDiagnosticReasons(t *testing.T) {
 	seen := make(map[string]bool)
 	for reason, name := range dropReasonName {
-		if name == "" || seen[name] || dropReasonText[reason] == "" {
+		if name == "" || seen[name] {
 			t.Fatal("诊断原因缺失或重复", reason)
 		}
 		seen[name] = true
+		packetlog.Format(packetlog.RelayDrop, packetlog.Reason(name), 1)
 	}
 	key, err := GenerateKey()
 	if err != nil {

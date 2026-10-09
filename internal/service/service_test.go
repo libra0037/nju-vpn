@@ -68,9 +68,10 @@ func newTestConfig(t *testing.T, srv *ztnatest.Server) *config.Config {
 		Username:             testUser,
 		Password:             testPass,
 		DeviceID:             "device-test-1",
-		MTU:                  1400,
 		PinnedNodeSPKISHA256: []string{pinText(srv)},
 		WireGuard: config.WireGuard{
+			Enabled:     true,
+			MTU:         1400,
 			ListenPort:  0,
 			PrivateKey:  key.String(),
 			PeerAddress: "10.66.66.2",
@@ -336,7 +337,7 @@ func TestTunnelGivingUpLandsInError(t *testing.T) {
 func TestServerDispatchContract(t *testing.T) {
 	srv := newFakeServer(t, ztnatest.Options{})
 	svc := newTestService(t, srv, newTestConfig(t, srv))
-	s := &Server{svc: svc, closing: make(chan struct{}), quit: make(chan struct{})}
+	s := NewServer(svc, nil)
 
 	if resp := s.dispatch(ipc.Request{Command: "nope"}); resp.Code != ipc.CodeBadRequest {
 		t.Errorf("未知命令的状态码 = %d，期望 400", resp.Code)
@@ -350,8 +351,11 @@ func TestServerDispatchContract(t *testing.T) {
 	if resp := s.dispatch(ipc.Request{Command: ipc.CmdState}); resp.Code != ipc.CodeOK || resp.Message != string(StateIdle) {
 		t.Errorf("state = %d %q，期望 200 idle", resp.Code, resp.Message)
 	}
-	if resp := s.dispatch(ipc.Request{Command: ipc.CmdPing}); resp.Code != ipc.CodeOK || !strings.Contains(resp.Message, "pong") {
+	if resp := s.dispatch(ipc.Request{Command: ipc.CmdPing}); resp.Code != ipc.CodeOK || resp.Message != `{"config":`+strconv.Quote(ipc.ConfigIdentity(svc.Identity().ConfigPath))+`}` {
 		t.Errorf("ping = %d %q", resp.Code, resp.Message)
+	}
+	if resp := s.dispatch(ipc.Request{Command: ipc.CmdPing, Args: []string{"extra"}}); resp.Code != ipc.CodeBadRequest {
+		t.Fatal("ping 没有拒绝多余参数")
 	}
 
 	resp := s.dispatch(ipc.Request{Command: ipc.CmdStart, Args: []string{"trust=0", ipc.EncodeSecret(testPass)}})
@@ -439,8 +443,9 @@ func TestConnectFailureStillLogsOut(t *testing.T) {
 	// 让承载层挂载失败：对端地址没了，地址映射建不起来。这是真实的失败
 	// 路径之一（配置写坏、设备被关掉），不必打桩。
 	svc.br.peerAddr = nil
+	svc.status.set(StateLoggingIn, "")
 
-	if err := svc.finishConnect(sess); err == nil {
+	if err := svc.finishConnect(context.Background(), sess); err == nil {
 		t.Fatal("承载层挂载失败时 finishConnect 应当报错")
 	}
 	if got := srv.LogoutCount(); got != 1 {
@@ -588,7 +593,7 @@ func TestListenHostTablesAgree(t *testing.T) {
 func loadWithListenHost(t *testing.T, value string) error {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	content := "server: vpn.example\nusername: u\nmtu: 1400\npinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\nwireguard:\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
+	content := "server: vpn.example\nusername: u\npinned_node_spki_sha256: [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]\nwireguard:\n  enabled: true\n  mtu: 1400\n  peer_address: 10.66.66.2\n  listen_host: \"" + value + "\"\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

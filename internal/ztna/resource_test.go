@@ -18,13 +18,13 @@ func TestResourceRulePriorityAndCompleteMatching(t *testing.T) {
  {"id":"same-key","nodeGroupId":"g","accessModel":"L3VPN","addressList":[{"host":"10.1.2.3/32","protocol":"TCP","port":"80"}]},
  {"id":"subnet","nodeGroupId":"g","accessModel":"L3VPN","addressList":[{"host":"10.1.9.9/16","protocol":"tcp","port":"443"}]},
  {"id":"earlier-address","nodeGroupId":"g","accessModel":"L3VPN","addressList":[{"host":"10.1.2.2","protocol":"all","port":"1-65535"}]}]}]}}}}`)
-	table, err := parseResourceTable(raw, "vpn.test")
+	table, _, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var order []string
-	for _, rule := range table.IP {
-		order = append(order, rule.ID)
+	for _, rule := range table.ipRules {
+		order = append(order, rule.grant.appID)
 	}
 	wantOrder := []string{"earlier-address", "exact-udp", "exact-tcp", "same-key", "exact-all", "subnet", "broad"}
 	if !slices.Equal(order, wantOrder) {
@@ -51,26 +51,26 @@ func TestResourceRulePriorityAndCompleteMatching(t *testing.T) {
 		{"::ffff:10.1.2.3", protoTCP, 443, ""},
 	} {
 		dst := netip.MustParseAddr(tc.dst)
-		app, group, ok := table.match(dst, tc.proto, tc.port)
-		if app != tc.want || ok != (tc.want != "") || ok && group != "g" {
-			t.Errorf("%s/%d/%d：%q/%q（%v），期望 %q", tc.dst, tc.proto, tc.port, app, group, ok, tc.want)
+		grant, ok := table.matchIP(dst, tc.proto, tc.port)
+		if grant.appID != tc.want || ok != (tc.want != "") || ok && grant.nodeGroupID != "g" {
+			t.Errorf("%s/%d/%d：%q/%q（%v），期望 %q", tc.dst, tc.proto, tc.port, grant.appID, grant.nodeGroupID, ok, tc.want)
 		}
 	}
 	dst := netip.MustParseAddr("10.1.2.3")
-	if allocs := testing.AllocsPerRun(100, func() { table.match(dst, protoTCP, 443) }); allocs != 0 {
+	if allocs := testing.AllocsPerRun(100, func() { table.matchIP(dst, protoTCP, 443) }); allocs != 0 {
 		t.Fatal("逐包匹配产生分配", allocs)
 	}
 }
 
 func TestResourceDNSUsesV2AndRejectsInvalidAddresses(t *testing.T) {
 	raw := []byte(`{"data":{"sdpPolicy":{"data":{"clientOption":{"dnsOption":{"firstDNS":"192.0.2.1"},"dnsOptionV2":{"firstDNS":"192.0.2.53","secondDNS":"192.0.2.54"}}}}}}`)
-	table, err := parseResourceTable(raw, "vpn.test")
-	if err != nil || table.DNS != (ResourceDNS{FirstDNS: "192.0.2.53", SecondDNS: "192.0.2.54"}) {
+	table, _, err := parseResourceTable(raw, "vpn.test")
+	if err != nil || table.dns != [2]netip.Addr{netip.MustParseAddr("192.0.2.53"), netip.MustParseAddr("192.0.2.54")} {
 		t.Fatal("没有采用 V2 DNS 元数据", table, err)
 	}
 	for _, dns := range []string{"dns.example", "::1", "::ffff:192.0.2.53", "192.0.2.53\nmarker"} {
 		raw := []byte(fmt.Sprintf(`{"data":{"sdpPolicy":{"data":{"clientOption":{"dnsOptionV2":{"firstDNS":%q}}}}}}`, dns))
-		_, err := parseResourceTable(raw, "vpn.test")
+		_, _, err := parseResourceTable(raw, "vpn.test")
 		var protocolErr *ProtocolError
 		if !errors.As(err, &protocolErr) || strings.Contains(err.Error(), dns) {
 			t.Fatal("非法 DNS 未拒绝或泄露值", err)
@@ -84,7 +84,7 @@ func TestResourceNodeGroupsAreStableWANFirstAndDeduplicateCandidates(t *testing.
  {"id":"main","addressInfo":[{"address":"lan.test:441","type":"lan"},{"address":"wan1.test:441","type":"WAN"},{"address":"wan2.test:441","type":"wan"}]},
  {"id":"a","addressInfo":[{"address":"a.test:441","type":"wan"},{"address":"wan1.test:441","type":"wan"}]},
  {"id":"preferred","addressInfo":[{"address":"peer.test:441","type":"lan"}]}]}}}}}}`)
-	table, err := parseResourceTable(raw, "vpn.test")
+	table, _, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestResourceNodeGroupsAreStableWANFirstAndDeduplicateCandidates(t *testing.
 			t.Fatal("节点组顺序不稳定、WAN 未优先或候选重复", got)
 		}
 	}
-	if nodes := table.NodeGroup["main"]; len(nodes) != 3 || nodes[0].Address != "wan1.test:441" || nodes[0].Type != "wan" || nodes[2].Type != "lan" {
+	if nodes := table.nodeGroups["main"]; len(nodes) != 3 || nodes[0] != "wan1.test:441" || nodes[2] != "lan.test:441" {
 		t.Fatal("节点状态没有归一化", nodes)
 	}
 }
@@ -110,7 +110,7 @@ func TestResourceCountsAndLengthsRemainBounded(t *testing.T) {
 		"port":      `{"data":{"appList":{"data":{"appInfo":[{"apps":[{"addressList":[{"port":"` + strings.Repeat("x", 257) + `"}]}]}]}}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := parseResourceTable([]byte(raw), "vpn.test"); err == nil {
+			if _, _, err := parseResourceTable([]byte(raw), "vpn.test"); err == nil {
 				t.Fatal("超预算输入仍接受")
 			}
 		})

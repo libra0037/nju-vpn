@@ -54,11 +54,17 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "campus-") {
+		return runCampus(os.Args[1], os.Args[2:])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "socks" {
+		return runSOCKS(os.Args[2:])
+	}
 	if len(os.Args) > 1 && os.Args[1] == "resilience" {
 		return runResilience(os.Args[2:])
 	}
 	if len(os.Args) < 2 || (os.Args[1] != "prepare" && os.Args[1] != "run" && os.Args[1] != "packet-check" && os.Args[1] != "upload-proxy" && os.Args[1] != "log-summary") {
-		return errors.New("用法: test-peer prepare|run|packet-check|upload-proxy|log-summary|resilience；参数见测试说明")
+		return errors.New("用法: test-peer prepare|run|packet-check|upload-proxy|log-summary|resilience|socks；参数见测试说明")
 	}
 	command := os.Args[1]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -108,7 +114,7 @@ func run() error {
 		return errors.New("参数无效")
 	}
 	cfg, err := config.LoadForClient(*path)
-	if err != nil || cfg.MTU != mtu || (cfg.WireGuard.ListenHost != "" && cfg.WireGuard.ListenHost != "loopback") {
+	if err != nil || !cfg.WireGuard.Enabled || cfg.WireGuard.MTU != mtu || (cfg.WireGuard.ListenHost != "" && cfg.WireGuard.ListenHost != "loopback") {
 		return errors.New("配置无效；要求 MTU 1400、loopback 监听")
 	}
 	if command == "prepare" {
@@ -233,7 +239,7 @@ func prepare(cfg *config.Config, out string) error {
 }
 
 func readKey(path string) (wg.Key, error) {
-	f, err := os.Open(path)
+	f, err := openKey(path)
 	if err != nil {
 		return wg.Key{}, err
 	}
@@ -345,7 +351,7 @@ func probeProxyUpload(parent context.Context, proxy *url.URL, target netip.Addr,
 		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}
 	headers := http.Header{"Content-Type": {"application/octet-stream"}, "Expect": {"100-continue"}, "User-Agent": {""}}
-	return measureHTTP(parent, transport, headers, target, runID, budget, "upload-1MiB-go-http-proxy", "POST", "/echo", uploadHash, uploadSize)
+	return measureHTTP(parent, transport, headers, httpTarget(target).String(), runID, budget, "upload-1MiB-go-http-proxy", "POST", "/echo", uploadHash, uploadSize)
 }
 
 type measurement struct {
@@ -369,21 +375,27 @@ type probeBudgets struct {
 	request, transfer time.Duration
 }
 
+type httpCheck struct {
+	name, method, path, digest string
+	size                       int
+	budget                     time.Duration
+}
+
+func httpChecks(budgets probeBudgets) []httpCheck {
+	return []httpCheck{
+		{"health", "GET", "/health", "", len("njuvpn-release-test\n"), budgets.request},
+		{"download-8MiB", "GET", "/slow-blob", downloadHash, downloadSize, budgets.transfer},
+		{"upload-1MiB", "POST", "/echo", uploadHash, uploadSize, budgets.transfer},
+	}
+}
+
 func probe(ctx context.Context, peer *directPeer, runID string, budgets probeBudgets) (report trafficReport) {
 	report = trafficReport{RunID: runID, MTU: mtu, BudgetMS: budgets.request.Milliseconds(), TransferMS: budgets.transfer.Milliseconds()}
 	defer func() {
 		report.HandshakeSeen = handshakeSeen(peer)
 		report.Passed = report.Passed && report.HandshakeSeen
 	}()
-	for _, test := range []struct {
-		name, method, path, digest string
-		size                       int
-		budget                     time.Duration
-	}{
-		{"health", "GET", "/health", "", len("njuvpn-release-test\n"), budgets.request},
-		{"download-8MiB", "GET", "/slow-blob", downloadHash, downloadSize, budgets.transfer},
-		{"upload-1MiB", "POST", "/echo", uploadHash, uploadSize, budgets.transfer},
-	} {
+	for _, test := range httpChecks(budgets) {
 		result := probeHTTP(ctx, peer, runID, test.budget, test.name, test.method, test.path, test.digest, test.size)
 		report.Checks = append(report.Checks, result)
 		if !result.Passed {
@@ -422,11 +434,11 @@ func probeHTTP(parent context.Context, peer *directPeer, runID string, budget ti
 		}
 		return peer.net.DialContextTCPAddrPort(ctx, httpTarget(peer.target))
 	}
-	return measureHTTP(parent, transport, nil, peer.target, runID, budget, name, method, path, expectedHash, size)
+	return measureHTTP(parent, transport, nil, httpTarget(peer.target).String(), runID, budget, name, method, path, expectedHash, size)
 }
 
 // transport 的独占所有权转入本次测量：修改拨号计时包装，并在退出时回收连接。
-func measureHTTP(parent context.Context, transport *http.Transport, headers http.Header, target netip.Addr, runID string, budget time.Duration, name, method, path, expectedHash string, size int) (result checkResult) {
+func measureHTTP(parent context.Context, transport *http.Transport, headers http.Header, targetAddress, runID string, budget time.Duration, name, method, path, expectedHash string, size int) (result checkResult) {
 	clock := &measurement{started: time.Now(), dialMS: -1, firstByteMS: -1}
 	result.Name = name
 	result.BudgetMS = budget.Milliseconds()
@@ -451,7 +463,7 @@ func measureHTTP(parent context.Context, transport *http.Transport, headers http
 	if method == "POST" {
 		body = bytes.NewReader(payload(size, 256))
 	}
-	request, err := http.NewRequestWithContext(ctx, method, "http://"+httpTarget(target).String()+path, body)
+	request, err := http.NewRequestWithContext(ctx, method, "http://"+targetAddress+path, body)
 	if err != nil {
 		result.Error = "request"
 		return result

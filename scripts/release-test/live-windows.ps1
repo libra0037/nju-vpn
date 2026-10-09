@@ -323,7 +323,7 @@ try {
     $started = $true
     Invoke-Cli 'restart'
     $before = Read-Helper 'info'
-    if ($before.mtu -ne 1400 -or $before.peer_public_key -eq '') { throw '测试配置要求 MTU 1400 且填写对端公钥' }
+    if (-not $before.wireguard_enabled -or $before.mtu -ne 1400 -or $before.peer_public_key -eq '') { throw '测试配置要求启用 WireGuard、MTU 1400 且填写对端公钥' }
     $stage = 'start'
     & $binary start -config $ConfigPath
     if ($LASTEXITCODE -ne 0) { throw '登录未成功' }
@@ -338,7 +338,8 @@ try {
     $lines = @(& $binary resources -config $ConfigPath 2>&1)
     $code = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($code -ne 0 -or $resources.apps -eq 0 -or $lines.Count -ne $resources.rows + 4) { throw 'IPv4 资源列表失败、为空或 DNS 打印不完整' }
+    $rules = $resources.ip_rules + $resources.tcp_domains
+    if ($code -ne 0 -or $rules -eq 0 -or $lines.Count -ne $rules + 6) { throw 'IP、TCP 域名资源列表失败、为空或 DNS 打印不完整' }
     Record 'resources-complete'
     Invoke-Cli 'start'
     $again = Read-Helper 'resources'

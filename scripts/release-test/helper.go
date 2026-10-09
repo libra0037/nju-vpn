@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,7 +17,6 @@ import (
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/ipc"
 	"github.com/libra0037/nju-vpn/internal/wireguard"
-	"github.com/libra0037/nju-vpn/internal/ztna"
 )
 
 func main() {
@@ -88,31 +86,20 @@ func run() error {
 			}
 			public = pub.String()
 		}
-		identity, _ := json.Marshal([]any{cfg.DeviceID, cfg.WireGuard.PrivateKey, cfg.PinnedNodeSPKISHA256, cfg.WireGuard.PeerPublicKey, cfg.MTU})
+		identity, _ := json.Marshal([]any{cfg.DeviceID, cfg.WireGuard.PrivateKey, cfg.PinnedNodeSPKISHA256, cfg.WireGuard.PeerPublicKey, cfg.WireGuard.MTU})
 		hash := sha256.Sum256(identity)
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"public_key": public, "peer_public_key": cfg.WireGuard.PeerPublicKey,
 			"peer_address": cfg.WireGuard.PeerAddress, "listen_port": cfg.WireGuard.ListenPort,
-			"listen_host": cfg.WireGuard.ListenHost, "mtu": cfg.MTU,
+			"listen_host": cfg.WireGuard.ListenHost, "mtu": cfg.WireGuard.MTU,
+			"wireguard_enabled": cfg.WireGuard.Enabled, "socks5_enabled": cfg.SOCKS5.Enabled,
 			"identity_sha256": hex.EncodeToString(hash[:]), "password_set": cfg.Password != "",
 		})
 	}
 	if command != "state" && command != "resources" && command != "shutdown" {
 		return errors.New("未知的测试操作")
 	}
-	conn, err := ipc.Dial(ipc.EndpointFor(config.CanonicalPath(*path)))
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return err
-	}
-	if err := ipc.WriteRequest(conn, ipc.Request{Command: command}); err != nil {
-		return err
-	}
-	reader := bufio.NewReader(conn)
-	response, err := ipc.ReadResponse(reader)
+	response, err := ipc.NewClient(*path).Call(ipc.Request{Command: command}, 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -120,17 +107,16 @@ func run() error {
 		return fmt.Errorf("IPC 操作失败，状态码 %d", response.Code)
 	}
 	if command == "resources" {
-		var resources ztna.L3Resources
-		if err := json.Unmarshal([]byte(response.Message), &resources); err != nil || resources.IP == nil || resources.NodeGroup == nil {
-			return errors.New("资源快照不是完整的 IPv4 L3 资源对象")
+		var resources ipc.Resources
+		if err := json.Unmarshal([]byte(response.Message), &resources); err != nil {
+			return errors.New("资源快照格式非法")
 		}
-		apps := make(map[string]bool)
-		for _, resource := range resources.IP {
-			apps[resource.ID] = true
+		if err := resources.Validate(); err != nil {
+			return err
 		}
 		hash := sha256.Sum256([]byte(response.Message))
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"apps": len(apps), "rows": len(resources.IP), "json_bytes": len(response.Message),
+			"ip_rules": len(resources.IP), "tcp_domains": len(resources.TCPDomains), "json_bytes": len(response.Message),
 			"sha256": hex.EncodeToString(hash[:]),
 		})
 	}

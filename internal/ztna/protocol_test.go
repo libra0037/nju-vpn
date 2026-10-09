@@ -293,12 +293,12 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 		{"id":"groupLan","addressInfo":[{"address":"node-b:441","type":"lan"}]}]}}}},
 		"sdpPolicy":{"data":{"clientOption":{"dnsOptionV2":{"firstDNS":"10.0.0.53"}}}}}}`)
 
-	table, err := parseResourceTable(raw, "vpn.test")
+	table, _, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(table.IP) != 2 {
-		t.Fatalf("资源条数 = %d，期望 2（Web 资源不参与 L3 匹配）", len(table.IP))
+	if len(table.ipRules) != 2 {
+		t.Fatalf("资源条数 = %d，期望 2（Web 资源不参与 L3 匹配）", len(table.ipRules))
 	}
 
 	cases := []struct {
@@ -323,11 +323,11 @@ func TestResourceTableMatchAndNodes(t *testing.T) {
 	}
 	for _, c := range cases {
 		dst := netip.MustParseAddr(c.dst)
-		appID, _, ok := table.match(dst, c.proto, c.port)
+		grant, ok := table.matchIP(dst, c.proto, c.port)
 		if ok != c.ok {
 			t.Errorf("%s: 匹配 = %v，期望 %v", c.name, ok, c.ok)
 		}
-		if ok && appID == "" {
+		if ok && grant.appID == "" {
 			t.Errorf("%s: 命中却没有 appID", c.name)
 		}
 	}
@@ -348,14 +348,14 @@ func TestResourceTableRejectsAndCountsInvalidPorts(t *testing.T) {
 			{"protocol":"tcp","port":"80,443","host":"10.3.0.0/16"}]}
 		]}],"config":{"nodeGroupConf":{"majorNodeGroup":{"id":"g"},"nodeGroupList":[
 		{"id":"g","addressInfo":[{"address":"node-a:441","type":"wan"}]}]}}}}}}`)
-	table, err := parseResourceTable(raw, "vpn.test")
+	table, stats, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if table.badPorts != 1 {
-		t.Errorf("看不懂的端口段计数 = %d，期望 1", table.badPorts)
+	if stats.badPorts != 1 {
+		t.Errorf("看不懂的端口段计数 = %d，期望 1", stats.badPorts)
 	}
-	if _, _, ok := table.match(netip.MustParseAddr("10.3.4.5"), protoTCP, 12345); ok {
+	if _, ok := table.matchIP(netip.MustParseAddr("10.3.4.5"), protoTCP, 12345); ok {
 		t.Error("非法端口规则扩大了访问范围")
 	}
 }
@@ -363,12 +363,12 @@ func TestResourceTableRejectsAndCountsInvalidPorts(t *testing.T) {
 func TestParseResourceTableSubstitutesHostPlaceholder(t *testing.T) {
 	raw := []byte(`{"data":{"appList":{"data":{"config":{"nodeGroupConf":{"majorNodeGroup":{"id":"g"},
 		"nodeGroupList":[{"id":"g","addressInfo":[{"address":"{{sdpcHost}}","type":"wan"}]}]}}}}}}`)
-	table, err := parseResourceTable(raw, "vpn.test")
+	table, _, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(table.NodeGroup["g"]) != 1 || table.NodeGroup["g"][0].Address != "vpn.test:441" {
-		t.Errorf("节点地址 = %v，期望 vpn.test:441", table.NodeGroup)
+	if len(table.nodeGroups["g"]) != 1 || table.nodeGroups["g"][0] != "vpn.test:441" {
+		t.Errorf("节点地址 = %v，期望 vpn.test:441", table.nodeGroups)
 	}
 }
 
@@ -404,12 +404,12 @@ func TestResourceTableDropsMalformedNodes(t *testing.T) {
 			{"address":"node-b:0","type":"wan"},
 			{"address":"node-c","type":"lan"}]}]}}}}}}`)
 
-	table, err := parseResourceTable(raw, "vpn.test")
+	table, stats, err := parseResourceTable(raw, "vpn.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if table.badNodes != 2 {
-		t.Errorf("丢弃的节点数 = %d，期望 2（注入串与端口 0；缺端口的补 :441 之后合法）", table.badNodes)
+	if stats.badNodes != 2 {
+		t.Errorf("丢弃的节点数 = %d，期望 2（注入串与端口 0；缺端口的补 :441 之后合法）", stats.badNodes)
 	}
 	nodes := table.candidateNodes("g")
 	if len(nodes) != 2 || nodes[0] != "node-a:441" || nodes[1] != "node-c:441" {

@@ -27,6 +27,9 @@ pinned_node_spki_sha256:
   - "cqCxa81gLyniGGB1PyKnjhxKN2wfBTs8NNy72SfRFpY="
 
 wireguard:
+  enabled: true
+  # 两段 IPv4 隧道共用的内层 MTU。
+  mtu: 1400
   # 对外暴露的 UDP 端口。留空或填 0 都按默认值 51820 处理。
   listen_port: 51820
   # 监听范围，取值 loopback 或 all。
@@ -38,8 +41,16 @@ wireguard:
   # 分配给 WireGuard 对端的地址。
   peer_address: 10.66.66.2
 
-# 两段隧道共用的内层 MTU。
-mtu: 1400
+# 两端点可分别开启。省略 enabled 等同于 false；SOCKS 只提供 IPv4/域名 TCP CONNECT。
+socks5:
+  enabled: true
+  listen_host: loopback
+  listen_port: 1080
+  # 独立于校园账号。回环可留空；listen_host: all 时必须同时配置。
+  username: ""
+  password: ""
+  max_connections: 128
+  max_dials: 32
 
 log:
   level: info

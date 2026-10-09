@@ -24,9 +24,12 @@ func TestLogEventsKeepOnlyFixedCategoriesAndNumbers(t *testing.T) {
 		{"隧道连接已建立", "tunnel_established", "", 0, 0},
 		{"隧道断开: secret-token at 192.0.2.1:443", "tunnel_closed", "", 0, 0},
 		{"逐流鉴权暂未就绪（状态 0x86），已安排 10s 后的一次重试", "auth_retry", "", 0, 0},
-		{"wireguard: 丢弃 下行队列已满（累计 19 个）", "relay_drop", "downlink_full", 19, 0},
-		{"上行拒绝：分片乱序或重叠，累计 7 个包", "tunnel_reject", "fragment_order", 7, 0},
-		{"上行拒绝：待鉴权缓存已满，累计 64 个包", "tunnel_reject", "pending_full", 64, 0},
+		{"wireguard: 丢弃 下行队列已满（reason=downlink_full，累计 19 个包）", "relay_drop", "downlink_full", 19, 0},
+		{"上行拒绝：分片乱序或重叠（reason=fragment_order，累计 7 个包）", "tunnel_reject", "fragment_order", 7, 0},
+		{"上行拒绝：待鉴权缓存已满（reason=pending_full，累计 64 个包）", "tunnel_reject", "pending_full", 64, 0},
+		{"上行拒绝：分片关联已满（reason=fragment_full，累计 2 个包）", "tunnel_reject", "fragment_full", 2, 0},
+		{"上行拒绝：报文格式非法（reason=invalid_packet，累计 3 个包）", "tunnel_reject", "invalid_packet", 3, 0},
+		{"上行拒绝：报文超过配置 MTU（reason=mtu_exceeded，累计 5 个包）", "tunnel_reject", "mtu_exceeded", 5, 0},
 	}
 	for _, tc := range cases {
 		event, ok := parseLogEvent(prefix + tc.message)
@@ -43,6 +46,8 @@ func TestLogEventsKeepOnlyFixedCategoriesAndNumbers(t *testing.T) {
 		prefix + "njuvpn test-version 服务进程启动 pid=42 账号=private-user",
 		prefix + "njuvpn 服务进程启动 pid=18446744073709551616 账号=private-user",
 		prefix + "wireguard: 丢弃 secret-token（累计 1 个）",
+		prefix + "wireguard: 丢弃 下行队列已满（累计 1 个）",
+		prefix + "上行拒绝：报文格式或容量超限，累计 1 个包",
 		prefix + "wireguard: 丢弃 下行队列已满（累计 18446744073709551616 个）",
 		prefix + "上行拒绝：secret-token，累计 1 个包",
 		prefix + "隧道连接已建立 private-user",
@@ -64,7 +69,7 @@ func TestLogSummarySelectsInstanceAndKeepsLatestBoundedEvents(t *testing.T) {
 	}
 	var body strings.Builder
 	for i := 1; i <= 300; i++ {
-		fmt.Fprintf(&body, "2026/10/02 12:34:56 wireguard: 丢弃 下行队列已满（累计 %d 个）\n", i)
+		fmt.Fprintf(&body, "2026/10/02 12:34:56 wireguard: 丢弃 下行队列已满（reason=downlink_full，累计 %d 个包）\n", i)
 	}
 	original := body.String()
 	if err := os.WriteFile(logPath, []byte(original), 0600); err != nil {

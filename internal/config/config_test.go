@@ -34,8 +34,9 @@ server: vpn.example.edu
 port: 443
 username: u
 password: p
-mtu: 1320
 wireguard:
+  enabled: true
+  mtu: 1320
   peer_address: 10.66.66.2
 `
 
@@ -45,16 +46,16 @@ func TestLoadValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("合法配置不该报错: %v", err)
 	}
-	if cfg.MTU != 1320 || cfg.WireGuard.PeerAddress != "10.66.66.2" {
+	if cfg.WireGuard.MTU != 1320 || cfg.WireGuard.PeerAddress != "10.66.66.2" {
 		t.Errorf("配置解析结果异常: %+v", cfg)
 	}
 }
 
 func TestConfiguredMTUIsNotCappedAt1400(t *testing.T) {
 	for _, mtu := range []int{576, 1500, 9000, 65535} {
-		body := fmt.Sprintf("server: vpn.example.edu\nusername: u\nmtu: %d\n", mtu)
+		body := fmt.Sprintf("server: vpn.example.edu\nusername: u\nwireguard:\n  enabled: true\n  mtu: %d\n", mtu)
 		cfg, err := Load(writeConfig(t, body, 0600))
-		if err != nil || cfg.MTU != mtu {
+		if err != nil || cfg.WireGuard.MTU != mtu {
 			t.Fatalf("配置 MTU %d 被拒绝或截低: %v", mtu, err)
 		}
 	}
@@ -79,7 +80,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	// listen_port 写 0 表示用默认端口：applyDefaults 会把它换成 51820，
 	// 所以端口预检与承载层都不会见到 0。
 	t.Run("listen_port 0 回落默认端口", func(t *testing.T) {
-		path := writeConfig(t, "server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  listen_port: 0\n", 0o600)
+		path := writeConfig(t, "server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  enabled: true\n  listen_port: 0\n", 0o600)
 		cfg, err := Load(path)
 		if err != nil {
 			t.Fatalf("listen_port 0 应当合法: %v", err)
@@ -106,22 +107,22 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		},
 		{
 			"mtu 过大",
-			"server: vpn.example.edu\nusername: u\npassword: p\nmtu: 65536\n",
+			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  enabled: true\n  mtu: 65536\n",
 			"mtu",
 		},
 		{
 			"mtu 过小",
-			"server: vpn.example.edu\nusername: u\npassword: p\nmtu: 100\n",
+			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  enabled: true\n  mtu: 100\n",
 			"mtu",
 		},
 		{
 			"监听端口越界",
-			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  listen_port: -1\n",
+			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  enabled: true\n  listen_port: -1\n",
 			"listen_port",
 		},
 		{
 			"peer 地址不是 IPv4",
-			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  peer_address: 2001:db8::2\n",
+			"server: vpn.example.edu\nusername: u\npassword: p\nwireguard:\n  enabled: true\n  peer_address: 2001:db8::2\n",
 			"peer_address",
 		},
 		{

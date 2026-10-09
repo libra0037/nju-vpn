@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -25,57 +24,12 @@ var errStateUnknown = errors.New("服务进程没有回报状态")
 // 登录命令需要凭据；状态、停止和资源查询只依赖实例路径。
 func clientConfig(path string) (*config.Config, error) { return config.LoadForClient(path) }
 
-// call 向服务进程发一条请求并返回响应。
-//
-// 带超时：服务进程可能在等短信验证码、或正在退避重连，没有超时的客户端会
-// 一直挂着，而用户看不出发生了什么。
-func call(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response, error) {
-	conn, err := ipc.Dial(endpoint)
-	if err != nil {
-		return ipc.Response{}, err
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return ipc.Response{}, err
-	}
-
-	if err := ipc.WriteRequest(conn, req); err != nil {
-		return ipc.Response{}, fmt.Errorf("发送请求: %w", err)
-	}
-	reader := bufio.NewReader(conn)
-	resp, err := ipc.ReadResponse(reader)
-	if err != nil {
-		return ipc.Response{}, fmt.Errorf("读取响应: %w", err)
-	}
-	return resp, nil
-}
-
-// endpointOf 解析出 IPC 端点。
-//
-// 端点只由配置文件路径派生；服务与命令共用 ipc.EndpointFor，保证同一
-// 配置对应同一实例，不同配置互不占用端点。
-func endpointOf(cfg *config.Config) string {
-	if cfg == nil {
-		return ""
-	}
-	return ipc.EndpointFor(cfg.SourcePath())
-}
-
-// endpointFor 供管理命令定位实例，不读取或修改配置内容。
-func endpointFor(configPath string) (string, error) {
-	if configPath == "" {
-		configPath = config.DefaultPath()
-	}
-	return ipc.EndpointFor(configPath), nil
-}
-
 // serviceState 问服务进程当前处在什么状态。
 //
 // 用专门的 state 命令而不是从 status 的显示文本里切第一段：那行是给人看
 // 的，格式一改，判断就静默失效（而按文本写的测试还会继续通过）。
-func serviceState(endpoint string) (string, error) {
-	resp, err := call(endpoint, ipc.Request{Command: ipc.CmdState}, 5*time.Second)
+func serviceState(client *ipc.Client) (string, error) {
+	resp, err := client.Call(ipc.Request{Command: ipc.CmdState}, 5*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -83,31 +37,6 @@ func serviceState(endpoint string) (string, error) {
 		return "", fmt.Errorf("%w: %d %s", errStateUnknown, resp.Code, resp.Message)
 	}
 	return strings.TrimSpace(resp.Message), nil
-}
-
-// runCommand 是那些"只发一条请求、没有位置参数"的命令的公共实现。
-//
-// timeout 由命令自己给：一次授信终端操作可能要登录一次（含短信），超时给
-// 得跟 start 一样宽。
-func runCommand(name string, args []string, req ipc.Request, timeout time.Duration) error {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	if err := parseNoPositional(fs, args); err != nil {
-		return err
-	}
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	resp, err := call(endpoint, req, timeout)
-	if err != nil {
-		if req.Command == ipc.CmdStop && errors.Is(err, ipc.ErrNotRunning) {
-			fmt.Println("服务进程未运行")
-			return nil
-		}
-		return err
-	}
-	return finish(endpoint, resp)
 }
 
 // maxCodeAttempts 是一次流程里最多让用户输几次验证码。
@@ -118,7 +47,7 @@ const maxCodeAttempts = 3
 // 428 表示服务端在等验证码：把提示打出来、把用户输的码送回去，然后接着看
 // 结果。验证码输错时服务进程回 400 但会话还等着，这时再给一次机会——用户
 // 手一抖不该让整条流程从头再来一遍（重新登录、重新发短信）。
-func finish(endpoint string, resp ipc.Response) error {
+func finish(client *ipc.Client, resp ipc.Response) error {
 	for attempts := 0; ; {
 		fmt.Println(resp.Message)
 
@@ -127,7 +56,7 @@ func finish(endpoint string, resp ipc.Response) error {
 			return nil
 		case resp.Code == ipc.CodeAuthRequired:
 			// 需要用户输验证码，走下面的提示。
-		case resp.Code == ipc.CodeBadRequest && attempts > 0 && awaitingCode(endpoint):
+		case resp.Code == ipc.CodeBadRequest && attempts > 0 && awaitingCode(client):
 			// 已经输过一次验证码又被拒：多半是码不对，而服务端还等着。
 		default:
 			return fmt.Errorf("服务进程返回 %d: %s", resp.Code, resp.Message)
@@ -145,15 +74,15 @@ func finish(endpoint string, resp ipc.Response) error {
 		}
 		attempts++
 
-		if resp, err = call(endpoint, ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, startTimeout); err != nil {
+		if resp, err = client.Call(ipc.Request{Command: ipc.CmdAuth, Args: []string{code}}, startTimeout); err != nil {
 			return err
 		}
 	}
 }
 
 // awaitingCode 报告服务进程是不是还在等验证码。
-func awaitingCode(endpoint string) bool {
-	state, err := serviceState(endpoint)
+func awaitingCode(client *ipc.Client) bool {
+	state, err := serviceState(client)
 	return err == nil && state == string(service.StateAuthPending)
 }
 
@@ -165,11 +94,13 @@ func awaitingCode(endpoint string) bool {
 // 隧道已经在跑时不问：这条路径上的操作（start 幂等、授信终端操作复用当前
 // 会话）都不需要口令，而看门狗式脚本每隔几分钟敲一次 start，每次都停在口令
 // 提示上等于让脚本永远失败——stdin 是 /dev/null 时更是直接以一句裸 EOF 收场。
-func passwordFor(cfg *config.Config, endpoint string) (string, error) {
+func passwordFor(cfg *config.Config, client *ipc.Client) (string, error) {
 	if cfg == nil || cfg.Password != "" {
 		return "", nil
 	}
-	if state, err := serviceState(endpoint); err == nil && state == string(service.StateUp) {
+	if state, err := serviceState(client); errors.Is(err, ipc.ErrInstanceMismatch) || errors.Is(err, ipc.ErrUntrustedPeer) {
+		return "", err
+	} else if err == nil && state == string(service.StateUp) {
 		return "", nil
 	}
 	password, err := promptSecret("请输入校园网口令: ")
@@ -180,7 +111,7 @@ func passwordFor(cfg *config.Config, endpoint string) (string, error) {
 		}
 		return "", err
 	}
-	return strings.TrimSpace(password), nil
+	return password, nil
 }
 
 // stdinReader 是复用的标准输入读取器。

@@ -63,7 +63,7 @@ func TestConnectSkipsNodeThatClosesBeforeTLS(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	if sess != nil {
 		defer sess.Close(context.Background())
 	}
@@ -121,7 +121,7 @@ func TestConnectSkipsNodeWithUnconfiguredSPKI(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	sess, err := client.Connect(ctx, ConnectOptions{})
+	sess, err := connectL3(ctx, client, ConnectOptions{})
 	if sess != nil {
 		defer sess.Close(context.Background())
 	}

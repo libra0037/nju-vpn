@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,13 +15,13 @@ import (
 	"github.com/libra0037/nju-vpn/internal/config"
 	"github.com/libra0037/nju-vpn/internal/dial"
 	"github.com/libra0037/nju-vpn/internal/ipc"
-	"github.com/libra0037/nju-vpn/internal/l3"
+	"github.com/libra0037/nju-vpn/internal/socks5"
 	"github.com/libra0037/nju-vpn/internal/ztna"
 )
 
 // 服务层对外的错误分类。IPC 层据此决定响应状态码，不靠字符串匹配。
 var (
-	// ErrNotRunning 表示隧道本来就没有运行。
+	// ErrNotRunning 表示共享会话本来就没有运行。
 	ErrNotRunning = errors.New("隧道未运行")
 	// ErrBadState 表示当前状态不允许该操作（例如正在登录时又敲 start）。
 	// 这是用法问题，不是服务端故障，IPC 层据此回 409。
@@ -72,6 +71,10 @@ const (
 	cmdTunnelDown
 	cmdTunnelRetry
 	cmdTunnelRestored
+	cmdSessionEnded
+	cmdSOCKSDown
+	cmdEndpointStart
+	cmdEndpointStop
 )
 
 func (k commandKind) String() string {
@@ -92,13 +95,24 @@ func (k commandKind) String() string {
 		return "tunnel-retry"
 	case cmdTunnelRestored:
 		return "tunnel-restored"
+	case cmdSessionEnded:
+		return "session-ended"
+	case cmdSOCKSDown:
+		return "socks-down"
+	case cmdEndpointStart:
+		return "endpoint-start"
+	case cmdEndpointStop:
+		return "endpoint-stop"
 	}
 	return "unknown"
 }
 
 type command struct {
-	kind commandKind
-	ctx  context.Context // 用户命令拥有总等待预算；内部事件没有此字段。
+	kind     commandKind
+	sess     *ztna.Session
+	socks    *socks5.Server
+	endpoint string
+	ctx      context.Context // 用户命令拥有总等待预算；内部事件没有此字段。
 	// arg 是本次请求带上来的口令（start / trust / untrust）或验证码（auth）。
 	arg string
 	// trust 与 all 是授信终端操作的参数：trust 表示"绑成授信终端"，
@@ -183,24 +197,22 @@ func (p *pendingOp) close(ctx context.Context) error {
 	return nil
 }
 
-// Service 持有一次隧道连接的全部资源。
+// Service 拥有共享校园会话及各端点的启停任务。
 //
 // 所有会改状态的操作都在 loop 这一个协程里执行：调用方把命令放进 cmds 并
 // 等一个回复。这样就不需要在持锁状态下做网络 I/O——登录、短信、建隧道都
 // 可能是分钟级，持锁做它们等于让退出路径永远拿不到锁。
 type Service struct {
-	cfg    *config.Config
-	status *statusStore
-	br     *bearer
-
-	// ep 指向当前会话的隧道端点。status 里的校园网地址现取（承载层改写用的
-	// 就是端点上的当前值），所以不留第二份快照——服务端在会话中途换地址时，
-	// status 跟着变，而不是停在旧值上。
-	//
-	// 写者只有 actor 协程（挂载时存、teardown 时清），读者可以是任何协程。
-	ep atomic.Pointer[l3.Endpoint]
-	// peerIP 来自配置，启动时定下，不再变。
-	peerIP string
+	cfg           *config.Config
+	status        *statusStore
+	br            *bearer
+	brSnapshot    atomic.Pointer[bearer]
+	socks         *socks5.Server
+	socksSnapshot atomic.Pointer[socks5.Server]
+	socksCancel   context.CancelFunc
+	socksDone     chan struct{}
+	rootCancel    context.CancelFunc
+	rootDone      chan struct{}
 
 	// cred 只在 actor 协程里读写，不需要加锁。
 	cred credentials
@@ -277,15 +289,24 @@ func New(cfg *config.Config, options ...Options) (*Service, error) {
 	if opts.CommandTimeout < 0 || opts.ReconnectBackoff < 0 {
 		return nil, errors.New("命令预算与重连退避须为正数")
 	}
-	br, err := newBearer(cfg)
-	if err != nil {
-		return nil, err
+	var br *bearer
+	var socks *socks5.Server
+	var wgErr, socksErr error
+	if cfg.WireGuard.Enabled {
+		br, wgErr = newBearer(cfg)
 	}
+	if cfg.SOCKS5.Enabled {
+		socks, socksErr = newSOCKS(cfg)
+	}
+	if (cfg.WireGuard.Enabled || cfg.SOCKS5.Enabled) && br == nil && socks == nil {
+		return nil, errors.Join(wgErr, socksErr)
+	}
+
 	s := &Service{
 		cfg:              cfg,
 		status:           newStatusStore(identityOf(cfg)),
 		br:               br,
-		peerIP:           br.peerAddr.String(),
+		socks:            socks,
 		cred:             credentials{username: cfg.Username, password: cfg.Password},
 		cmds:             make(chan *command, 32),
 		events:           make(chan *command, 16),
@@ -297,6 +318,10 @@ func New(cfg *config.Config, options ...Options) (*Service, error) {
 		commandTimeout:   opts.CommandTimeout,
 		reconnectBackoff: opts.ReconnectBackoff,
 	}
+	s.brSnapshot.Store(br)
+	s.socksSnapshot.Store(socks)
+	s.status.endpoint(true, cfg.WireGuard.Enabled, wgErr)
+	s.status.endpoint(false, cfg.SOCKS5.Enabled, socksErr)
 	go s.loop()
 	return s, nil
 }
@@ -316,24 +341,39 @@ func identityOf(cfg *config.Config) Identity {
 
 // Status 返回当前状态快照。它不经过 actor，永远立即可用。
 //
-// 两个地址是现取的：会话挂着时读端点上的当前地址与配置里的 peer 地址，
-// 会话摘掉（teardown）后两个都为空。写成快照既会留下一份服务端换地址后
-// 的旧值，又要在每次状态迁移时记得清。
+// 端点诊断从当前对象派生；L3 地址只在真实连接可用时返回。
 func (s *Service) Status() Status {
 	st := s.status.Get()
-	if s.br != nil {
-		st.WireGuard = s.br.dev.Diagnostics()
+	if br := s.brSnapshot.Load(); br != nil {
+		st.WireGuard.Diagnostics = br.dev.Diagnostics()
+		st.WireGuard.Listening = true
 	}
-	if sess := s.sessionSnapshot.Load(); sess != nil {
-		d := sess.Diagnostics()
-		st.Tunnel = &d
+	if socks := s.socksSnapshot.Load(); socks != nil {
+		st.SOCKS5.Diagnostics = socks.Diagnostics()
 	}
-	if ep := s.ep.Load(); ep != nil {
-		st.PeerIP = s.peerIP
-		if ip := ep.LocalAddr(); ip != nil {
-			st.ClientIP = ip.String()
+	closing := false
+	select {
+	case <-s.closed:
+		closing = true
+	default:
+	}
+	if sess := s.sessionSnapshot.Load(); sess != nil && sess.Err() == nil && st.State == StateUp && !closing {
+		st.SessionReady = true
+		if st.WireGuard.Enabled {
+			d := sess.Diagnostics()
+			st.Tunnel = &d
+			if d.Connected {
+				st.PeerIP = s.cfg.WireGuard.PeerAddress
+				if ip := sess.ClientIP(); ip != nil {
+					st.ClientIP = ip.String()
+				}
+			}
 		}
 	}
+	st.Ready = st.SessionReady && (st.WireGuard.Enabled || st.SOCKS5.Enabled) &&
+		(!st.WireGuard.Enabled || st.WireGuard.Listening && st.Tunnel != nil && st.Tunnel.Connected && !st.Retrying) &&
+		(!st.SOCKS5.Enabled || st.SOCKS5.Listening && st.SOCKS5.Failure == "")
+
 	return st
 }
 
@@ -347,7 +387,22 @@ func (s *Service) Identity() Identity { return s.status.Get().Identity }
 func (s *Service) Done() <-chan struct{} { return s.closed }
 
 // BearerSummary 描述承载层的监听状态，供启动日志用。
-func (s *Service) BearerSummary() string { return s.br.summary() }
+func (s *Service) BearerSummary() string {
+	msg := ""
+	if br := s.brSnapshot.Load(); br != nil {
+		msg = "WireGuard " + br.summary()
+	}
+	if socks := s.socksSnapshot.Load(); socks != nil {
+		if msg != "" {
+			msg += "；"
+		}
+		msg += fmt.Sprintf("SOCKS5 TCP %d 已监听", socks.Diagnostics().Port)
+	}
+	if msg == "" {
+		return "数据端点未启用"
+	}
+	return msg
+}
 
 // Start 建立隧道：登录、取资源表、建隧道，必要时把本机绑成授信终端。
 //
@@ -400,9 +455,7 @@ func (s *Service) Close() {
 			log.Printf("服务进程收尾超过 %s，放弃等待", closeGrace)
 		}
 
-		// 设备是进程级资源，收尾完成后才关：上面那一步会登出，
-		// 而 teardown 还要经过它摘会话。
-		s.br.close()
+		// 可变端点由 actor 释放；预算耗尽也不跨协程读取它的私有字段。
 	})
 }
 
@@ -467,6 +520,11 @@ func (s *Service) loop() {
 		select {
 		case <-s.closed:
 			s.teardown("服务进程退出")
+			s.brSnapshot.Store(nil)
+			if s.br != nil {
+				s.br.close()
+				s.br = nil
+			}
 			return
 		case cmd := <-s.cmds:
 			s.dispatch(cmd)
@@ -518,7 +576,7 @@ func (s *Service) dispatch(cmd *command) {
 
 	// 退出期间不再执行新命令：Close 已经走过登出，此时再建隧道会留下
 	// 没人管的会话。隧道协程的汇报例外——丢掉它会让状态卡在 up。
-	if cmd.kind != cmdTunnelDown && cmd.kind != cmdTunnelRetry && cmd.kind != cmdTunnelRestored {
+	if cmd.kind != cmdTunnelDown && cmd.kind != cmdTunnelRetry && cmd.kind != cmdTunnelRestored && cmd.kind != cmdSessionEnded && cmd.kind != cmdSOCKSDown {
 		select {
 		case <-s.closed:
 			reply(ErrShuttingDown)
@@ -532,7 +590,7 @@ func (s *Service) dispatch(cmd *command) {
 	// 自己起来了"。stop 自己当然要放行，它正是来清这个标记的。
 	if s.stopPending.Load() {
 		switch cmd.kind {
-		case cmdStart, cmdDevices, cmdAuth:
+		case cmdStart, cmdDevices, cmdAuth, cmdEndpointStart:
 			log.Printf("已收到断开请求，丢弃排队中的 %s 命令", cmd.kind)
 			reply(ErrStopRequested)
 			return
@@ -557,6 +615,22 @@ func (s *Service) dispatch(cmd *command) {
 		err = s.tunnelRetry(cmd.gen, cmd.attempt, cmd.err)
 	case cmdTunnelRestored:
 		err = s.tunnelRestored(cmd.gen)
+	case cmdSessionEnded:
+		if s.session == cmd.sess {
+			err = s.fail(cmd.err)
+		}
+	case cmdSOCKSDown:
+		if s.session == cmd.sess && s.socks == cmd.socks {
+			s.stopSOCKS()
+			s.status.endpoint(false, true, cmd.err)
+			if !s.status.Get().WireGuard.Enabled {
+				err = s.fail(cmd.err)
+			}
+		}
+	case cmdEndpointStart:
+		err = s.startEndpoint(ctx, cmd.endpoint)
+	case cmdEndpointStop:
+		err = s.stopEndpoint(cmd.endpoint)
 	default:
 		err = fmt.Errorf("未知命令 %d", cmd.kind)
 	}
@@ -565,6 +639,9 @@ func (s *Service) dispatch(cmd *command) {
 
 // start 建立隧道。
 func (s *Service) start(ctx context.Context, trust bool, password string) error {
+	if !s.cfg.WireGuard.Enabled && !s.cfg.SOCKS5.Enabled {
+		return fmt.Errorf("%w：没有启用数据端点", ErrBadState)
+	}
 	switch s.status.Get().State {
 	case StateAuthPending:
 		// 等待验证码时再次 start，意味着用户没收到码、想重新要一条：
@@ -598,9 +675,12 @@ func (s *Service) start(ctx context.Context, trust bool, password string) error 
 		return s.fail(err)
 	}
 	if trust {
-		s.ensureTrusted(ctx, sess)
+		if err := s.ensureTrusted(ctx, sess); err != nil {
+			s.attach(sess)
+			return s.fail(err)
+		}
 	}
-	return s.finishConnect(sess)
+	return s.finishConnect(ctx, sess)
 }
 
 // devices 是 trust / untrust 的实现。
@@ -733,19 +813,27 @@ func (s *Service) auth(ctx context.Context, code string) error {
 		return s.runDeviceOp(ctx, p.dev, p.trust, p.all)
 	}
 	if p.trust {
-		s.ensureTrusted(ctx, p.sess)
+		if err := s.ensureTrusted(ctx, p.sess); err != nil {
+			s.attach(p.sess)
+			return s.fail(err)
+		}
 	}
-	return s.finishConnect(p.sess)
+	return s.finishConnect(ctx, p.sess)
 }
 
-// ensureTrusted 把本机绑成授信终端，失败只记日志。
+// ensureTrusted 把本机绑成授信终端；只有共享 SID 失效终止数据端点启动。
 //
 // 绑定失败不该影响隧道：拿到的网络能力是一样的，只是下次登录还要再做一次
 // 二次验证。
-func (s *Service) ensureTrusted(ctx context.Context, sess *ztna.Session) {
+func (s *Service) ensureTrusted(ctx context.Context, sess *ztna.Session) error {
 	if err := sess.EnsureTrusted(ctx); err != nil {
+		var gone *ztna.ErrSessionGone
+		if errors.As(err, &gone) {
+			return gone
+		}
 		log.Printf("绑定授信终端失败（不影响隧道）: %v", err)
 	}
+	return nil
 }
 
 // awaitAuth 切到等待验证码状态。
@@ -829,29 +917,49 @@ func (s *Service) stop() error {
 }
 
 // finishConnect 用一次成功的连接建立承载。
-func (s *Service) finishConnect(sess *ztna.Session) error {
-	// 先接管会话再挂承载：挂载失败（没分配到地址、地址映射建不起来、装
-	// 接入方公钥失败）时这条会话已经在 s.session 上，fail → teardown 才会
-	// 发出登出。顺序反过来会让服务端的单会话名额被一条没人持有的会话
-	// 占着，用户下一次 start 直接被拒。
+func (s *Service) finishConnect(ctx context.Context, sess *ztna.Session) error {
 	s.attach(sess)
-	if err := s.br.attach(sess); err != nil {
-		return s.fail(err)
+	s.status.set(StateUp, "校园会话已登录")
+	s.status.endpoint(true, s.cfg.WireGuard.Enabled, nil)
+	s.status.endpoint(false, s.cfg.SOCKS5.Enabled, nil)
+	var wgErr, socksErr error
+	// 接入先准备 L4，L3 的建连或错误不会持有其拨号/转发任务。
+	if s.cfg.SOCKS5.Enabled {
+		socksErr = s.startSOCKS(ctx)
+	}
+	if s.cfg.WireGuard.Enabled {
+		wgErr = s.startL3(ctx)
+	}
+	if ctx.Err() != nil {
+		return s.fail(ctx.Err())
+	}
+	if s.session == nil {
+		return s.fail(ErrNotRunning)
+	}
+	if sess.Err() != nil {
+		return s.fail(sess.Err())
+	}
+	if (wgErr != nil || !s.cfg.WireGuard.Enabled) && (socksErr != nil || !s.cfg.SOCKS5.Enabled) {
+		return s.fail(errors.Join(wgErr, socksErr))
 	}
 	s.status.setRetrying(false)
-	// 先进入 up 再启动隧道协程：如果协程立刻就失败，tunnelDown 必须能
-	// 看到 up 才能正确收敛，否则这次失败会被忽略掉。
-	s.status.set(StateUp, "隧道已建立")
-
-	// 隧道协程的生命周期独立于本次命令：Stop / Close 通过 runCancel 结束它。
-	runCtx, cancel := context.WithCancel(context.Background())
-	s.runCancel = cancel
-	s.gen++
-	gen := s.gen
-	done := make(chan struct{})
-	s.runDone = done
-	go func() { defer close(done); s.runTunnel(runCtx, sess, gen) }()
-	log.Printf("隧道已建立")
+	if wgErr != nil || socksErr != nil {
+		s.status.setDetail("校园会话已登录，部分端点启动失败")
+	} else {
+		s.status.setDetail("数据端点已启动")
+	}
+	rootCtx, cancel := context.WithCancel(context.Background())
+	s.rootCancel = cancel
+	s.rootDone = make(chan struct{})
+	done := s.rootDone
+	go func() {
+		defer close(done)
+		select {
+		case <-sess.Done():
+			s.report(rootCtx, &command{kind: cmdSessionEnded, sess: sess, err: sess.Err()})
+		case <-rootCtx.Done():
+		}
+	}()
 	return nil
 }
 
@@ -864,7 +972,6 @@ func (s *Service) attach(sess *ztna.Session) {
 	prev := s.session
 	s.session = sess
 	s.sessionSnapshot.Store(sess)
-	s.ep.Store(sess.Endpoint())
 	if prev == nil || prev == sess {
 		return
 	}
@@ -914,6 +1021,14 @@ func (s *Service) tunnelDown(gen uint64, err error) error {
 		return nil
 	}
 	log.Printf("隧道断开: %v", err)
+	var gone *ztna.ErrSessionGone
+	if !errors.As(err, &gone) && s.status.Get().SOCKS5.Enabled {
+		s.stopL3()
+		s.status.endpoint(true, true, err)
+		s.status.setRetrying(false)
+		s.status.setDetail("L3 已停止，SOCKS5 继续提供服务")
+		return nil
+	}
 	s.teardown("")
 	detail := "隧道已断开"
 	if err != nil {
@@ -983,38 +1098,35 @@ func (s *Service) teardown(detail string) {
 		s.runCancel = nil
 	}
 	s.sessionSnapshot.Store(nil)
-	s.br.dev.ClearSession()
-
+	// 先撤销就绪，再等待任何关闭/登出 I/O。
+	if s.status.Get().State != StateIdle {
+		s.status.set(StateIdle, detail)
+	}
+	if s.rootCancel != nil {
+		s.rootCancel()
+		s.rootCancel = nil
+	}
+	if s.rootDone != nil {
+		<-s.rootDone
+		s.rootDone = nil
+	}
+	// 先停止接入及转发，再释放共享会话；本地 L3 也必须先打断阻塞写入。
+	s.stopSOCKS()
+	s.stopL3()
 	var logoutErr error
 	if s.pending != nil {
 		logoutErr = s.pending.close(context.Background())
 		s.pending = nil
 	}
 	if s.session != nil {
-		// 用独立的超时上下文：退出路径上的 ctx 很可能已经被取消，而登出
-		// 本身必须发出去。
 		logoutErr = s.session.Close(context.Background())
 		s.session = nil
 	}
 	if logoutErr != nil {
 		log.Printf("释放会话时出错: %v", logoutErr)
+		s.status.setDetail(fmt.Sprintf("%s（登出未成功: %v，服务端名额可能仍被占用）", detail, logoutErr))
 	}
-	if s.runDone != nil {
-		<-s.runDone
-		s.runDone = nil
-	}
-	s.br.detach()
-	s.ep.Store(nil)
 
-	if s.status.Get().State != StateIdle {
-		if detail == "" {
-			detail = "已断开"
-		}
-		if logoutErr != nil {
-			detail = fmt.Sprintf("%s（登出未成功: %v，服务端名额可能仍被占用）", detail, logoutErr)
-		}
-		s.status.set(StateIdle, detail)
-	}
 }
 
 // applyPassword 决定这次操作用哪个口令，并留在内存里供后续复用。
@@ -1022,8 +1134,6 @@ func (s *Service) applyPassword(password string) (string, error) {
 	if password != "" {
 		s.cred.password = password
 	}
-	// 口令可能从终端带进来换行，去掉首尾空白再用于登录。
-	s.cred.password = strings.TrimSpace(s.cred.password)
 	if s.cred.username == "" {
 		return "", fmt.Errorf("%w：配置文件里缺少 username", ErrMissingCredential)
 	}
@@ -1065,7 +1175,6 @@ func (s *Service) clientFor() (*ztna.Client, error) {
 		DeviceID:         s.cfg.DeviceID,
 		Logf:             log.Printf,
 		ControlRootCAs:   s.controlRootCAs,
-		MTU:              s.cfg.MTU,
 		NodeSPKIPins:     pins,
 		ReconnectBackoff: s.reconnectBackoff,
 	})
@@ -1076,5 +1185,22 @@ func (s *Service) ResourcesJSON(limit int) ([]byte, error) {
 	if sess == nil {
 		return nil, ztna.ErrResourcesUnavailable
 	}
-	return sess.ResourcesJSON(limit)
+	view, err := sess.Resources()
+	if err != nil {
+		return nil, err
+	}
+	r := ipc.Resources{IP: make([]ipc.IPResource, len(view.IP)), TCPDomains: make([]ipc.TCPDomainResource, len(view.TCPDomains))}
+	for i, rule := range view.IP {
+		r.IP[i] = ipc.IPResource{Prefix: rule.Prefix, Protocol: rule.Protocol.String(), Ports: rule.Ports}
+	}
+	for i, rule := range view.TCPDomains {
+		r.TCPDomains[i] = ipc.TCPDomainResource{Pattern: rule.Pattern, Ports: rule.Ports}
+	}
+	if view.DNS[0].IsValid() {
+		r.DNS.Primary = view.DNS[0].String()
+	}
+	if view.DNS[1].IsValid() {
+		r.DNS.Secondary = view.DNS[1].String()
+	}
+	return ipc.EncodeResources(r, limit)
 }

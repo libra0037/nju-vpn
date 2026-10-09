@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -47,7 +46,7 @@ func runResilience(args []string) (resultErr error) {
 		return err
 	}
 	cfg, err := config.LoadForClient(*sourcePath)
-	if err != nil || cfg.Password == "" || cfg.MTU != mtu {
+	if err != nil || cfg.Password == "" || !cfg.WireGuard.Enabled || cfg.WireGuard.MTU != mtu {
 		return errors.New("断线测试要求有效配置、已填写 password、MTU 1400")
 	}
 	sourceBody, err := os.ReadFile(cfg.SourcePath())
@@ -276,24 +275,7 @@ func runResilience(args []string) (resultErr error) {
 }
 
 func ipcCall(parent context.Context, path, command string, args []string, budget time.Duration) (ipc.Response, error) {
-	ctx, cancel := context.WithTimeout(parent, budget)
-	defer cancel()
-	if ctx.Err() != nil {
-		return ipc.Response{}, ctx.Err()
-	}
-	connection, err := ipc.Dial(ipc.EndpointFor(config.CanonicalPath(path)))
-	if err != nil {
-		return ipc.Response{}, err
-	}
-	defer closeOnCancel(ctx, connection)()
-	deadline, _ := ctx.Deadline()
-	if err := connection.SetDeadline(deadline); err != nil {
-		return ipc.Response{}, err
-	}
-	if err := ipc.WriteRequest(connection, ipc.Request{Command: command, Args: args}); err != nil {
-		return ipc.Response{}, err
-	}
-	return ipc.ReadResponse(bufio.NewReader(connection))
+	return ipc.NewClient(path).CallContext(parent, ipc.Request{Command: command, Args: args}, budget)
 }
 
 func waitStatus(parent context.Context, path, wantState string, wantCode int, budget time.Duration) bool {

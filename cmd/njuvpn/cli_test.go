@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"flag"
 	"path/filepath"
@@ -14,25 +15,11 @@ import (
 
 const nl = "\n"
 
-func TestParseInterleavedKeepsOrderAndFlags(t *testing.T) {
+func TestFlagTerminatorDoesNotReinterpretTrailingOptions(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	configPath := fs.String("config", "", "配置文件路径")
-	trust := fs.Bool("trust", false, "绑授信")
-
-	positional, err := parseInterleaved(fs, []string{"a", "-config", "/tmp/x.yaml", "b", "-trust"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if *configPath != "/tmp/x.yaml" || !*trust {
-		t.Errorf("flag 解析结果 = %q / %v", *configPath, *trust)
-	}
-	if len(positional) != 2 || positional[0] != "a" || positional[1] != "b" {
-		t.Errorf("位置参数 = %v，期望 [a b]", positional)
-	}
-
-	fs2 := flag.NewFlagSet("test2", flag.ContinueOnError)
-	if _, err := parseInterleaved(fs2, []string{"-nope"}); err == nil {
-		t.Error("未知 flag 应报错")
+	all := fs.Bool("all", false, "全部")
+	if err := parseNoPositional(fs, []string{"--", "literal", "--all"}); err == nil || *all || fs.NArg() != 2 {
+		t.Fatal("终止符语义被破坏", err, fs.Args())
 	}
 }
 
@@ -93,12 +80,12 @@ func TestLogFileNameDistinguishesInstance(t *testing.T) {
 }
 
 // startFakeService 起一个只按脚本应答的"服务进程"，用来测命令行的分支。
-func startFakeService(t *testing.T, handle func(ipc.Request) ipc.Response) string {
+func startFakeService(t *testing.T, handle func(ipc.Request) ipc.Response) *ipc.Client {
 	t.Helper()
 	return startFakeServiceFor(t, filepath.Join(t.TempDir(), "fixture.yaml"), handle)
 }
 
-func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc.Response) string {
+func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc.Response) *ipc.Client {
 	t.Helper()
 	endpoint := ipc.EndpointFor(path)
 	ln, err := ipc.Listen(endpoint)
@@ -106,6 +93,10 @@ func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	identity, err := json.Marshal(ipc.InstanceIdentity{ConfigPath: ipc.ConfigIdentity(path)})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	go func() {
 		for {
@@ -121,14 +112,18 @@ func startFakeServiceFor(t *testing.T, path string, handle func(ipc.Request) ipc
 					if err != nil {
 						return
 					}
-					if err := ipc.WriteResponse(conn, handle(req)); err != nil {
+					response := ipc.Response{Code: ipc.CodeOK, Message: string(identity)}
+					if req.Command != ipc.CmdPing {
+						response = handle(req)
+					}
+					if err := ipc.WriteResponse(conn, response); err != nil {
 						return
 					}
 				}
 			}()
 		}
 	}()
-	return endpoint
+	return ipc.NewClient(path)
 }
 
 // setStdin 让交互提示从给定的几行文本里读，模拟用户在终端里敲。

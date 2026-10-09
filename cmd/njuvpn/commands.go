@@ -38,7 +38,7 @@ func cmdRun(args []string) (resultErr error) {
 		return err
 	}
 
-	endpoint := endpointOf(cfg)
+	endpoint := ipc.EndpointFor(cfg.SourcePath())
 	ln, err := ipc.Listen(endpoint)
 	if err != nil {
 		return err
@@ -67,7 +67,7 @@ func cmdRun(args []string) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	log.Printf("WireGuard 承载: %s", svc.BearerSummary())
+	log.Printf("数据端点: %s", svc.BearerSummary())
 
 	// 退出路径上无条件登出：服务端同一账号只允许一条隧道会话，残留会话会让
 	// 后续建隧道被拒。这里相当于 atexit。
@@ -78,16 +78,12 @@ func cmdRun(args []string) (resultErr error) {
 
 // 实例端点已被当前进程独占；身份自举必须持久化成功后才采用。
 func ensureIdentity(cfg *config.Config) error {
-	saved, err := config.InitializeIdentity(cfg.SourcePath(), func() (string, string, error) {
-		id, err := ztna.NewDeviceID()
-		if err != nil {
-			return "", "", err
-		}
+	saved, err := config.InitializeIdentity(cfg.SourcePath(), ztna.NewDeviceID, func() (string, error) {
 		key, err := wireguard.GenerateKey()
 		if err != nil {
-			return "", "", err
+			return "", err
 		}
-		return id, key.String(), nil
+		return key.String(), nil
 	})
 	if err != nil {
 		return err
@@ -98,7 +94,7 @@ func ensureIdentity(cfg *config.Config) error {
 
 // logWireGuardPublicKey 打印承载层公钥，用户需要把它填进对端配置。
 func logWireGuardPublicKey(cfg *config.Config) {
-	if cfg.WireGuard.PrivateKey == "" {
+	if !cfg.WireGuard.Enabled || cfg.WireGuard.PrivateKey == "" {
 		return
 	}
 	key, err := wireguard.ParseKey(cfg.WireGuard.PrivateKey)
@@ -122,17 +118,25 @@ func logWireGuardPublicKey(cfg *config.Config) {
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	configPath := fs.String("config", "", "配置文件路径")
+	endpointName := fs.String("endpoint", "", "只启动 wireguard 或 socks5（要求已登录）")
 	trust := fs.Bool("trust", false, "把本机绑成授信终端（之后登录免二次验证）")
 	if err := parseNoPositional(fs, args); err != nil {
 		return err
+	}
+
+	if *endpointName != "" {
+		if *trust {
+			return &usageError{"单端点启动不接受 trust"}
+		}
+		return endpointCommand(*configPath, *endpointName, ipc.CmdEndpointStart)
 	}
 
 	cfg, err := clientConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	endpoint := endpointOf(cfg)
-	password, err := passwordFor(cfg, endpoint)
+	client := ipc.NewClient(cfg.SourcePath())
+	password, err := passwordFor(cfg, client)
 	if err != nil {
 		return err
 	}
@@ -144,11 +148,11 @@ func cmdStart(args []string) error {
 	if password != "" {
 		req.Args = append(req.Args, ipc.EncodeSecret(password))
 	}
-	resp, err := call(endpoint, req, startTimeout)
+	resp, err := client.Call(req, startTimeout)
 	if err != nil {
 		return err
 	}
-	return finish(endpoint, resp)
+	return finish(client, resp)
 }
 
 // cmdTrust 把本机绑成授信终端。
@@ -182,8 +186,8 @@ func deviceCommand(configPath, command string, args []string) error {
 	if err != nil {
 		return err
 	}
-	endpoint := endpointOf(cfg)
-	password, err := passwordFor(cfg, endpoint)
+	client := ipc.NewClient(cfg.SourcePath())
+	password, err := passwordFor(cfg, client)
 	if err != nil {
 		return err
 	}
@@ -194,15 +198,33 @@ func deviceCommand(configPath, command string, args []string) error {
 		args = append(args, ipc.EncodeSecret(password))
 	}
 
-	resp, err := call(endpoint, ipc.Request{Command: command, Args: args}, startTimeout)
+	resp, err := client.Call(ipc.Request{Command: command, Args: args}, startTimeout)
 	if err != nil {
 		return err
 	}
-	return finish(endpoint, resp)
+	return finish(client, resp)
 }
 
 func cmdStop(args []string) error {
-	return runCommand("stop", args, ipc.Request{Command: ipc.CmdStop}, time.Minute)
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	path := fs.String("config", "", "配置文件路径")
+	name := fs.String("endpoint", "", "只停止 wireguard 或 socks5，保留校园登录")
+	if err := parseNoPositional(fs, args); err != nil {
+		return err
+	}
+	if *name != "" {
+		return endpointCommand(*path, *name, ipc.CmdEndpointStop)
+	}
+	client := ipc.NewClient(*path)
+	resp, err := client.Call(ipc.Request{Command: ipc.CmdStop}, time.Minute)
+	if err != nil {
+		if errors.Is(err, ipc.ErrNotRunning) {
+			fmt.Println("服务进程未运行")
+			return nil
+		}
+		return err
+	}
+	return finish(client, resp)
 }
 
 // cmdStatus 只读查询；输出格式不改变退出码，未就绪结果不作为查询错误。
@@ -213,15 +235,13 @@ func cmdStatus(args []string) (int, error) {
 	if err := parseNoPositional(fs, args); err != nil {
 		return exitUsage, err
 	}
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return exitFailure, err
-	}
+
+	client := ipc.NewClient(*configPath)
 	req := ipc.Request{Command: ipc.CmdStatus}
 	if *jsonOutput {
 		req.Args = append(req.Args, "json")
 	}
-	resp, err := call(endpoint, req, 30*time.Second)
+	resp, err := client.Call(req, 30*time.Second)
 	if err != nil {
 		if errors.Is(err, ipc.ErrNotRunning) {
 			return exitServiceNotRunning, err
@@ -250,15 +270,12 @@ func cmdRestart(args []string) error {
 		return err
 	}
 
-	endpoint, err := endpointFor(*configPath)
-	if err != nil {
-		return err
-	}
-	if err := shutdownService(endpoint); err != nil {
+	client := ipc.NewClient(*configPath)
+	if err := shutdownService(client); err != nil {
 		if !errors.Is(err, ipc.ErrNotRunning) {
 			return err
 		}
-	} else if err := waitServiceGone(endpoint, serviceStopTimeout, pingService); err != nil {
+	} else if err := waitServiceGone(client, serviceStopTimeout, pingService); err != nil {
 		return err
 	}
 	if err := ensureService(*configPath); err != nil {
@@ -274,4 +291,16 @@ func boolArg(name string, v bool) string {
 		return name + "=1"
 	}
 	return name + "=0"
+}
+
+func endpointCommand(path, name, command string) error {
+	if name != "wireguard" && name != "socks5" {
+		return &usageError{"endpoint 只能是 wireguard 或 socks5"}
+	}
+	client := ipc.NewClient(path)
+	resp, err := client.Call(ipc.Request{Command: command, Args: []string{name}}, startTimeout)
+	if err != nil {
+		return err
+	}
+	return finish(client, resp)
 }
