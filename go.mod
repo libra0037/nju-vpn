@@ -1,6 +1,6 @@
 module github.com/libra0037/nju-vpn
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/Microsoft/go-winio v0.6.2

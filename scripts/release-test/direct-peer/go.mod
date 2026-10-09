@@ -1,6 +1,6 @@
 module github.com/libra0037/nju-vpn/scripts/release-test/direct-peer
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/libra0037/nju-vpn v0.0.0
