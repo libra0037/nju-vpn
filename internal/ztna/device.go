@@ -81,23 +81,38 @@ func (d *DeviceSession) Untrust(ctx context.Context, all bool) (DeviceStatus, er
 	if all {
 		ids = st.TrustedIDs()
 	} else {
+		if !st.Trusted {
+			return st, nil
+		}
+		if st.SelfID == "" {
+			return st, &ProtocolError{What: "服务端没有给出本机终端标识"}
+		}
+		id := st.SelfID
 		for _, rec := range st.Devices {
 			if rec.ID == st.SelfID || rec.DevDbID == st.SelfID {
-				ids = append(ids, rec.ID)
+				id = rec.managementID()
 				break
 			}
 		}
-		if len(ids) == 0 && st.SelfID != "" {
-			ids = append(ids, st.SelfID)
-		}
+		ids = []string{id}
 	}
 	if len(ids) == 0 {
+		if st.hasTrustedDevices() {
+			return st, &ProtocolError{What: "授信终端列表缺少可撤信的标识"}
+		}
 		return st, nil // 本来就没有授信终端
 	}
 	if err := d.sess.ctrl.untrustDevice(ctx, ids); err != nil {
 		return st, err
 	}
-	return d.Status(ctx)
+	st, err = d.Status(ctx)
+	if err != nil {
+		return st, err
+	}
+	if st.Trusted || all && st.hasTrustedDevices() {
+		return st, &ProtocolError{What: "撤信后仍有待解除的授信终端"}
+	}
+	return st, nil
 }
 
 // Auth 在登录需要验证码时继续。

@@ -38,14 +38,23 @@ type DeviceRecord struct {
 	NetworkZone string `json:"lastNetworkZone"`
 }
 
+// managementID 是 idList 的标识：查询接口有时只给出 devDbId。
+func (d DeviceRecord) managementID() string {
+	if d.ID != "" {
+		return d.ID
+	}
+	return d.DevDbID
+}
+
+func (s DeviceStatus) hasTrustedDevices() bool {
+	return s.Trusted || s.Count != 0 || len(s.Devices) != 0
+}
+
 // TrustedIDs 返回列表里所有终端的 id，用于"解除全部"。
 func (s DeviceStatus) TrustedIDs() []string {
 	out := make([]string, 0, len(s.Devices))
 	for _, d := range s.Devices {
-		id := d.ID
-		if id == "" {
-			id = d.DevDbID
-		}
+		id := d.managementID()
 		if id != "" {
 			out = append(out, id)
 		}
